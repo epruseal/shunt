@@ -3,7 +3,11 @@ title: モデルディスカバリー
 description: Claude Code の /model ピッカーを Claude 命名のエイリアスで自動的に埋める。
 ---
 
-Discovery（`GET /v1/models`）は Claude Code の `/model` ピッカーを自動的に埋められます。デフォルトでは、shunt は管理者が選定した `[[models]]` エントリを先に返し、その後にリファレンス Claude apps gateway をミラーする組み込み Claude モデルカタログを追加します。同一 id は選定したエントリを優先して重複を除きます。選定したリストだけを公開するには、トップレベルで `auto_include_builtin_models = false` を設定してください。組み込みモデルは専用の `[[routes]]` エントリを必要としません。通常のルーティング規則で解決され、`[[routes]]` と `[[route_prefixes]]` のいずれにも一致しない場合は `server.default_provider` にフォールバックします。
+Discovery（`GET /v1/models`）は Claude Code の `/model` ピッカーを自動的に埋められます。デフォルトでは、shunt は管理者が選定した `[[models]]` エントリを先に返し、その後に shunt 自身が検出したモデルを追加します。同一 id は選定したエントリを優先して重複を除きます。選定したリストだけを公開するには、トップレベルで `auto_include_builtin_models = false` を設定してください。
+
+後半について、`server.default_provider` が Anthropic 種別の場合に限り、shunt はそのアップストリームに実際の一覧を問い合わせ、その認証モードに応じた認証情報を使います。`auth = "passthrough"` では呼び出し元が転送した認証情報を使うため、呼び出し元ごとにその認証情報で利用できるモデルが返ります。`api_key` では設定済みのキーを使います。`claude_oauth` では、推論と同じ実効アカウントセットから、解決可能かつ無効化されていない最初のアカウントを使います。このセットにはストアから検出されたアカウントが含まれ、`account_scope` の順序が適用されます。Discovery はプール選択、クールダウン、クォータの記録を行いません。そのため、ゲートウェイ所有の認証情報を使う後者 2 つのモードでは、すべての呼び出し元がその認証情報にスコープされたカタログを共有します。`server.default_provider` が Anthropic 種別ではない、使える認証情報がない、あるいは呼び出しが失敗・タイムアウト（2 秒上限）した場合は、組み込みの Claude カタログのスナップショットにフォールバックします。キャッシュはしません。
+
+検出されたモデルは専用の `[[routes]]` エントリを必要としません。通常のルーティング規則で解決され、`[[routes]]` と `[[route_prefixes]]` のいずれにも一致しない場合は `server.default_provider` にフォールバックします。
 
 Claude Code は discovery された id が `claude`/`anthropic` で始まらない場合、それを無視するため（[プロトコルリファレンス](https://code.claude.com/docs/en/llm-gateway-protocol#model-discovery)）、`gpt-*` などの非 Claude モデルには Claude 命名のエイリアスを使ってください。
 

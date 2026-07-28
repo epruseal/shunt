@@ -40,14 +40,17 @@ is the documented default. Discovery is only useful if shunt exposes a **Claude-
   {
     "data": [ { "type": "model", "id": "claude-opus-via-codex", "display_name": "Opus (via Codex)" } ],
     "has_more": false,
-    "first_id": null,
-    "last_id": null
+    "first_id": "claude-opus-via-codex",
+    "last_id": "claude-opus-via-codex"
   }
   ```
   Claude Code reads `id` + optional `display_name`; ignores non-`claude`/`anthropic` ids. The
-  entry `type` and the `has_more`/`first_id`/`last_id` envelope mirror the reference gateway's
-  Anthropic list shape for strict parity (#213); shunt never paginates, so the cursors are
-  constant.
+  entry `type` and the `has_more`/`first_id`/`last_id` envelope follow the Anthropic list shape
+  for strict parity (#213). shunt never paginates, so `has_more` is always `false`, but
+  `first_id`/`last_id` carry the first and last entry ids as the real API does — `null` only when
+  `data` is empty. Builtin entries additionally carry the upstream `created_at`,
+  `max_input_tokens`, and `max_tokens`; curated `[[models]]` entries omit them, since config
+  supplies no such metadata.
 - Claude Code caches results to `~/.claude/cache/gateway-models.json` and refreshes each
   startup; on failure it falls back to the cached/built-in list. So a slow or redirecting
   `/v1/models` degrades silently — keep it instant.
@@ -68,12 +71,45 @@ is the documented default. Discovery is only useful if shunt exposes a **Claude-
   before `[[routes]]`, `[[route_prefixes]]`, and `server.default_provider`; provider-level effort
   still applies. For exact-id routing, this is the recommended form; exact-match `[[routes]]` is a
   legacy but indefinitely supported alternative.
-- Return the list envelope above from local config; no upstream call.
-- The top-level `auto_include_builtin_models` key mirrors the reference Claude apps gateway and
-  defaults to `true`: append the builtin Claude catalog after `[[models]]`, deduplicating by exact
-  id so the curated entry wins. Builtins need no dedicated `[[routes]]` entry; they resolve
-  through the normal routing rules, falling back to the default provider when no `[[routes]]` or
-  `[[route_prefixes]]` entry matches. Set the key to `false` for a strictly curated response.
+- Curated `[[models]]` entries come from local config alone. Only the automatic half below may
+  make an upstream call, and it is bounded and optional.
+- The top-level `auto_include_builtin_models` key defaults to `true` and appends non-curated
+  models after `[[models]]`, deduplicating by exact id so the curated entry wins. Set it to
+  `false` for a strictly curated response — that also disables the upstream call below. The
+  appended models come from one of two sources, in order:
+  1. **Live upstream list.** shunt issues `GET {base_url}/v1/models` against
+     `server.default_provider` when that provider is Anthropic-kind. With
+     `auth = "passthrough"`, it forwards the caller's credential, so the answer is scoped to that
+     caller. If shunt consumed that credential as a `[server.auth]` client token or gateway-login
+     bearer, it does not replay it upstream; discovery logs why no upstream credential remains and
+     falls back to the snapshot. With `api_key`, shunt uses the configured key. With
+     `claude_oauth`, it uses the first resolvable, non-disabled account from the same effective
+     account set as inference, including store-scanned accounts in `account_scope` order. Discovery
+     performs no pool selection, cooldown, or quota accounting. Those two modes therefore return a
+     shared catalog scoped to a gateway-owned credential. Entries relay `display_name`,
+     `created_at`, `max_input_tokens`, `max_tokens`, and `capabilities` verbatim. shunt caches
+     nothing; for `passthrough`, a shared cache could serve one caller's entitlement view to
+     another. The overall operation is capped at 2 s and follows `has_more` pagination up to five
+     pages. An incomplete list would silently supersede the snapshot and be emitted with
+     `has_more = false`, making truncation indistinguishable from a complete answer, so shunt
+     accepts only pagination that establishes the catalog is complete.
+  2. **Builtin snapshot**, used when `server.default_provider` is not Anthropic-kind, no credential
+     is available to ask with, or the call fails, times out, does not parse, returns an empty list,
+     or produces an incomplete or unfollowable paginated response. An upstream error, timeout,
+     malformed response, or incomplete pagination is logged at `warn`; discovery degrades to the
+     snapshot rather than erroring.
+
+  Neither source needs a dedicated `[[routes]]` entry; those ids resolve through the normal
+  routing rules, falling back to the default provider when no `[[routes]]` or
+  `[[route_prefixes]]` entry matches.
+
+  The builtin table is the **superset** of what the three observed upstream surfaces serve —
+  `x-api-key` (11 ids), Claude subscription OAuth (10, no `claude-opus-4-1-20250805`), and the
+  reference apps gateway (10, no `claude-opus-4-5-20251101`). It is a snapshot with no
+  credential behind it, so it over-advertises by design: a caller may see an id its own
+  credential cannot reach, and that stays a runtime error rather than a discovery-time
+  entitlement probe. A successful live fetch **supersedes** the snapshot rather than merging
+  with it, precisely so a caller with a real answer is not handed ids it cannot use.
 - Never redirect; respond well under 3 s.
 - If `[[models]]` is empty and `auto_include_builtin_models = false`, return the envelope with
   `"data": []` (discovery simply adds nothing; the custom model option still works).
@@ -139,9 +175,16 @@ and `count_tokens_uses_tiktoken_by_default` in `tests/passthrough.rs`.
 
 ## 8. Tests
 
-- `/v1/models` returns curated entries followed by deduplicated builtins by default; disabling
-  `auto_include_builtin_models` returns only configured entries (including an empty list); never
-  emits a redirect; responds without an upstream call.
+- `/v1/models` returns curated entries followed by deduplicated automatic entries by default;
+  disabling `auto_include_builtin_models` returns only configured entries (including an empty
+  list) and issues no upstream call; never emits a redirect.
+- Upstream list fetch (`discovery::upstream`, wiremock): forwards the caller's credential and maps
+  every field; makes no call at all when a passthrough upstream has no caller credential; drops the
+  `x-api-key` duplicated alongside an `sk-ant-oat…` bearer; injects a configured `api_key`; follows
+  `has_more` pagination only while it can establish a complete result; and returns `None` — so
+  discovery falls back to the builtin snapshot — on an upstream error, an empty list, an
+  unfollowable cursor, or the five-page backstop. A successful fetch supersedes the snapshot
+  (`live_upstream_list_supersedes_the_builtin_snapshot`).
 - Config validation: a map-less `[[models]]` id lacking a `[[routes]]` entry warns; a map-bearing
   entry hard-errors unless it names exactly one existing provider and has no explicit-route or
   duplicate-map conflict.
