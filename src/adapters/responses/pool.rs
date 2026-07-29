@@ -74,6 +74,11 @@ pub(super) async fn forward_chatgpt_oauth(
     let ramp_initial = state.config.storm_ramp_initial();
     let candidates = order.len();
     let mut last_response: Option<reqwest::Response> = None;
+    // The translated request is immutable across account attempts, so serialize it
+    // at most once per turn and give each attempt (including a 401 refresh retry)
+    // a cheap refcount clone. Keep this lazy so a successful websocket turn never
+    // pays to serialize an HTTP body it does not send (issue #251).
+    let mut http_body: Option<bytes::Bytes> = None;
 
     for (position, index) in order.into_iter().enumerate() {
         let account = &accounts_config[index];
@@ -138,12 +143,23 @@ pub(super) async fn forward_chatgpt_oauth(
             }
         }
 
+        // Borrow rather than clone here: the happy path then pays a single
+        // refcount bump at the `http_send` call below instead of two.
+        let body = http_body.get_or_insert_with(|| {
+            // `to_vec` serializes straight into the byte buffer `Bytes` takes
+            // ownership of, skipping the `fmt` machinery and UTF-8 round-trip
+            // `Value::to_string()` pays for. Serializing a `Value` cannot fail,
+            // so the fallback is unreachable — it just keeps the old path.
+            serde_json::to_vec(&upstream_body)
+                .map(bytes::Bytes::from)
+                .unwrap_or_else(|_| bytes::Bytes::from(upstream_body.to_string()))
+        });
         let upstream = match http_send(
             &state,
             &route,
             credential.clone(),
             session_id.as_deref(),
-            bytes::Bytes::from(upstream_body.to_string()),
+            body.clone(),
         )
         .await
         {
@@ -221,7 +237,7 @@ pub(super) async fn forward_chatgpt_oauth(
                     &route,
                     retry_credential,
                     session_id.as_deref(),
-                    bytes::Bytes::from(upstream_body.to_string()),
+                    body.clone(),
                 )
                 .await
                 {
