@@ -120,6 +120,7 @@ pub struct CursorAgentClient {
 
 /// An inline image attached to the current user message. `data` is the raw
 /// (already base64-decoded) image bytes.
+#[derive(Debug, PartialEq, Eq)]
 pub struct AgentImage {
     pub data: Vec<u8>,
     pub uuid: String,
@@ -137,14 +138,14 @@ pub struct AgentTool {
 }
 
 /// Inputs for a single agent turn.
-pub struct AgentRunParams<'a> {
-    pub prompt: &'a str,
-    pub model_id: &'a str,
-    pub cwd: &'a str,
+pub struct AgentRunParams {
+    pub prompt: String,
+    pub model_id: String,
+    pub cwd: String,
     /// `AgentMode` enum (`UserMessage.mode`): AGENT=1, ASK=2, PLAN=3.
     pub mode: u64,
-    pub images: &'a [AgentImage],
-    pub tools: &'a [AgentTool],
+    pub images: Vec<AgentImage>,
+    pub tools: Vec<AgentTool>,
 }
 
 impl CursorAgentClient {
@@ -156,16 +157,16 @@ impl CursorAgentClient {
         }
     }
 
-    /// Open a single agent turn: start the paced request stream and return once
-    /// the response headers arrive. The returned turn keeps the request stream
-    /// open (with heartbeats) until it is read to completion or dropped.
+    /// Open a single agent turn: send the pre-built frames as a paced request
+    /// stream and return once response headers arrive. The returned turn keeps the
+    /// request stream open (with heartbeats) until it is read to completion or
+    /// dropped.
     pub async fn open_turn(
         &self,
         token: &str,
-        params: &AgentRunParams<'_>,
+        frames: Vec<Bytes>,
     ) -> Result<CursorAgentTurn, CursorError> {
         let request_id = uuid::Uuid::new_v4().to_string();
-        let frames = build_run_frames(params);
 
         // The request body is fed by a paced sender task so the server sees the
         // marker frames arrive over time (single-shot half-close yields
@@ -566,7 +567,20 @@ fn encode_selected_context(images: &[AgentImage]) -> Vec<u8> {
 }
 
 /// Build the ordered Connect frames for a single agent turn.
-fn build_run_frames(params: &AgentRunParams<'_>) -> Vec<Bytes> {
+///
+/// Framing is unconditionally offloaded at the call site. The measured blocking-
+/// pool round trip is 10.2 µs (1,000 samples, release profile), while a 4 KiB
+/// text-only turn frames in about 9.9 µs, so that small case pays roughly its own
+/// cost again in scheduling. This is accepted because Claude Code Cursor turns
+/// always carry tools, where framing takes about 336 µs and dwarfs the round trip;
+/// the absolute cost is about 10 µs on a path that then makes a network round trip;
+/// and no size predicate can soundly bound the non-linear cost of encoding tool
+/// schemas. The calibration is reproducible with the ignored
+/// `connect::tests::measure_spawn_blocking_round_trip` test.
+///
+/// Exposed for the benchmark target only, not a stability commitment.
+#[doc(hidden)]
+pub fn build_run_frames(params: &AgentRunParams) -> Vec<Bytes> {
     let AgentRunParams {
         prompt,
         model_id: model,
@@ -912,20 +926,102 @@ mod tests {
     use super::*;
 
     fn offload_observer() -> std::sync::MutexGuard<'static, ()> {
-        crate::adapters::cursor::connect::OFFLOAD_OBSERVER
+        crate::adapters::cursor::offload::OFFLOAD_OBSERVER
             .lock()
             .unwrap_or_else(|error| error.into_inner())
     }
 
-    fn text_params<'a>(prompt: &'a str, model: &'a str, cwd: &'a str) -> AgentRunParams<'a> {
+    fn text_params(prompt: &str, model: &str, cwd: &str) -> AgentRunParams {
         AgentRunParams {
-            prompt,
-            model_id: model,
-            cwd,
+            prompt: prompt.to_string(),
+            model_id: model.to_string(),
+            cwd: cwd.to_string(),
             mode: 1,
-            images: &[],
-            tools: &[],
+            images: Vec::new(),
+            tools: Vec::new(),
         }
+    }
+
+    async fn build_run_frames_offloaded(params: AgentRunParams) -> Vec<Bytes> {
+        crate::adapters::cursor::build_run_frames_async(params)
+            .await
+            .expect("framing offload should complete")
+    }
+
+    fn assert_frame_parts(frames: &[Bytes], markers: &[&str]) {
+        assert_eq!(frames.len(), 12);
+        for frame in frames {
+            assert!(frame.len() >= 5);
+            let len = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]) as usize;
+            assert_eq!(len + 5, frame.len());
+            assert_eq!(frame[0], 0);
+        }
+        let first = String::from_utf8_lossy(&frames[0]);
+        for marker in markers {
+            assert!(first.contains(marker), "missing marker {marker:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn offloaded_text_framing_matches_sync_structure() {
+        let _observer = offload_observer();
+        let sync = build_run_frames(&text_params("TEXT_MARKER", "MODEL_MARKER", "/tmp"));
+        let offloaded =
+            build_run_frames_offloaded(text_params("TEXT_MARKER", "MODEL_MARKER", "/tmp")).await;
+
+        assert_eq!(sync.len(), offloaded.len());
+        assert_frame_parts(&sync, &["TEXT_MARKER", "MODEL_MARKER"]);
+        assert_frame_parts(&offloaded, &["TEXT_MARKER", "MODEL_MARKER"]);
+        assert_eq!(&sync[1..], &offloaded[1..]);
+    }
+
+    #[tokio::test]
+    async fn offloaded_tool_and_image_framing_matches_sync_structure() {
+        let _observer = offload_observer();
+        fn params() -> AgentRunParams {
+            AgentRunParams {
+                prompt: "IMAGE_PROMPT_MARKER".into(),
+                model_id: "MODEL_MARKER".into(),
+                cwd: "/tmp".into(),
+                mode: 1,
+                images: vec![AgentImage {
+                    data: b"IMAGE_DATA_MARKER".to_vec(),
+                    uuid: "IMAGE_UUID_MARKER".into(),
+                    path: "IMAGE_PATH_MARKER.png".into(),
+                    mime_type: "image/png".into(),
+                }],
+                tools: vec![AgentTool {
+                    name: "TOOL_NAME_MARKER".into(),
+                    description: "TOOL_DESCRIPTION_MARKER".into(),
+                    input_schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"SCHEMA_PROPERTY_MARKER": {"type": "string"}}
+                    }),
+                }],
+            }
+        }
+
+        let sync = build_run_frames(&params());
+        let offloaded = build_run_frames_offloaded(params()).await;
+        // Every request field that rides in frame 0 is asserted, not just the
+        // identifiers: the image bytes (`SelectedImage` f8) and the tool schema
+        // could be dropped without changing frame count or `frames[1..]`, so
+        // omitting them here would let an empty image reach Cursor unnoticed.
+        let markers = [
+            "IMAGE_PROMPT_MARKER",
+            "MODEL_MARKER",
+            "IMAGE_UUID_MARKER",
+            "IMAGE_PATH_MARKER.png",
+            "IMAGE_DATA_MARKER",
+            "image/png",
+            "TOOL_NAME_MARKER",
+            "TOOL_DESCRIPTION_MARKER",
+            "SCHEMA_PROPERTY_MARKER",
+        ];
+        assert_eq!(sync.len(), offloaded.len());
+        assert_frame_parts(&sync, &markers);
+        assert_frame_parts(&offloaded, &markers);
+        assert_eq!(&sync[1..], &offloaded[1..]);
     }
 
     #[test]
@@ -985,20 +1081,20 @@ mod tests {
         // f4 (mode) inside the user message carries the AgentMode enum. A Plan
         // turn (3) must differ from an Agent turn (1) in the frame-0 bytes.
         let agent = build_run_frames(&AgentRunParams {
-            prompt: "x",
-            model_id: "m",
-            cwd: "/tmp",
+            prompt: "x".into(),
+            model_id: "m".into(),
+            cwd: "/tmp".into(),
             mode: 1,
-            images: &[],
-            tools: &[],
+            images: Vec::new(),
+            tools: Vec::new(),
         });
         let plan = build_run_frames(&AgentRunParams {
-            prompt: "x",
-            model_id: "m",
-            cwd: "/tmp",
+            prompt: "x".into(),
+            model_id: "m".into(),
+            cwd: "/tmp".into(),
             mode: 3,
-            images: &[],
-            tools: &[],
+            images: Vec::new(),
+            tools: Vec::new(),
         });
         assert_ne!(agent[0], plan[0], "mode must change the request bytes");
     }
@@ -1012,12 +1108,12 @@ mod tests {
             mime_type: "image/png".into(),
         };
         let frames = build_run_frames(&AgentRunParams {
-            prompt: "look",
-            model_id: "m",
-            cwd: "/tmp",
+            prompt: "look".into(),
+            model_id: "m".into(),
+            cwd: "/tmp".into(),
             mode: 1,
-            images: std::slice::from_ref(&image),
-            tools: &[],
+            images: vec![image],
+            tools: Vec::new(),
         });
         let hay = String::from_utf8_lossy(&frames[0]);
         // uuid, path and mime are string fields of the SelectedImage.
@@ -1074,12 +1170,12 @@ mod tests {
             }),
         };
         let frames = build_run_frames(&AgentRunParams {
-            prompt: "x",
-            model_id: "m",
-            cwd: "/tmp",
+            prompt: "x".into(),
+            model_id: "m".into(),
+            cwd: "/tmp".into(),
             mode: 1,
-            images: &[],
-            tools: std::slice::from_ref(&tool),
+            images: Vec::new(),
+            tools: vec![tool],
         });
         let hay = String::from_utf8_lossy(&frames[0]);
         assert!(hay.contains("Read"));

@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod connect;
 pub mod model;
+pub(crate) mod offload;
 pub mod request;
 pub mod sse;
 // Retained pending #170 follow-up: the old `api2.cursor.sh` proto/transport and
@@ -90,7 +91,7 @@ async fn forward(
         }
     };
     let prompt = request::render_cursor_prompt(request);
-    let images = decode_cursor_images(request);
+    let images = decode_cursor_images_async(request).await?;
     let tools = extract_cursor_tools(request);
     let want_stream = request
         .get("stream")
@@ -108,20 +109,22 @@ async fn forward(
 
     let client = CursorAgentClient::new(state.http_client.clone());
     let params = agent::AgentRunParams {
-        prompt: &prompt,
-        model_id: &resolved.model_id,
-        cwd,
+        prompt,
+        model_id: resolved.model_id,
+        cwd: cwd.to_string(),
         mode: resolved.mode.wire_enum(),
-        images: &images,
-        tools: &tools,
+        images,
+        tools,
     };
+    let frames = build_run_frames_async(params).await?;
     // `open_turn` returns once the response headers arrive, keeping the paced
     // request stream open behind the returned turn. It is not wrapped in the
     // shared `send_with_retry` (which is typed to `reqwest::Response`); a
-    // connection blip surfaces to the client. TODO(#170): bounded pre-response
-    // retry for the streaming turn.
+    // connection blip surfaces to the client. Building first also lets the
+    // TODO(#170) retry reuse cheap `Bytes` clones instead of reframing.
+    // TODO(#170): bounded pre-response retry for the streaming turn.
     let turn = client
-        .open_turn(&access_token, &params)
+        .open_turn(&access_token, frames)
         .await
         .map_err(map_client_error)?;
     if !turn.status().is_success() {
@@ -139,12 +142,39 @@ async fn forward(
     ))
 }
 
-/// Base64-decode the request's inline images into agent image inputs. URL
-/// images (skipped upstream) and any that fail to decode are dropped; the
-/// rendered prompt still carries a text placeholder for them.
-fn decode_cursor_images(request: &Value) -> Vec<agent::AgentImage> {
+/// Maximum estimated decoded image bytes accepted inline on a Tokio worker.
+///
+/// The retained `gateway::cursor_extract_and_decode_images` benchmark measures
+/// the complete synchronous path: JSON extraction, base64-string cloning, and
+/// decode. On Apple Silicon its 64 KiB and 128 KiB medians are 54.55 µs and
+/// 112.7 µs, respectively; 64 KiB stays inside Tokio's 100 µs worker-blocking
+/// budget while 128 KiB does not. `gateway::cursor_decode_images` retains the
+/// decode-only baseline over the same sizes.
+///
+/// The extraction itself stays inline: it borrows the request `Value`, so moving
+/// it into a `'static` blocking closure needs a larger refactor than this path.
+pub(crate) const INLINE_IMAGE_DECODE_BYTES: usize = 64 * 1024;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestPrepPath {
+    ImageInline,
+    ImageOffloaded,
+    FramingOffloaded,
+}
+
+#[cfg(test)]
+static LAST_REQUEST_PREP_PATH: std::sync::Mutex<Option<RequestPrepPath>> =
+    std::sync::Mutex::new(None);
+
+/// Base64-decode selected request images into agent image inputs. Images that
+/// fail to decode are dropped, preserving the existing request semantics.
+///
+/// Exposed for the benchmark target only, not a stability commitment.
+#[doc(hidden)]
+pub fn decode_selected_images(images: Vec<request::CursorSelectedImage>) -> Vec<agent::AgentImage> {
     use base64::Engine;
-    request::cursor_selected_images(request)
+    images
         .into_iter()
         .filter_map(|image| {
             let data = base64::engine::general_purpose::STANDARD
@@ -158,6 +188,66 @@ fn decode_cursor_images(request: &Value) -> Vec<agent::AgentImage> {
             })
         })
         .collect()
+}
+
+/// Extract inline images and offload base64 decode only when their estimated
+/// decoded size exceeds the measured inline budget. URL images remain excluded
+/// by `cursor_selected_images`; the rendered prompt still contains placeholders.
+async fn decode_selected_images_async(
+    images: Vec<request::CursorSelectedImage>,
+) -> Result<Vec<agent::AgentImage>, AdapterError> {
+    // Base64 expands exactly 4:3, so the encoded length is a sound upper bound on
+    // the decoded size: this rounds each image up to the next multiple of 3 and
+    // never under-estimates the decode work the predicate is gating.
+    let decoded_bytes = images.iter().fold(0usize, |total, image| {
+        total.saturating_add(image.data.len().saturating_mul(3) / 4)
+    });
+    if decoded_bytes <= INLINE_IMAGE_DECODE_BYTES {
+        #[cfg(test)]
+        LAST_REQUEST_PREP_PATH
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .replace(RequestPrepPath::ImageInline);
+        return Ok(decode_selected_images(images));
+    }
+
+    offload::spawn_bounded_request_prep(move || {
+        #[cfg(test)]
+        LAST_REQUEST_PREP_PATH
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .replace(RequestPrepPath::ImageOffloaded);
+        decode_selected_images(images)
+    })
+    .await
+    .map_err(|error| request_prep_error("cursor image decode", error))
+}
+
+async fn build_run_frames_async(params: agent::AgentRunParams) -> Result<Vec<Bytes>, AdapterError> {
+    offload::spawn_bounded_request_prep(move || {
+        #[cfg(test)]
+        LAST_REQUEST_PREP_PATH
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .replace(RequestPrepPath::FramingOffloaded);
+        agent::build_run_frames(&params)
+    })
+    .await
+    .map_err(|error| request_prep_error("cursor request framing", error))
+}
+
+fn request_prep_error(context: &'static str, error: std::io::Error) -> AdapterError {
+    own_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "api_error",
+        format!("{context}: {error}"),
+    )
+}
+
+async fn decode_cursor_images_async(
+    request: &Value,
+) -> Result<Vec<agent::AgentImage>, AdapterError> {
+    decode_selected_images_async(request::cursor_selected_images(request)).await
 }
 
 /// Extract advertised client tools into native MCP tool declarations. Tools
@@ -424,8 +514,9 @@ fn bad_gateway(message: String) -> AdapterError {
 }
 
 fn own_error(status: StatusCode, kind: &'static str, message: impl Into<String>) -> AdapterError {
+    let message = message.into();
     AdapterError {
-        message: "Cursor adapter failed".to_string(),
+        message: format!("Cursor adapter failed: {message}"),
         response: Box::new(ShuntError::new(status, kind, message).into_response()),
         failure: None,
     }
@@ -433,7 +524,10 @@ fn own_error(status: StatusCode, kind: &'static str, message: impl Into<String>)
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::await_holding_lock)] // Intentional cross-module test serialization.
+
     use axum::body::to_bytes;
+    use base64::Engine;
     use serde_json::Value;
     use wiremock::{
         matchers::{method, path},
@@ -677,8 +771,206 @@ mod tests {
         assert!(extract_cursor_tools(&serde_json::json!({})).is_empty());
     }
 
-    #[test]
-    fn decode_cursor_images_decodes_base64_and_skips_unsupported_images() {
+    fn selected_image(decoded_bytes: usize) -> request::CursorSelectedImage {
+        request::CursorSelectedImage {
+            data: base64::engine::general_purpose::STANDARD.encode(vec![0x5a; decoded_bytes]),
+            uuid: "image-uuid".to_string(),
+            path: "claude-image-1.png".to_string(),
+            mime_type: "image/png".to_string(),
+        }
+    }
+
+    fn reset_request_prep_path() {
+        *LAST_REQUEST_PREP_PATH
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+
+    fn request_prep_path() -> RequestPrepPath {
+        LAST_REQUEST_PREP_PATH
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .expect("request-preparation path should be recorded")
+    }
+
+    #[tokio::test]
+    async fn image_decode_threshold_selects_expected_path_and_preserves_values() {
+        let _observer = offload::OFFLOAD_OBSERVER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        // The predicate rounds each image up to the next multiple of 3 (see
+        // `decode_selected_images_async`), so a payload of exactly the threshold
+        // estimates 2 bytes over and offloads. Erring toward the offload at the
+        // boundary is the intended direction: the estimate must never claim less
+        // work than the decode actually costs.
+        for (decoded_bytes, expected_path) in [
+            (INLINE_IMAGE_DECODE_BYTES - 2, RequestPrepPath::ImageInline),
+            (INLINE_IMAGE_DECODE_BYTES - 1, RequestPrepPath::ImageInline),
+            (INLINE_IMAGE_DECODE_BYTES, RequestPrepPath::ImageOffloaded),
+        ] {
+            let selected = selected_image(decoded_bytes);
+            let expected = decode_selected_images(vec![selected.clone()]);
+            reset_request_prep_path();
+            let actual = decode_selected_images_async(vec![selected]).await.unwrap();
+
+            assert_eq!(request_prep_path(), expected_path);
+            assert_eq!(actual, expected);
+            assert_eq!(actual[0].data.len(), decoded_bytes);
+            assert_eq!(actual[0].uuid, "image-uuid");
+            assert_eq!(actual[0].path, "claude-image-1.png");
+            assert_eq!(actual[0].mime_type, "image/png");
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_image_decode_uses_aggregate_threshold() {
+        let _observer = offload::OFFLOAD_OBSERVER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        let under_each = (INLINE_IMAGE_DECODE_BYTES - 12) / 3;
+        let under = vec![
+            selected_image(under_each),
+            selected_image(under_each),
+            selected_image(under_each),
+        ];
+        reset_request_prep_path();
+        let decoded = decode_selected_images_async(under).await.unwrap();
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(request_prep_path(), RequestPrepPath::ImageInline);
+
+        let over_each = INLINE_IMAGE_DECODE_BYTES / 3 + 1;
+        let over = vec![
+            selected_image(over_each),
+            selected_image(over_each),
+            selected_image(over_each),
+        ];
+        reset_request_prep_path();
+        let decoded = decode_selected_images_async(over).await.unwrap();
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(request_prep_path(), RequestPrepPath::ImageOffloaded);
+    }
+
+    #[tokio::test]
+    async fn production_framing_helper_offloads_and_preserves_structure() {
+        let _observer = offload::OFFLOAD_OBSERVER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let params = agent::AgentRunParams {
+            prompt: "TEXT_MARKER".into(),
+            model_id: "MODEL_MARKER".into(),
+            cwd: "/tmp".into(),
+            mode: 1,
+            images: Vec::new(),
+            tools: Vec::new(),
+        };
+
+        reset_request_prep_path();
+        let frames = build_run_frames_async(params).await.unwrap();
+
+        assert_eq!(request_prep_path(), RequestPrepPath::FramingOffloaded);
+        assert_eq!(frames.len(), 12);
+        assert!(String::from_utf8_lossy(&frames[0]).contains("TEXT_MARKER"));
+        assert!(String::from_utf8_lossy(&frames[0]).contains("MODEL_MARKER"));
+        assert_eq!(
+            u32::from_be_bytes([frames[0][1], frames[0][2], frames[0][3], frames[0][4]]) as usize
+                + 5,
+            frames[0].len()
+        );
+    }
+
+    #[tokio::test]
+    async fn request_prep_proceeds_while_gzip_is_saturated() {
+        let _observer = offload::OFFLOAD_OBSERVER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let gzip_slots = offload::gzip_slots();
+        let request_prep_slots = offload::request_prep_slots();
+        let gzip_capacity = gzip_slots.available_permits();
+        let request_prep_capacity = request_prep_slots.available_permits();
+        assert!(gzip_capacity > 0);
+        assert!(request_prep_capacity > 0);
+
+        let held_gzip = gzip_slots
+            .acquire_many(gzip_capacity as u32)
+            .await
+            .expect("gzip semaphore should remain open");
+        assert_eq!(gzip_slots.available_permits(), 0);
+
+        let params = agent::AgentRunParams {
+            prompt: "TEXT_MARKER".into(),
+            model_id: "MODEL_MARKER".into(),
+            cwd: "/tmp".into(),
+            mode: 1,
+            images: Vec::new(),
+            tools: Vec::new(),
+        };
+        reset_request_prep_path();
+        let frames = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            build_run_frames_async(params),
+        )
+        .await
+        .expect("request framing should proceed while gzip is saturated")
+        .expect("request frames should build");
+        assert_eq!(request_prep_path(), RequestPrepPath::FramingOffloaded);
+        assert_eq!(frames.len(), 12);
+        assert!(String::from_utf8_lossy(&frames[0]).contains("TEXT_MARKER"));
+        assert!(String::from_utf8_lossy(&frames[0]).contains("MODEL_MARKER"));
+        assert_eq!(
+            u32::from_be_bytes([frames[0][1], frames[0][2], frames[0][3], frames[0][4]]) as usize
+                + 5,
+            frames[0].len()
+        );
+
+        let selected = selected_image(INLINE_IMAGE_DECODE_BYTES);
+        reset_request_prep_path();
+        let images = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            decode_selected_images_async(vec![selected]),
+        )
+        .await
+        .expect("image decode should proceed while gzip is saturated")
+        .expect("selected image should decode");
+        assert_eq!(request_prep_path(), RequestPrepPath::ImageOffloaded);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].data.len(), INLINE_IMAGE_DECODE_BYTES);
+
+        drop(held_gzip);
+        assert_eq!(gzip_slots.available_permits(), gzip_capacity);
+        assert_eq!(
+            request_prep_slots.available_permits(),
+            request_prep_capacity
+        );
+    }
+
+    #[tokio::test]
+    async fn request_prep_failures_map_to_local_anthropic_500() {
+        for context in ["cursor request framing", "cursor image decode"] {
+            let error = request_prep_error(context, std::io::Error::other("join failed"));
+            assert!(error.message.contains(context));
+            assert!(error.message.contains("join failed"));
+            assert!(error.failure.is_none());
+            assert_eq!(error.response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            let body = body_json(error).await;
+            assert_eq!(body["type"], "error");
+            assert_eq!(body["error"]["type"], "api_error");
+            assert!(body["error"]["message"]
+                .as_str()
+                .is_some_and(
+                    |message| message.contains(context) && message.contains("join failed")
+                ));
+        }
+    }
+
+    #[tokio::test]
+    async fn decode_cursor_images_decodes_base64_and_skips_unsupported_images() {
+        // Records `LAST_REQUEST_PREP_PATH`, which request-preparation path tests
+        // assert on.
+        let _observer = offload::OFFLOAD_OBSERVER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let request = serde_json::json!({
             "messages": [{
                 "role": "user",
@@ -710,7 +1002,7 @@ mod tests {
             }]
         });
 
-        let images = decode_cursor_images(&request);
+        let images = decode_cursor_images_async(&request).await.unwrap();
 
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].data, b"hello");
