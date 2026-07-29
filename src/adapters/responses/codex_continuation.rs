@@ -94,7 +94,25 @@ pub struct Decision {
 /// suffix. Returns `None` — meaning "send the full input" — on any mismatch, a
 /// shrunk input, or an empty delta.
 pub fn decide(stored: &StoredContinuation, current_body: &Value) -> Option<Decision> {
-    if signature(current_body) != stored.signature {
+    let current_signature = signature(current_body);
+    decide_with_signature(stored, current_body, &current_signature)
+}
+
+/// Decide whether the current request can continue using a precomputed signature.
+///
+/// `current_signature` **must** be `signature(current_body)`. The parameter exists
+/// solely so a caller that already computed the signature (currently
+/// `src/adapters/responses/websocket.rs`) does not recompute it. Passing a
+/// signature for another body is unsafe, not merely a cache miss: if it happens
+/// to equal `stored.signature`, this guard is bypassed and changed model,
+/// instructions, tools, reasoning, or other non-input fields go unchecked,
+/// allowing an invalid continuation to be accepted.
+pub fn decide_with_signature(
+    stored: &StoredContinuation,
+    current_body: &Value,
+    current_signature: &str,
+) -> Option<Decision> {
+    if current_signature != stored.signature {
         return None;
     }
     let input = current_body.get("input").and_then(Value::as_array)?;
@@ -135,12 +153,16 @@ pub fn signature(body: &Value) -> String {
     let Some(object) = body.as_object() else {
         return String::new();
     };
-    let filtered: Map<String, Value> = object
+    let mut entries = object
         .iter()
         .filter(|(key, _)| key.as_str() != "input")
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
-    stable_string(&Value::Object(filtered))
+        .collect::<Vec<_>>();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let inner = entries
+        .into_iter()
+        .map(|(key, value)| format!("{}:{}", encode_str(key), stable_string(value)))
+        .collect::<Vec<_>>();
+    format!("{{{}}}", inner.join(","))
 }
 
 /// Deterministic JSON string with object keys sorted recursively, so the
@@ -515,6 +537,87 @@ mod tests {
         };
         let current = body(vec![user("hi")]);
         assert!(decide(&stored, &current).is_none());
+    }
+
+    #[test]
+    fn decide_with_signature_matches_decide_on_hit() {
+        let stored = StoredContinuation {
+            response_id: "resp_1".to_string(),
+            signature: signature(&body(vec![user("hi")])),
+            transcript: build_transcript(&[user("hi")], &[backend_assistant("hello")]),
+            turn_state: None,
+        };
+        let current = body(vec![
+            user("hi"),
+            reconstructed_assistant("hello"),
+            user("bye"),
+        ]);
+        let current_signature = signature(&current);
+
+        assert_eq!(
+            decide_with_signature(&stored, &current, &current_signature),
+            decide(&stored, &current)
+        );
+        assert!(decide(&stored, &current).is_some());
+    }
+
+    #[test]
+    fn decide_with_signature_matches_decide_when_non_input_field_changes() {
+        let stored = StoredContinuation {
+            response_id: "resp_1".to_string(),
+            signature: signature(&body(vec![user("hi")])),
+            transcript: build_transcript(&[user("hi")], &[backend_assistant("hello")]),
+            turn_state: None,
+        };
+        let mut current = body(vec![
+            user("hi"),
+            reconstructed_assistant("hello"),
+            user("bye"),
+        ]);
+        current["reasoning"]["effort"] = json!("high");
+        let current_signature = signature(&current);
+
+        assert_eq!(
+            decide_with_signature(&stored, &current, &current_signature),
+            decide(&stored, &current)
+        );
+        assert!(decide(&stored, &current).is_none());
+    }
+
+    #[test]
+    fn decide_with_signature_uses_the_passed_signature_as_the_guard() {
+        let stored = StoredContinuation {
+            response_id: "resp_1".to_string(),
+            signature: signature(&body(vec![user("hi")])),
+            transcript: build_transcript(&[user("hi")], &[backend_assistant("hello")]),
+            turn_state: None,
+        };
+        let current = body(vec![
+            user("hi"),
+            reconstructed_assistant("hello"),
+            user("bye"),
+        ]);
+
+        assert!(decide(&stored, &current).is_some());
+        assert!(decide_with_signature(&stored, &current, "not-the-current-signature").is_none());
+    }
+
+    #[test]
+    fn signature_format_is_stable_for_nested_and_escaped_values() {
+        let fixture = json!({
+            "z_null": null,
+            "nested": {
+                "z": [1, true, null, {"b": "line\n\"slash\\", "a\"b": false}],
+                "a": -2.5
+            },
+            "input": [user("excluded")],
+            "a\"b": "quote \" newline\n tab\t slash\\"
+        });
+
+        assert_eq!(
+            signature(&fixture),
+            r#"{"a\"b":"quote \" newline\n tab\t slash\\","nested":{"a":-2.5,"z":[1,true,null,{"a\"b":false,"b":"line\n\"slash\\"}]},"z_null":null}"#
+        );
     }
 
     #[test]

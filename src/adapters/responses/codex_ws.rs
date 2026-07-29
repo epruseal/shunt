@@ -385,11 +385,13 @@ pub fn response_create_frame(mut body: Value) -> Value {
 }
 
 /// What to record as continuation state after a turn completes: the request's
-/// non-input signature and its full logical input, so the reader can assemble
-/// `input ++ output_items` for the next turn's prefix match.
+/// non-input signature and an optional shared translated request. The reader
+/// extracts its full logical `input` after the turn completes, then assembles
+/// `input ++ output_items` for the next turn's prefix match. Sharing the [`Arc`]
+/// replaces the old per-turn deep clone of the input array.
 pub struct RecordPlan {
     pub signature: String,
-    pub request_input: Vec<Value>,
+    pub request: Option<Arc<Value>>,
 }
 
 impl RecordPlan {
@@ -397,7 +399,7 @@ impl RecordPlan {
     pub fn none() -> Self {
         Self {
             signature: String::new(),
-            request_input: Vec::new(),
+            request: None,
         }
     }
 }
@@ -947,7 +949,16 @@ async fn run_turn(
                             let stored = StoredContinuation {
                                 response_id,
                                 signature: record.signature,
-                                transcript: build_transcript(&record.request_input, &output_items),
+                                transcript: build_transcript(
+                                    record
+                                        .request
+                                        .as_deref()
+                                        .and_then(|request| request.get("input"))
+                                        .and_then(Value::as_array)
+                                        .map(Vec::as_slice)
+                                        .unwrap_or_default(),
+                                    &output_items,
+                                ),
                                 turn_state: turn_state
                                     .or_else(|| conn.handshake_turn_state.clone()),
                             };
@@ -2014,7 +2025,7 @@ mod tests {
                 &frame,
                 RecordPlan {
                     signature: "sig-a".to_string(),
-                    request_input: vec![user_hi.clone()],
+                    request: Some(Arc::new(serde_json::json!({"input": [user_hi.clone()]}))),
                 },
             )
             .await

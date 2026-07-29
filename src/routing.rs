@@ -61,15 +61,31 @@ pub(crate) fn resolve_request_chain(
     config: &Config,
     body: &[u8],
 ) -> Result<(Vec<Route>, String), ShuntError> {
-    let view: RoutingView = serde_json::from_slice(body).map_err(|error| {
-        ShuntError::new(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            format!("request body must include a JSON model field: {error}"),
-        )
-    })?;
+    // Deserialize the narrow view straight from bytes for callers without a
+    // parsed tree: serde can skip every non-model field without materializing it.
+    let view: RoutingView = serde_json::from_slice(body).map_err(invalid_routing_request)?;
+    Ok(resolve_view(config, view))
+}
+
+pub(crate) fn resolve_request_chain_value(
+    config: &Config,
+    request: &serde_json::Value,
+) -> Result<(Vec<Route>, String), ShuntError> {
+    let view = RoutingView::deserialize(request).map_err(invalid_routing_request)?;
+    Ok(resolve_view(config, view))
+}
+
+fn resolve_view(config: &Config, view: RoutingView) -> (Vec<Route>, String) {
     let routes = resolve_model_chain(config, &view.model);
-    Ok((routes, view.model))
+    (routes, view.model)
+}
+
+pub(crate) fn invalid_routing_request(error: serde_json::Error) -> ShuntError {
+    ShuntError::new(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        format!("request body must include a JSON model field: {error}"),
+    )
 }
 
 /// Claude Code appends a `[1m]` suffix to a model id as a *client-side* hint that
@@ -454,6 +470,15 @@ mod tests {
             assert_eq!(routes.len(), 1);
             assert_eq!(routes[0].provider, provider);
         }
+    }
+
+    #[test]
+    fn request_chain_rejects_duplicate_model_fields() {
+        assert!(resolve_request_chain(
+            &Config::default(),
+            br#"{"model":"first","model":"second"}"#,
+        )
+        .is_err());
     }
 
     #[test]
