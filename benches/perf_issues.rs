@@ -1,4 +1,4 @@
-//! Focused measurements for performance issues #252, #253, and #265.
+//! Focused measurements for performance issues #252, #253, #264, and #265.
 //!
 //! `pre_parse_once_http_responses_cpu_front` and
 //! `pre_parse_once_codex_ws_reused_prepare_and_serialize` are deliberately frozen
@@ -8,17 +8,22 @@
 //! parse-once implementation.
 //!
 //! Those baselines are frozen at pre-#261 specifically, so they are not a
-//! before/after for any later change. The #265 borrow-vs-clone comparison is its
-//! own pair: `codex_ws_non_continuation_clone_and_serialize` reproduces the
-//! per-send deep clone `start_ws_turn` no longer performs, and
-//! `codex_ws_non_continuation_borrow_and_serialize` models the borrow-based frame
-//! envelope that replaced it.
+//! before/after for any later change — each later refactor carries its own pair.
+//! The #264 continuation-sharing comparison is
+//! `pre_arc_stored_continuation_retrieve`, which reproduces the deep clone
+//! `Turn::stored_continuation` no longer performs, against
+//! `arc_stored_continuation_retrieve`. The #265 borrow-vs-clone comparison is
+//! `codex_ws_non_continuation_clone_and_serialize`, which reproduces the per-send
+//! deep clone `start_ws_turn` no longer performs, against
+//! `codex_ws_non_continuation_borrow_and_serialize`, which models the borrow-based
+//! frame envelope that replaced it.
 //!
-//! Do not update the frozen baselines — the two `pre_parse_once_*` benchmarks and
+//! Do not update the frozen baselines — the two `pre_parse_once_*` benchmarks,
+//! `pre_arc_stored_continuation_retrieve`, and
 //! `codex_ws_non_continuation_clone_and_serialize` — to follow production: their
 //! stable old work is what keeps the before/after comparison meaningful.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::http::{HeaderMap, HeaderValue};
 use serde_json::{json, Value};
@@ -309,6 +314,26 @@ fn codex_continuation_decide_hit(bencher: divan::Bencher, size: usize) {
     bencher.bench(|| {
         codex_continuation::decide(divan::black_box(&stored), divan::black_box(&current)).unwrap()
     });
+}
+
+/// Retrieving a reused connection's continuation state, which every
+/// continuation-enabled turn on a pooled socket does before it can pick a delta
+/// (issue #264). `pre_arc_stored_continuation_retrieve` is a frozen reproduction
+/// of the pre-refactor `Turn::stored_continuation`, which deep-cloned the whole
+/// transcript out of the connection mutex; `arc_stored_continuation_retrieve`
+/// models sharing it behind an `Arc`.
+#[divan::bench(args = BODY_SIZES)]
+fn pre_arc_stored_continuation_retrieve(bencher: divan::Bencher, size: usize) {
+    let (stored, _) = continuation_fixture(size);
+    let slot = Mutex::new(Some(stored));
+    bencher.bench(|| divan::black_box(slot.lock().unwrap().clone()));
+}
+
+#[divan::bench(args = BODY_SIZES)]
+fn arc_stored_continuation_retrieve(bencher: divan::Bencher, size: usize) {
+    let (stored, _) = continuation_fixture(size);
+    let slot = Mutex::new(Some(Arc::new(stored)));
+    bencher.bench(|| divan::black_box(slot.lock().unwrap().clone()));
 }
 
 #[divan::bench(args = BODY_SIZES)]
