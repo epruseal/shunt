@@ -117,6 +117,142 @@ impl ConnectFrameDecoder {
 /// decompression so a malicious "zip bomb" payload cannot exhaust memory.
 const MAX_DECOMPRESSED_FRAME_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Compressed-size pre-filter for gzip frames that may be decoded inline.
+///
+/// The retained `gateway::decode_gzip_frame` benchmark measured representative
+/// 1 KiB, 4 KiB, 16 KiB, and 64 KiB compressed frames at 8.804 µs, 25.4 µs,
+/// 102.2 µs, and 435.9 µs median, respectively. The `spawn_blocking` round-trip
+/// overhead can be reproduced separately with:
+/// `cargo test -- --ignored --nocapture measure_spawn_blocking_round_trip`.
+///
+/// Compressed size alone cannot bound inflate work, so this is only a cheap
+/// early-out for obviously large frames. [`INLINE_GZIP_OUTPUT_BYTES`] is the
+/// actual inline-work safety bound.
+pub(crate) const INLINE_GZIP_FRAME_BYTES: usize = 4 * 1024;
+
+/// Maximum complete decompressed output accepted inline on a Tokio worker.
+/// The bounded probe materializes one additional byte to detect larger output.
+///
+/// Deflate can expand by roughly 1,032:1, and inflate throughput varies by about
+/// an order of magnitude with the data's redundancy, so compressed length cannot
+/// bound worker time. Direct measurement puts 32 KiB of realistic data at roughly
+/// 54–65 µs, within Tokio's 100 µs blocking budget; random/incompressible data is
+/// faster (roughly 8 µs), not a slower worst case.
+pub(crate) const INLINE_GZIP_OUTPUT_BYTES: usize = 32 * 1024;
+
+#[cfg(test)]
+pub(crate) static OFFLOADED_DECODES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) static OFFLOAD_OBSERVER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+static IN_FLIGHT_DECODES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+static MAX_IN_FLIGHT_DECODES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+struct InFlightDecode;
+
+#[cfg(test)]
+impl InFlightDecode {
+    fn enter() -> Self {
+        let in_flight = IN_FLIGHT_DECODES.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        MAX_IN_FLIGHT_DECODES.fetch_max(in_flight, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for InFlightDecode {
+    fn drop(&mut self) {
+        IN_FLIGHT_DECODES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Decode at most `budget + 1` output bytes to determine whether a gzip frame is
+/// small enough to finish inline. `None` means the caller must redo the complete
+/// decode off-thread; malformed input remains an error.
+fn decode_gzip_frame_within(
+    payload: &[u8],
+    budget: usize,
+) -> Result<Option<Vec<u8>>, std::io::Error> {
+    use std::io::Read;
+    let decoder = flate2::read::GzDecoder::new(payload);
+    // Size the buffer from the compressed length at a realistic ratio, capped by
+    // the budget, so a typical frame decodes without repeated growth.
+    let mut out = Vec::with_capacity(std::cmp::min(payload.len() * 4, budget + 1));
+    decoder.take(budget as u64 + 1).read_to_end(&mut out)?;
+    Ok((out.len() <= budget).then_some(out))
+}
+
+/// Limit concurrent gzip decodes to available CPU capacity. Callers wait on the
+/// async semaphore without occupying a Tokio worker, while admitted blocking
+/// tasks share the process-wide blocking pool with other gateway work.
+///
+/// Scope of the bound, stated precisely so it is not over-read: a permit covers
+/// one *in-progress* decode — the CPU cost and the peak simultaneous working set
+/// (compressed input plus the output buffer, whose `read_to_end` growth can leave
+/// roughly twice the cap reserved). It deliberately does not bound total resident
+/// memory: queued payloads are already-received bytes, and a finished output
+/// escapes the blocking closure as the task result, so it outlives the permit
+/// while the caller consumes it. Both scale with concurrent streams, which the
+/// gateway does not cap anywhere — `axum::serve` runs without a concurrency-limit
+/// layer and inbound auth is optional — a pre-existing gateway-wide property this
+/// path neither introduces nor can fix locally.
+///
+/// It is still a strict improvement: before the offload every concurrent stream
+/// inflated simultaneously, so peak decompressed buffers scaled with stream count
+/// rather than with these slots.
+///
+/// Excess streams queue rather than being shed. Each stream decodes at most one
+/// frame at a time and Tokio's semaphore is FIFO, so waiting is bounded delay, not
+/// starvation, and contention only begins once demand exceeds CPU capacity — where
+/// queueing beats thrashing. Failing an interactive request to avoid a short wait
+/// would be the worse trade.
+fn gzip_decode_slots() -> &'static tokio::sync::Semaphore {
+    static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| {
+        let n = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        tokio::sync::Semaphore::new(n.clamp(2, 16))
+    })
+}
+
+/// Decode a small gzip frame inline, or use Tokio's bounded blocking pool path.
+pub(crate) async fn decode_gzip_frame_async(payload: Bytes) -> Result<Vec<u8>, std::io::Error> {
+    if payload.len() <= INLINE_GZIP_FRAME_BYTES {
+        if let Some(out) = decode_gzip_frame_within(&payload, INLINE_GZIP_OUTPUT_BYTES)? {
+            return Ok(out);
+        }
+        // Re-inflating the first 32 KiB off-thread is intentional and bounded;
+        // it avoids letting compressed size masquerade as an output-work bound.
+    }
+
+    // Waiters queue asynchronously, so no runtime worker is blocked while all
+    // decode slots are occupied. This semaphore is never closed. Move the permit
+    // into the blocking task so cancellation cannot free a slot before its
+    // unabortable decode exits: admission tracks decode lifetime, not future lifetime.
+    let permit = gzip_decode_slots()
+        .acquire()
+        .await
+        .map_err(std::io::Error::other)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        #[cfg(test)]
+        let _in_flight = InFlightDecode::enter();
+        #[cfg(test)]
+        OFFLOADED_DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        decode_gzip_frame(&payload)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
 /// Decode gzipped payload bytes. The caller decides when to call this based
 /// on frame flags & FLAG_GZIP.
 ///
@@ -236,7 +372,45 @@ impl std::error::Error for ConnectError {}
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::await_holding_lock)] // Intentional cross-runtime test serialization.
+
     use super::*;
+    use std::io::Write;
+
+    fn offload_observer() -> std::sync::MutexGuard<'static, ()> {
+        OFFLOAD_OBSERVER
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn gzip(payload: &[u8]) -> Bytes {
+        gzip_with(payload, flate2::Compression::fast())
+    }
+
+    fn gzip_with(payload: &[u8], compression: flate2::Compression) -> Bytes {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), compression);
+        encoder.write_all(payload).unwrap();
+        Bytes::from(encoder.finish().unwrap())
+    }
+
+    fn incompressible_bytes(len: usize) -> Vec<u8> {
+        let mut state = 0x4d59_5df4_d0f3_3173u64;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    }
+
+    fn oversized_gzip_payload() -> Bytes {
+        static PAYLOAD: std::sync::OnceLock<Bytes> = std::sync::OnceLock::new();
+        PAYLOAD
+            .get_or_init(|| gzip(&vec![b'a'; (MAX_DECOMPRESSED_FRAME_BYTES as usize) + 1024]))
+            .clone()
+    }
 
     #[test]
     fn parses_context_overflow_as_bad_request() {
@@ -469,15 +643,7 @@ mod tests {
 
     #[test]
     fn gzip_frame_decompress() {
-        let payload = b"hello gzip";
-        let mut compressed = Vec::new();
-        {
-            use std::io::Write;
-            let mut encoder =
-                flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::fast());
-            encoder.write_all(payload).unwrap();
-            encoder.finish().unwrap();
-        }
+        let compressed = gzip(b"hello gzip");
 
         let frame = encode_connect_frame(&compressed, FLAG_GZIP);
         let mut decoder = ConnectFrameDecoder::new();
@@ -505,17 +671,143 @@ mod tests {
     fn gzip_frame_rejects_oversized_payload() {
         // A payload that decompresses beyond the cap must error rather than
         // silently truncate.
-        let oversized = vec![b'a'; (MAX_DECOMPRESSED_FRAME_BYTES as usize) + 1024];
-        let mut compressed = Vec::new();
-        {
-            use std::io::Write;
-            let mut encoder =
-                flate2::write::GzEncoder::new(&mut compressed, flate2::Compression::fast());
-            encoder.write_all(&oversized).unwrap();
-            encoder.finish().unwrap();
-        }
-
+        let compressed = oversized_gzip_payload();
         let err = decode_gzip_frame(&compressed).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn gzip_decode_within_distinguishes_budget_and_corruption() {
+        let within = gzip(b"within budget");
+        assert_eq!(
+            decode_gzip_frame_within(&within, b"within budget".len()).unwrap(),
+            Some(b"within budget".to_vec())
+        );
+
+        let over = gzip(b"one byte over");
+        assert_eq!(
+            decode_gzip_frame_within(&over, b"one byte over".len() - 1).unwrap(),
+            None
+        );
+        assert!(decode_gzip_frame_within(b"not-gzip", 1024).is_err());
+    }
+
+    #[tokio::test]
+    async fn async_gzip_small_compressed_large_output_decodes_off_thread() {
+        let _observer = offload_observer();
+        let expected = vec![b'a'; 1024 * 1024];
+        let compressed = gzip_with(&expected, flate2::Compression::best());
+        assert!(compressed.len() <= INLINE_GZIP_FRAME_BYTES);
+        assert_eq!(
+            decode_gzip_frame_within(&compressed, INLINE_GZIP_OUTPUT_BYTES).unwrap(),
+            None
+        );
+
+        let before = OFFLOADED_DECODES.load(std::sync::atomic::Ordering::Relaxed);
+        let decoded = decode_gzip_frame_async(compressed).await.unwrap();
+        assert_eq!(decoded, expected);
+        // The observer lock attributes this exact increment to this decode rather
+        // than a concurrently running async gzip test.
+        assert_eq!(
+            OFFLOADED_DECODES.load(std::sync::atomic::Ordering::Relaxed),
+            before + 1,
+            "large-output frame must execute through spawn_blocking"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_gzip_below_threshold_matches_sync_decode() {
+        let _observer = offload_observer();
+        let expected = b"small gzip response frame";
+        let compressed = gzip(expected);
+        assert!(compressed.len() <= INLINE_GZIP_FRAME_BYTES);
+
+        let sync = decode_gzip_frame(&compressed).unwrap();
+        let before = OFFLOADED_DECODES.load(std::sync::atomic::Ordering::Relaxed);
+        let asynchronous = decode_gzip_frame_async(compressed).await.unwrap();
+        assert_eq!(asynchronous, sync);
+        assert_eq!(asynchronous, expected);
+        assert_eq!(
+            OFFLOADED_DECODES.load(std::sync::atomic::Ordering::Relaxed),
+            before,
+            "small-output frame must stay on the inline decode path"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_gzip_above_threshold_matches_sync_decode() {
+        let _observer = offload_observer();
+        let expected = incompressible_bytes(INLINE_GZIP_FRAME_BYTES * 2);
+        let compressed = gzip(&expected);
+        assert!(compressed.len() > INLINE_GZIP_FRAME_BYTES);
+
+        let sync = decode_gzip_frame(&compressed).unwrap();
+        let asynchronous = decode_gzip_frame_async(compressed).await.unwrap();
+        assert_eq!(asynchronous, sync);
+        assert_eq!(asynchronous, expected);
+    }
+
+    #[tokio::test]
+    async fn async_gzip_rejects_oversized_payload() {
+        let _observer = offload_observer();
+        let compressed = oversized_gzip_payload();
+        assert!(compressed.len() > INLINE_GZIP_FRAME_BYTES);
+
+        let err = decode_gzip_frame_async(compressed).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[tokio::test]
+    async fn async_gzip_rejects_corruption_on_both_paths() {
+        let _observer = offload_observer();
+        let inline = Bytes::from_static(b"not-gzip");
+        assert!(inline.len() <= INLINE_GZIP_FRAME_BYTES);
+        assert!(decode_gzip_frame_async(inline).await.is_err());
+
+        let mut blocking = gzip(&incompressible_bytes(INLINE_GZIP_FRAME_BYTES * 2));
+        blocking.truncate(blocking.len() - 1);
+        assert!(blocking.len() > INLINE_GZIP_FRAME_BYTES);
+        assert!(decode_gzip_frame_async(blocking).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn async_gzip_offloads_never_exceed_slot_limit() {
+        let _observer = offload_observer();
+        let slots = gzip_decode_slots().available_permits();
+        MAX_IN_FLIGHT_DECODES.store(0, std::sync::atomic::Ordering::SeqCst);
+        let compressed = gzip(&incompressible_bytes(INLINE_GZIP_FRAME_BYTES * 16));
+        assert!(compressed.len() > INLINE_GZIP_FRAME_BYTES);
+
+        let decodes = (0..slots * 4).map(|_| decode_gzip_frame_async(compressed.clone()));
+        let results = futures_util::future::join_all(decodes).await;
+        assert!(results.into_iter().all(|result| result.is_ok()));
+
+        let observed = MAX_IN_FLIGHT_DECODES.load(std::sync::atomic::Ordering::SeqCst);
+        // This is a one-sided safety bound, not proof that scheduling exercised
+        // every slot; a non-overlapping run may legitimately observe only one.
+        assert!(
+            observed <= slots,
+            "observed {observed} decodes for {slots} slots"
+        );
+    }
+
+    /// Reproduce the native blocking-pool scheduling and join calibration used by
+    /// [`INLINE_GZIP_FRAME_BYTES`]. Ignored because wall-clock thread wakeups are
+    /// intentionally unsuitable for CodSpeed's instruction-counting simulation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn measure_spawn_blocking_round_trip() {
+        const SAMPLES: usize = 1_000;
+
+        tokio::task::spawn_blocking(|| {}).await.unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..SAMPLES {
+            tokio::task::spawn_blocking(|| {}).await.unwrap();
+        }
+        let elapsed = started.elapsed();
+        println!(
+            "spawn_blocking round-trip: {:?} mean over {SAMPLES} samples",
+            elapsed / SAMPLES as u32
+        );
     }
 }
