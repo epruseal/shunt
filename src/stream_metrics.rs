@@ -14,12 +14,24 @@ use std::{
 
 use axum::{
     body::{Body, Bytes},
-    http::{header::CONTENT_TYPE, Response},
+    http::{header::CONTENT_TYPE, Response, StatusCode},
 };
 use futures_util::{Stream, StreamExt};
 use serde_json::Value;
 
 const MAX_EVENT_BYTES: usize = 256 * 1024;
+
+/// Injected by `adapters::responses::http::stream_response` as a standalone
+/// SSE comment frame immediately before a synthesized completion, whenever
+/// `AnthropicSseMachine::finish` only produced output because the upstream
+/// connection ended before a real terminal/error event was seen (that
+/// adapter is the only caller of `finish()` on the streaming path). SSE
+/// comment lines (`:`-prefixed) are ignored by every conforming client per
+/// the WHATWG EventSource spec, so real clients never see this — only this
+/// observer's own frame parser does, letting `outcome` classify the result
+/// as `UpstreamCut` instead of `Completed` despite the well-formed
+/// `message_stop` that follows it.
+pub(crate) const UPSTREAM_TRUNCATED_MARKER: &[u8] = b":shunt-upstream-truncated";
 
 /// Client-facing SSE protocol used to interpret terminal and usage events.
 #[derive(Clone, Copy, Debug)]
@@ -45,6 +57,19 @@ impl Outcome {
             Self::ClientDisconnect => "client_disconnect",
         }
     }
+
+    /// The [`crate::observability::StreamFailureKind`] counterpart to this
+    /// outcome, for [`crate::observability::record_stream_failure`] — `None`
+    /// for `Completed`/`ClientDisconnect`, which are not upstream failures (a
+    /// natural end and a client hangup are not root-causeable events; see
+    /// `ObserverState::finish`).
+    fn as_stream_failure(self) -> Option<crate::observability::StreamFailureKind> {
+        match self {
+            Self::ErrorEvent => Some(crate::observability::StreamFailureKind::ErrorEvent),
+            Self::UpstreamCut => Some(crate::observability::StreamFailureKind::UpstreamCut),
+            Self::Completed | Self::ClientDisconnect => None,
+        }
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -60,6 +85,21 @@ struct ObserverState {
     provider: String,
     model: String,
     started_at: Instant,
+    // The upstream response status the stream opened with. `finish` gates
+    // `record_stream_failure` on this being 2xx: a non-2xx SSE response was
+    // already recorded/captured at header time
+    // (`observability::record_span_outcome` / `capture_upstream_outcome`), so
+    // a mid-stream failure event on top of it would double-report the same
+    // failure and contradicts the "answered 200 then failed" scope this
+    // module documents (see the module docs).
+    status: StatusCode,
+    // Held for the lifetime of the stream so a mid-stream failure can still
+    // record onto the request's own span (`crate::observability::record_stream_failure`)
+    // — cloning a `tracing::Span` bumps its ref count, deferring `on_close`
+    // (and the OTel/Sentry export it triggers) until this state is dropped.
+    // See `crate::observability`'s module docs for why this is the only
+    // reliable way to reach the span from here.
+    span: tracing::Span,
     first_chunk_seen: bool,
     buffer: Vec<u8>,
     skipping_oversized: bool,
@@ -67,17 +107,30 @@ struct ObserverState {
     skip_tail_len: usize,
     terminal_seen: bool,
     error_seen: bool,
+    /// Set once the [`UPSTREAM_TRUNCATED_MARKER`] frame is observed; forces
+    /// `outcome` to classify the stream as `UpstreamCut` even though the
+    /// synthesized completion that follows also sets `terminal_seen`.
+    truncated_seen: bool,
     tokens: TokenUsage,
     finished: bool,
 }
 
 impl ObserverState {
-    fn new(protocol: Protocol, provider: String, model: String, started_at: Instant) -> Self {
+    fn new(
+        protocol: Protocol,
+        status: StatusCode,
+        provider: String,
+        model: String,
+        started_at: Instant,
+        span: tracing::Span,
+    ) -> Self {
         Self {
             protocol,
             provider,
             model,
             started_at,
+            status,
+            span,
             first_chunk_seen: false,
             buffer: Vec::with_capacity(4096),
             skipping_oversized: false,
@@ -85,6 +138,7 @@ impl ObserverState {
             skip_tail_len: 0,
             terminal_seen: false,
             error_seen: false,
+            truncated_seen: false,
             tokens: TokenUsage::default(),
             finished: false,
         }
@@ -128,6 +182,7 @@ impl ObserverState {
             let observation = observe_frame(self.protocol, &self.buffer[..boundary]);
             self.terminal_seen |= observation.terminal;
             self.error_seen |= observation.error;
+            self.truncated_seen |= observation.truncated;
             merge_tokens(&mut self.tokens, observation.tokens);
             self.buffer.drain(..end);
         }
@@ -165,6 +220,13 @@ impl ObserverState {
     fn outcome(&self, natural_end: bool) -> Outcome {
         if self.error_seen {
             Outcome::ErrorEvent
+        } else if self.truncated_seen {
+            // Checked ahead of `terminal_seen`: the adapter-synthesized
+            // completion that follows the marker also sets `terminal_seen`,
+            // but the marker's presence means this "terminal" event was
+            // manufactured to keep the client stream well-formed after a
+            // real upstream cut, not a genuine backend completion.
+            Outcome::UpstreamCut
         } else if self.terminal_seen {
             Outcome::Completed
         } else if natural_end {
@@ -179,11 +241,23 @@ impl ObserverState {
             return;
         }
         self.finished = true;
-        crate::metrics::record_stream_outcome(
-            &self.provider,
-            &self.model,
-            self.outcome(natural_end).as_str(),
-        );
+        let outcome = self.outcome(natural_end);
+        crate::metrics::record_stream_outcome(&self.provider, &self.model, outcome.as_str());
+        // Only a stream that actually opened `200` can have "failed mid-stream"
+        // in the sense this reports: a non-2xx response was already recorded
+        // at header time (`record_span_outcome` / `capture_upstream_outcome`),
+        // so reporting again here would double the Sentry signal for the same
+        // upstream failure (see the `status` field doc comment).
+        if self.status.is_success() {
+            if let Some(failure) = outcome.as_stream_failure() {
+                crate::observability::record_stream_failure(
+                    &self.span,
+                    &self.provider,
+                    &self.model,
+                    failure,
+                );
+            }
+        }
         for (kind, count) in [
             ("input", self.tokens.input),
             ("output", self.tokens.output),
@@ -201,10 +275,19 @@ impl ObserverState {
 struct FrameObservation {
     terminal: bool,
     error: bool,
+    /// Set only for the [`UPSTREAM_TRUNCATED_MARKER`] comment frame.
+    truncated: bool,
     tokens: TokenUsage,
 }
 
 fn observe_frame(protocol: Protocol, frame: &[u8]) -> FrameObservation {
+    if frame == UPSTREAM_TRUNCATED_MARKER {
+        return FrameObservation {
+            truncated: true,
+            ..Default::default()
+        };
+    }
+
     let (event, data) = event_and_data(frame);
     if event == Some(b"ping") || data == Some(b"{\"type\": \"ping\"}") {
         return FrameObservation::default();
@@ -257,13 +340,29 @@ fn observe_responses(event: Option<&[u8]>, data: Option<&[u8]>) -> FrameObservat
             ..Default::default()
         };
     }
-    if event == Some(b"response.failed") {
+    // Mirrors the Responses translator's own error handling
+    // (`model::responses::AnthropicSseMachine::apply`, `"error" | "response.failed"`):
+    // both event names terminate the backend stream with an error.
+    if matches!(event, Some(b"error") | Some(b"response.failed")) {
         return FrameObservation {
             error: true,
             ..Default::default()
         };
     }
-    if event != Some(b"response.completed") {
+    // Mirrors the translator's terminal handling (`"response.completed" |
+    // "response.done"`, see also `docs/m1-responses-translation.md`): both
+    // names carry the full `response` + `usage` and end the stream normally.
+    // `response.incomplete` is terminal too, matching the terminal set the
+    // WebSocket transport already uses
+    // (`adapters::responses::codex_ws::TERMINAL_EVENTS`,
+    // `docs/m7-codex-websocket.md`): the backend explicitly concluded the
+    // stream, just with truncated content, not a transport cut — classifying
+    // it as `UpstreamCut` would misreport a genuine (if incomplete) response
+    // as a mid-stream failure.
+    if !matches!(
+        event,
+        Some(b"response.completed") | Some(b"response.done") | Some(b"response.incomplete")
+    ) {
         return FrameObservation::default();
     }
     let mut tokens = TokenUsage::default();
@@ -338,10 +437,17 @@ pub fn observe_response(
     if !is_sse(&response) {
         return response;
     }
+    let status = response.status();
+    // Captured here, synchronously inside the caller's `.instrument(span)`
+    // future (`proxy::post` / `codex_endpoint::post`), so this resolves to
+    // the request's own span — by the time the stream is actually polled,
+    // that future has already returned and `tracing::Span::current()` would
+    // no longer find it. See `crate::observability`'s module docs.
+    let span = tracing::Span::current();
     let (parts, body) = response.into_parts();
     let observed = ObservedStream {
         upstream: body.into_data_stream().boxed(),
-        state: ObserverState::new(protocol, provider, model, started_at),
+        state: ObserverState::new(protocol, status, provider, model, started_at, span),
     };
     Response::from_parts(parts, Body::from_stream(observed))
 }
