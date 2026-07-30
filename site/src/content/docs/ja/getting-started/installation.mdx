@@ -1,6 +1,6 @@
 ---
 title: インストール
-description: Homebrew、cargo、ビルド済みバイナリ、またはソースから shunt をインストールする。
+description: Homebrew、Git リポジトリからの Cargo、ビルド済みバイナリ、またはソースから shunt をインストールする。
 ---
 
 
@@ -32,13 +32,15 @@ brew services start shunt
 service](https://github.com/pleaseai/shunt/blob/main/docs/running.md#run-as-a-background-service-homebrew)
 を参照してください。
 
-## Cargo
+## Cargo（Git リポジトリ）
 
-クレートは `shunt-gateway` として公開されています（バイナリは引き続き `shunt`）。
+ソースリポジトリから直接インストールします。バイナリ名は引き続き `shunt` です。
 
 ```bash
-cargo install shunt-gateway
+cargo install --git https://github.com/pleaseai/shunt
 ```
+
+新しいバージョンは Homebrew と GitHub リリースバイナリで配布されます。crates.io パッケージは、最後に公開されたバージョンで更新を停止します。
 
 ## ビルド済みバイナリ
 

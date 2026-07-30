@@ -2,6 +2,11 @@
 # crates.io package name; the library and binary keep the short name `shunt`
 # (the bare `shunt` crate name is taken by an unrelated project).
 name = "shunt-gateway"
+# Cargo omits `[patch.crates-io]` from packaged manifests, and dependents cannot
+# inherit a patch, so the permessage-deflate fork pins make this configuration
+# unpublishable (issue #292). Remove this restriction with the pins once upstream
+# snapview/tungstenite-rs#426 ships in a crates.io release.
+publish = false
 version = "0.32.0"
 edition = "2021"
 description = "Claude Code LLM gateway — an Anthropic Messages proxy that routes models to OpenAI/Codex and Anthropic-compatible backends"
@@ -43,8 +48,8 @@ notify = "8.2.0"
 # over reqwest's *blocking* client so the SDK's dedicated-thread batch span/log
 # processors and periodic metric reader run fully independent of the axum
 # serving runtime — no tokio handle threading, and telemetry init stays
-# synchronous like `init_sentry`. reqwest-rustls-webpki-roots reuses reqwest's
-# ring-backed rustls with bundled roots, matching the tokio-tungstenite TLS.
+# synchronous like `init_sentry`. reqwest-rustls-webpki-roots uses rustls with
+# bundled roots; tokio-tungstenite is likewise configured with rustls/webpki roots.
 opentelemetry = "0.32"
 opentelemetry_sdk = "0.32"
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "logs", "http-proto", "reqwest-blocking-client", "reqwest-rustls-webpki-roots"] }
@@ -79,8 +84,16 @@ tokio = { version = "1", features = ["full"] }
 toml = "0.8"
 # Codex Responses WebSocket v2 transport (issue #32). rustls + bundled webpki
 # roots keeps TLS self-contained and consistent with reqwest's rustls-tls, with
-# no OpenSSL/native-tls system dependency.
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# no OpenSSL/native-tls system dependency. Pinned to the openai-oss-forks forks
+# below (issue #292) for permessage-deflate (RFC 7692) support: the crates.io
+# releases of tungstenite checked through 0.30 expose no `deflate` feature. These
+# exact fork revisions match the pins in the current public `openai/codex` source.
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+# Direct tungstenite 0.27 dep so the `deflate` feature (permessage-deflate,
+# RFC 7692) is enabled through the `[patch.crates-io]` fork below. The
+# tokio-tungstenite 0.28 fork re-exports tungstenite, but its feature table has no
+# `deflate` feature to forward.
+tungstenite = { version = "0.27", default-features = false, features = ["deflate"] }
 tracing = "0.1"
 tracing-opentelemetry = "0.33"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -109,3 +122,14 @@ harness = false
 [[bench]]
 name = "perf_issues"
 harness = false
+
+# openai-oss-forks pins for permessage-deflate (RFC 7692) on the outbound Codex
+# WebSocket (issue #292). Pinned to an exact rev, not a branch, per our usual
+# posture for git dependencies: upgrades are a deliberate, reviewed rev bump, not
+# something that moves under us on an unrelated `cargo update`. Revisit these
+# pins once permessage-deflate support lands in upstream tungstenite
+# (snapview/tungstenite-rs#426) and ships in a crates.io release, at which point
+# this patch and the direct `tungstenite` dependency above can be dropped.
+[patch.crates-io]
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
