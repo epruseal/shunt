@@ -25,8 +25,10 @@ pub struct UpstreamConfig {
     pub count_tokens: CountTokens,
     #[serde(default)]
     pub websocket: bool,
-    #[serde(default)]
-    pub tool_search: bool,
+    /// See [`ProviderConfig::tool_search`] for semantics; unset ("auto") by
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_search: Option<bool>,
     #[serde(default)]
     pub retry: RetryConfig,
 }
