@@ -1453,6 +1453,7 @@ mod tests {
                 account_scope,
                 websocket: false,
                 tool_search: None,
+                request_compression: true,
                 retry: Default::default(),
             },
         );
