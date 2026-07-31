@@ -178,6 +178,7 @@ async fn websocket_handshake_failure_falls_back_to_http() {
         provider: "codex".to_string(),
         upstream_model: None,
         effort: None,
+        service_tier: None,
     });
 
     let gateway = start_gateway_with(config).await;
@@ -254,6 +255,7 @@ async fn streaming_ws_fallback_still_seeds_message_start_estimate() {
         provider: "codex".to_string(),
         upstream_model: None,
         effort: None,
+        service_tier: None,
     });
 
     let gateway = start_gateway_with(config).await;
@@ -306,6 +308,7 @@ fn codex_ws_config(base_url: String) -> Config {
         provider: "codex".to_string(),
         upstream_model: None,
         effort: None,
+        service_tier: None,
     });
     config
 }

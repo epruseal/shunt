@@ -1113,6 +1113,15 @@ pub struct ProviderConfig {
     /// Optional default reasoning effort for `kind = "responses"` providers.
     #[serde(default)]
     pub effort: Option<String>,
+    /// Optional default Responses `service_tier` for `kind = "responses"`
+    /// providers -- Codex CLI's "Fast" mode (faster responses, increased usage).
+    /// Accepts `fast` (Codex's original name for this tier, normalized to
+    /// the `priority` wire value), `priority`, `flex`, or `default` (a
+    /// client-only sentinel meaning "unset"; never sent on the wire).
+    /// Normalized and validated at config load -- see
+    /// `Config::normalize_service_tiers`. Off by default (opt-in).
+    #[serde(default)]
+    pub service_tier: Option<String>,
     /// How `POST /v1/messages/count_tokens` is answered for this provider.
     #[serde(default)]
     pub count_tokens: CountTokens,
@@ -1589,6 +1598,9 @@ pub struct RouteConfig {
     pub provider: String,
     pub upstream_model: Option<String>,
     pub effort: Option<String>,
+    /// See [`ProviderConfig::service_tier`]; a route-level value wins over
+    /// the provider-level default.
+    pub service_tier: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1708,6 +1720,10 @@ pub enum ConfigError {
     OauthUsageSelfPollLoop { provider: String },
     #[error("route for model {model} references unknown provider: {provider}")]
     UnknownRouteProvider { model: String, provider: String },
+    #[error("providers.{provider}.service_tier must be one of fast, priority, flex, default; got \"{value}\"")]
+    InvalidProviderServiceTier { provider: String, value: String },
+    #[error("route for model {model} service_tier must be one of fast, priority, flex, default; got \"{value}\"")]
+    InvalidRouteServiceTier { model: String, value: String },
     #[error("models entry {model} upstream_model references unknown provider: {provider}")]
     UnknownModelProvider { model: String, provider: String },
     #[error("models entry {model} upstream_model must name exactly one provider (got {count}) when using legacy [providers.*]; rewrite as ordered upstreams:\n{rewrite}")]
@@ -1830,6 +1846,7 @@ impl ProviderConfig {
             api_key_env: None,
             api_key_header: ApiKeyHeader::Bearer,
             effort: None,
+            service_tier: None,
             count_tokens: CountTokens::default(),
             accounts: Vec::new(),
             account_scope: Vec::new(),
@@ -1851,6 +1868,7 @@ impl ProviderConfig {
             api_key_env: api_key_env.map(str::to_string),
             api_key_header: ApiKeyHeader::Bearer,
             effort: None,
+            service_tier: None,
             count_tokens: CountTokens::default(),
             accounts: Vec::new(),
             account_scope: Vec::new(),
@@ -1872,6 +1890,7 @@ impl ProviderConfig {
             api_key_env: None,
             api_key_header: ApiKeyHeader::Bearer,
             effort: None,
+            service_tier: None,
             count_tokens: CountTokens::default(),
             accounts: Vec::new(),
             account_scope: Vec::new(),
@@ -1915,6 +1934,7 @@ impl Default for Config {
                     api_key_env: None,
                     api_key_header: ApiKeyHeader::Bearer,
                     effort: None,
+                    service_tier: None,
                     count_tokens: CountTokens::default(),
                     accounts: Vec::new(),
                     account_scope: Vec::new(),
@@ -1972,6 +1992,7 @@ impl Default for Config {
                     api_key_env: None,
                     api_key_header: ApiKeyHeader::Bearer,
                     effort: None,
+                    service_tier: None,
                     count_tokens: CountTokens::default(),
                     accounts: Vec::new(),
                     account_scope: Vec::new(),
@@ -2063,6 +2084,23 @@ impl ConfigFormat {
             }
             _ => ConfigFormat::Toml,
         }
+    }
+}
+
+/// Normalizes a raw `service_tier` config value to its Responses wire form.
+/// `default` is preserved as its own sentinel string rather than collapsed to
+/// `None`: `None` also means "not configured", and collapsing the two made an
+/// explicit route-level `default` indistinguishable from an unset route, so
+/// it silently inherited the provider-level tier instead of overriding it
+/// (issue #301). The sentinel is stripped only at the wire-emission site
+/// (`model/responses_request.rs`), which never sends the literal string
+/// `"default"`. `None` here means the input was invalid.
+fn normalize_service_tier_value(value: &str) -> Option<&'static str> {
+    match value {
+        "fast" | "priority" => Some("priority"),
+        "flex" => Some("flex"),
+        "default" => Some("default"),
+        _ => None,
     }
 }
 
@@ -2176,6 +2214,89 @@ impl Config {
         Ok(())
     }
 
+    /// Validates and normalizes every configured `service_tier` (provider-level
+    /// and route-level) to its Responses wire form, in place, fail-closed:
+    /// `fast` is Codex's original name for this tier, normalized to `priority`;
+    /// `default` is preserved as its own sentinel string rather than collapsed
+    /// to `None`, so an explicit route-level `default` stays distinguishable
+    /// from an unset route (see `normalize_service_tier_value`); any other
+    /// value is rejected. Mirrors the shape of `normalize_upstreams`, but
+    /// unconditionally revisits every entry rather than switching on a
+    /// declaration-form flag, since `service_tier` is orthogonal to which of
+    /// `[[upstreams]]`/`[providers.*]` populated `self.providers`.
+    fn normalize_service_tiers(&mut self) -> Result<(), ConfigError> {
+        for (name, provider) in self.providers.iter_mut() {
+            if let Some(raw) = provider.service_tier.take() {
+                provider.service_tier = Some(
+                    normalize_service_tier_value(&raw)
+                        .ok_or_else(|| ConfigError::InvalidProviderServiceTier {
+                            provider: name.clone(),
+                            value: raw.clone(),
+                        })?
+                        .to_string(),
+                );
+            }
+        }
+        for route in self.routes.iter_mut() {
+            if let Some(raw) = route.service_tier.take() {
+                route.service_tier = Some(
+                    normalize_service_tier_value(&raw)
+                        .ok_or_else(|| ConfigError::InvalidRouteServiceTier {
+                            model: route.model.clone(),
+                            value: raw.clone(),
+                        })?
+                        .to_string(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Warns when a provider or route has an explicitly configured
+    /// `service_tier` that resolves to the `xai`/`grok` Responses flavor:
+    /// that flavor never sends `service_tier` on the wire (xAI's Responses
+    /// endpoint rejects it with a 400), so the configured value is silently
+    /// withheld at request time with no other signal. Non-fatal -- existing
+    /// configs that happen to set `service_tier` alongside an xai/grok
+    /// provider must not start failing.
+    fn warn_service_tier_withheld_for_flavor(&self) {
+        for (name, provider) in &self.providers {
+            if provider
+                .service_tier
+                .as_deref()
+                .is_some_and(|v| v != "default")
+                && matches!(
+                    self.responses_flavor(name),
+                    ResponsesFlavor::Xai | ResponsesFlavor::Grok
+                )
+            {
+                tracing::warn!(
+                    provider = %name,
+                    service_tier = ?provider.service_tier,
+                    "service_tier is configured but withheld on the xai/grok Responses flavor"
+                );
+            }
+        }
+        for route in &self.routes {
+            if route
+                .service_tier
+                .as_deref()
+                .is_some_and(|v| v != "default")
+                && matches!(
+                    self.responses_flavor(&route.provider),
+                    ResponsesFlavor::Xai | ResponsesFlavor::Grok
+                )
+            {
+                tracing::warn!(
+                    model = %route.model,
+                    provider = %route.provider,
+                    service_tier = ?route.service_tier,
+                    "service_tier is configured but withheld on the xai/grok Responses flavor"
+                );
+            }
+        }
+    }
+
     fn apply_ordered_provider_env(&mut self, env: Env) -> Result<(), ConfigError> {
         if !self.upstreams_ordered {
             return Ok(());
@@ -2211,6 +2332,9 @@ impl Config {
 
     pub fn validate(mut self) -> Result<Self, ConfigError> {
         self.normalize_upstreams()?;
+        // Runs after `normalize_upstreams` so it sees `self.providers` merged
+        // from either declaration form ([[upstreams]] or [providers.*]).
+        self.normalize_service_tiers()?;
         self.server.bind_addr()?;
         // `tokio::sync::Semaphore::new` panics above `MAX_PERMITS`, so an
         // out-of-range limit would pass `shunt check` and then abort at boot
@@ -2714,6 +2838,7 @@ impl Config {
                 );
             }
         }
+        self.warn_service_tier_withheld_for_flavor();
         Ok(self)
     }
 
@@ -3387,6 +3512,133 @@ mod tests {
         assert!(matches!(
             config.validate().unwrap_err(),
             ConfigError::AccountMultipleCredentialSources { .. }
+        ));
+    }
+
+    #[test]
+    fn service_tier_fast_alias_normalizes_to_priority() {
+        let mut config = Config::default();
+        config.providers.get_mut("anthropic").unwrap().service_tier = Some("fast".to_string());
+        let config = config.validate().unwrap();
+        assert_eq!(
+            config
+                .providers
+                .get("anthropic")
+                .unwrap()
+                .service_tier
+                .as_deref(),
+            Some("priority")
+        );
+    }
+
+    #[test]
+    fn service_tier_default_sentinel_is_preserved() {
+        // "default" is a client-only sentinel that must never reach the wire,
+        // but validation preserves it as Some("default") rather than clearing
+        // it to None -- collapsing the two made an explicit route-level
+        // "default" indistinguishable from an unset route, so it silently
+        // inherited the provider-level tier instead of overriding it
+        // (issue #301). The wire-emission site strips the sentinel instead.
+        let mut config = Config::default();
+        config.providers.get_mut("anthropic").unwrap().service_tier = Some("default".to_string());
+        let config = config.validate().unwrap();
+        assert_eq!(
+            config
+                .providers
+                .get("anthropic")
+                .unwrap()
+                .service_tier
+                .as_deref(),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn service_tier_rejects_invalid_provider_value() {
+        let mut config = Config::default();
+        config.providers.get_mut("anthropic").unwrap().service_tier = Some("turbo".to_string());
+        assert!(matches!(
+            config.validate().unwrap_err(),
+            ConfigError::InvalidProviderServiceTier { .. }
+        ));
+    }
+
+    #[test]
+    fn service_tier_rejects_invalid_route_value() {
+        let mut config = Config::default();
+        config.routes.push(super::RouteConfig {
+            model: "gpt-special".to_string(),
+            provider: "anthropic".to_string(),
+            upstream_model: None,
+            effort: None,
+            service_tier: Some("turbo".to_string()),
+        });
+        assert!(matches!(
+            config.validate().unwrap_err(),
+            ConfigError::InvalidRouteServiceTier { .. }
+        ));
+    }
+
+    #[test]
+    fn service_tier_flex_and_priority_pass_through_unchanged() {
+        // "flex" and literal "priority" are already wire values -- the
+        // normalize match arms that pass them through as-is (as opposed to
+        // the "fast" -> "priority" alias and the "default" sentinel) were
+        // previously unasserted.
+        let mut config = Config::default();
+        config.providers.get_mut("anthropic").unwrap().service_tier = Some("flex".to_string());
+        let config = config.validate().unwrap();
+        assert_eq!(
+            config
+                .providers
+                .get("anthropic")
+                .unwrap()
+                .service_tier
+                .as_deref(),
+            Some("flex")
+        );
+
+        let mut config = Config::default();
+        config.providers.get_mut("anthropic").unwrap().service_tier = Some("priority".to_string());
+        let config = config.validate().unwrap();
+        assert_eq!(
+            config
+                .providers
+                .get("anthropic")
+                .unwrap()
+                .service_tier
+                .as_deref(),
+            Some("priority")
+        );
+    }
+
+    #[test]
+    fn service_tier_route_level_fast_alias_normalizes_to_priority() {
+        // Mirrors service_tier_fast_alias_normalizes_to_priority, but for the
+        // route-level field rather than the provider-level one -- the two are
+        // normalized by separate loops in normalize_service_tiers.
+        let mut config = Config::default();
+        config.routes.push(super::RouteConfig {
+            model: "gpt-special".to_string(),
+            provider: "anthropic".to_string(),
+            upstream_model: None,
+            effort: None,
+            service_tier: Some("fast".to_string()),
+        });
+        let config = config.validate().unwrap();
+        assert_eq!(config.routes[0].service_tier.as_deref(), Some("priority"));
+    }
+
+    #[test]
+    fn service_tier_rejects_mixed_case_value() {
+        // Case-sensitivity pin: normalize_service_tier_value matches exact
+        // lowercase literals only, so "Fast" must be rejected rather than
+        // silently treated as the "fast" alias.
+        let mut config = Config::default();
+        config.providers.get_mut("anthropic").unwrap().service_tier = Some("Fast".to_string());
+        assert!(matches!(
+            config.validate().unwrap_err(),
+            ConfigError::InvalidProviderServiceTier { .. }
         ));
     }
 
@@ -4353,6 +4605,7 @@ id = "claude-sonnet-5"
                 provider: "codex".to_string(),
                 upstream_model: Some("gpt-5.2".to_string()),
                 effort: None,
+                service_tier: None,
             }],
             ..Config::default()
         };
@@ -4494,6 +4747,75 @@ id = "claude-sonnet-5"
 
         assert!(!logs.contains("configured discovery model has no matching route"));
         assert!(!logs.contains("claude-opus-via-codex"));
+    }
+
+    #[test]
+    fn validate_warns_when_service_tier_is_withheld_for_xai_flavor() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer_output = Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || BufferWriter {
+                buffer: Arc::clone(&writer_output),
+            })
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let mut config = Config::default();
+        config.providers.get_mut("xai").unwrap().service_tier = Some("priority".to_string());
+
+        let config = tracing::subscriber::with_default(subscriber, || config.validate().unwrap());
+        assert_eq!(config.responses_flavor("xai"), ResponsesFlavor::Xai);
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+
+        assert!(logs
+            .contains("service_tier is configured but withheld on the xai/grok Responses flavor"));
+        assert!(logs.contains("xai"));
+    }
+
+    #[test]
+    fn validate_does_not_warn_when_service_tier_is_configured_for_openai_flavor() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer_output = Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || BufferWriter {
+                buffer: Arc::clone(&writer_output),
+            })
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let mut config = Config::default();
+        config.providers.get_mut("openai").unwrap().service_tier = Some("priority".to_string());
+
+        tracing::subscriber::with_default(subscriber, || {
+            config.validate().unwrap();
+        });
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+
+        assert!(!logs.contains("service_tier is configured but withheld"));
+    }
+
+    #[test]
+    fn validate_does_not_warn_when_service_tier_is_default_sentinel_for_xai_flavor() {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer_output = Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || BufferWriter {
+                buffer: Arc::clone(&writer_output),
+            })
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let mut config = Config::default();
+        config.providers.get_mut("xai").unwrap().service_tier = Some("default".to_string());
+
+        let config = tracing::subscriber::with_default(subscriber, || config.validate().unwrap());
+        assert_eq!(config.responses_flavor("xai"), ResponsesFlavor::Xai);
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+
+        // "default" is a client-only sentinel stripped unconditionally at wire
+        // emission on every flavor, so it is never actually withheld -- warning
+        // here would be misleading.
+        assert!(!logs.contains("service_tier is configured but withheld"));
     }
 
     #[test]

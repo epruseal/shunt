@@ -122,13 +122,20 @@ struct TempConfig(std::path::PathBuf);
 
 impl TempConfig {
     fn new(raw: &str) -> Self {
+        // pid+nanos alone can collide: tests running concurrently on the same
+        // core can observe the same SystemTime::now() tick, and the filename
+        // is otherwise identical. A per-process monotonic counter makes each
+        // call unique regardless of timer resolution.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "shunt-upstreams-test-{}-{}.toml",
+            "shunt-upstreams-test-{}-{}-{}.toml",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            seq
         ));
         std::fs::write(&path, raw).unwrap();
         Self(path)
@@ -184,6 +191,51 @@ primary = "gpt-5.6-sol"
     let kimi = config.provider("fallback").unwrap();
     assert_eq!(kimi.base_url, "https://api.moonshot.ai/anthropic");
     assert_eq!(kimi.api_key_env.as_deref(), Some("MOONSHOT_API_KEY"));
+}
+
+#[test]
+fn service_tier_normalizes_through_ordered_upstream_declaration() {
+    // [[upstreams]] form: `service_tier = "fast"` on a declared upstream must
+    // come out normalized to the wire value "priority" after Config::load's
+    // end-to-end validate() pass, exactly as the legacy [providers.*] form
+    // does (see service_tier_normalizes_through_legacy_provider_declaration).
+    let file = TempConfig::new(
+        r#"
+[[upstreams]]
+name = "anthropic"
+provider = "anthropic"
+service_tier = "fast"
+"#,
+    );
+
+    let config = load(&file).unwrap();
+    assert_eq!(
+        config
+            .provider("anthropic")
+            .unwrap()
+            .service_tier
+            .as_deref(),
+        Some("priority")
+    );
+}
+
+#[test]
+fn service_tier_normalizes_through_legacy_provider_declaration() {
+    // Legacy [providers.*] form: same normalization as the [[upstreams]]
+    // form above, reached through the merge-onto-builtin-provider path
+    // instead of upstreams::normalize.
+    let file = TempConfig::new(
+        r#"
+[providers.codex]
+service_tier = "fast"
+"#,
+    );
+
+    let config = load(&file).unwrap();
+    assert_eq!(
+        config.provider("codex").unwrap().service_tier.as_deref(),
+        Some("priority")
+    );
 }
 
 #[test]
