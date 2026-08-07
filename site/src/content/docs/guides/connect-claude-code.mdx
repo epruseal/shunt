@@ -160,7 +160,7 @@ curl -s -X POST "$ANTHROPIC_BASE_URL/v1/messages" \
   -d '{"model":"gpt-5.6-sol","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
 ```
 
-Then start `claude`, run `/status`, and check the **Anthropic base URL** line shows your gateway. See also [Effort & Context](/guides/effort-and-context/) for reasoning-effort and context-window tuning.
+Then start `claude`, run `/status`, and check the **Anthropic base URL** line shows your gateway. See also [Effort & Context](/guides/effort-and-context/) for reasoning-effort and context-window tuning, and [Client Environment Variables](/reference/client-environment/) for the environment variables that change behind a gateway.
 
 ### Verify a named subagent end to end
 
