@@ -20,6 +20,7 @@ use crate::{
     server::AppState,
 };
 
+mod auto_mode_classifier;
 mod model_rewrite;
 
 pub struct AnthropicAdapter;
@@ -55,6 +56,11 @@ async fn forward(
     let credential = resolve_credential(&state.config, &route, &state.http_client).await?;
     let request_headers = outbound_headers(headers, &credential);
     let oauth_client = bearer_is_subscription_oauth(&request_headers);
+    // Only a subscription-OAuth bearer faces the client-shape gate; an API-key
+    // Anthropic-compatible provider keeps byte-for-byte passthrough.
+    if oauth_client {
+        auto_mode_classifier::restore_claude_code_identity(&mut body);
+    }
     normalize_upstream_model_request(&mut body, &route.upstream_model);
     let body = body.into_raw();
     // Bounded transient retry (issue #48) for this single-credential path. Kept
@@ -216,8 +222,17 @@ async fn forward_claude_oauth(
         };
         let mut request_body = base_body.clone();
         rewrite_account_uuid_request(&mut request_body, account_uuid);
-        let request_body = request_body.into_raw();
         let request_headers = outbound_headers(headers, &credential);
+        // Gate on the bearer that actually goes out rather than on the pool's
+        // shape. Every account here resolves to `Credential::ClaudeOauth`, but
+        // the `token_env` branch of `resolve_claude_account` wraps whatever the
+        // variable holds without checking it is a subscription token — so an
+        // account pointed at an `sk-ant-api…` key would otherwise have its body
+        // rewritten despite facing no client-shape gate.
+        if bearer_is_subscription_oauth(&request_headers) {
+            auto_mode_classifier::restore_claude_code_identity(&mut request_body);
+        }
+        let request_body = request_body.into_raw();
 
         let upstream = match post_upstream(
             &state.http_client,
