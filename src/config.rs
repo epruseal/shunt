@@ -457,9 +457,10 @@ pub struct GatewayConfig {
     /// its explicit "no managed policy" 404 behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policies: Option<Vec<GatewayPolicyConfig>>,
-    /// Client telemetry configuration. M-B uses this only to push the telemetry
-    /// enable flag plus five `OTEL_*` environment variables; the inbound relay
-    /// routes arrive in M-C (#189).
+    /// Client telemetry configuration. A non-empty `forward_to` list both
+    /// pushes the telemetry enable flag plus five `OTEL_*` environment
+    /// variables through managed settings (M-B) and relays the OTLP payloads
+    /// those clients then post to `POST /v1/{metrics,logs,traces}` (M-C, #189).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telemetry: Option<GatewayTelemetryConfig>,
     /// File persisting refresh sessions across restarts (issue #194). Refresh
@@ -497,11 +498,25 @@ pub struct GatewayTelemetryConfig {
     pub forward_to: Vec<GatewayTelemetryDestination>,
 }
 
+/// One inbound-telemetry relay destination: a base OTLP/HTTP endpoint, the
+/// same shape as `OTEL_EXPORTER_OTLP_ENDPOINT`. shunt appends the signal path
+/// (`/v1/metrics`, `/v1/logs`, `/v1/traces`) when relaying.
+///
+/// Signals are opted in per destination. Metrics default on; logs and traces
+/// default off because Claude Code log records and spans can carry command
+/// lines, prompts, and file paths, so forwarding them off-host is an explicit
+/// operator decision.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GatewayTelemetryDestination {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers: Option<BTreeMap<String, String>>,
+    #[serde(default = "default_true")]
+    pub metrics: bool,
+    #[serde(default)]
+    pub logs: bool,
+    #[serde(default)]
+    pub traces: bool,
 }
 
 /// `~/.shunt/gateway-sessions.json` (`HOME`, falling back to `USERPROFILE` on
@@ -648,14 +663,18 @@ fn validate_gateway_policy_emails(
 
 fn validate_gateway_telemetry(
     telemetry: Option<&GatewayTelemetryConfig>,
-) -> Result<bool, ConfigError> {
+) -> Result<crate::gateway::managed::TelemetryPush, ConfigError> {
+    let mut push = crate::gateway::managed::TelemetryPush::default();
     let Some(telemetry) = telemetry else {
-        return Ok(false);
+        return Ok(push);
     };
     for (index, destination) in telemetry.forward_to.iter().enumerate() {
         validate_gateway_telemetry_destination(destination, index)?;
+        push.metrics |= destination.metrics;
+        push.logs |= destination.logs;
+        push.traces |= destination.traces;
     }
-    Ok(!telemetry.forward_to.is_empty())
+    Ok(push)
 }
 
 fn validate_gateway_telemetry_destination(
@@ -668,16 +687,57 @@ fn validate_gateway_telemetry_destination(
             message: error.to_string(),
         }
     })?;
-    if matches!(url.scheme(), "http" | "https") && url.host_str().is_some() {
-        return Ok(());
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(ConfigError::InvalidGatewayTelemetryUrl {
+            index,
+            message: format!(
+                "must be an http(s) URL with a host, got `{}`",
+                destination.url
+            ),
+        });
     }
-    Err(ConfigError::InvalidGatewayTelemetryUrl {
-        index,
-        message: format!(
-            "must be an http(s) URL with a host, got `{}`",
-            destination.url
-        ),
-    })
+    // The destination is a *base* endpoint that shunt extends by string
+    // concatenation to reach `/v1/<signal>`. A query or fragment would land on
+    // the wrong side of that join (`…?tenant=x/v1/metrics`), and userinfo would
+    // put a credential in a URL that reaches error paths and logs. All three
+    // are rejected at boot rather than silently misrouted.
+    let offending = if url.query().is_some() {
+        Some("a query string")
+    } else if url.fragment().is_some() {
+        Some("a fragment")
+    } else if !url.username().is_empty() || url.password().is_some() {
+        Some("embedded credentials")
+    } else {
+        None
+    };
+    if let Some(offending) = offending {
+        return Err(ConfigError::InvalidGatewayTelemetryUrl {
+            index,
+            message: format!(
+                "must be a base OTLP endpoint (scheme, host, optional path) without {offending}; \
+                 shunt appends `/v1/<signal>` to it"
+            ),
+        });
+    }
+    // Headers are validated here, at boot and on every reload, so a typo in a
+    // collector's auth header fails `shunt check` instead of being dropped at
+    // relay time — where it would silently exclude that header for the life of
+    // the process after a single warning.
+    for (name, value) in destination.headers.iter().flatten() {
+        let part = if reqwest::header::HeaderName::try_from(name.as_str()).is_err() {
+            "name"
+        } else if reqwest::header::HeaderValue::try_from(value.as_str()).is_err() {
+            "value"
+        } else {
+            continue;
+        };
+        return Err(ConfigError::InvalidGatewayTelemetryHeader {
+            index,
+            name: name.clone(),
+            part,
+        });
+    }
+    Ok(())
 }
 
 fn validate_managed_policy(
@@ -1796,6 +1856,17 @@ pub enum ConfigError {
     InvalidGatewayPolicyEnv { index: usize },
     #[error("[server.gateway.telemetry].forward_to[{index}].url is invalid: {message}")]
     InvalidGatewayTelemetryUrl { index: usize, message: String },
+    /// The header value is deliberately not echoed — it is typically a
+    /// collector API key.
+    #[error(
+        "[server.gateway.telemetry].forward_to[{index}].headers has an invalid entry `{name}`: \
+         header {part} is not valid HTTP"
+    )]
+    InvalidGatewayTelemetryHeader {
+        index: usize,
+        name: String,
+        part: &'static str,
+    },
     #[error("[server.auth] is set but {env} is unset or empty; refusing to run open")]
     MissingClientTokens { env: String },
     #[error("invalid client tokens in {env}: {message}")]
@@ -4253,6 +4324,9 @@ mod tests {
             forward_to: vec![GatewayTelemetryDestination {
                 url: "ftp://collector.example".to_string(),
                 headers: None,
+                metrics: true,
+                logs: false,
+                traces: false,
             }],
         });
         assert!(matches!(
@@ -5512,6 +5586,144 @@ id = "claude-sonnet-5"
         assert!(otel.traces && otel.metrics && otel.logs);
         assert!(!otel.include_session_id);
         assert!(otel.headers.is_empty());
+    }
+
+    /// A destination URL is a *base* endpoint that `signal_url` extends by
+    /// string concatenation, so a query, fragment, or embedded credential is
+    /// rejected at boot rather than misrouted or leaked into a log.
+    #[test]
+    fn gateway_telemetry_rejects_query_fragment_and_userinfo_urls() {
+        for url in [
+            "https://collector.example?tenant=acme",
+            "https://collector.example#frag",
+            "https://user:secret@collector.example",
+        ] {
+            let telemetry = GatewayTelemetryConfig {
+                forward_to: vec![GatewayTelemetryDestination {
+                    url: url.to_string(),
+                    headers: None,
+                    metrics: true,
+                    logs: false,
+                    traces: false,
+                }],
+            };
+            assert!(
+                matches!(
+                    super::validate_gateway_telemetry(Some(&telemetry)),
+                    Err(ConfigError::InvalidGatewayTelemetryUrl { index: 0, .. })
+                ),
+                "{url} must be rejected"
+            );
+        }
+    }
+
+    /// The shapes that stay valid: a bare origin and one with a path prefix.
+    #[test]
+    fn gateway_telemetry_accepts_base_endpoints_with_and_without_a_path() {
+        for url in [
+            "https://collector.example",
+            "https://collector.example/otlp",
+        ] {
+            let telemetry = GatewayTelemetryConfig {
+                forward_to: vec![GatewayTelemetryDestination {
+                    url: url.to_string(),
+                    headers: None,
+                    metrics: true,
+                    logs: false,
+                    traces: false,
+                }],
+            };
+            assert!(
+                super::validate_gateway_telemetry(Some(&telemetry)).is_ok(),
+                "{url} must be accepted"
+            );
+        }
+    }
+
+    /// An invalid header must fail startup rather than be dropped at relay
+    /// time — it is usually the collector's auth key, and a runtime skip would
+    /// exclude it silently for the life of the process.
+    #[test]
+    fn gateway_telemetry_rejects_invalid_header_names_and_values() {
+        let destination = |name: &str, value: &str| GatewayTelemetryConfig {
+            forward_to: vec![GatewayTelemetryDestination {
+                url: "https://collector.example".to_string(),
+                headers: Some(
+                    [(name.to_string(), value.to_string())]
+                        .into_iter()
+                        .collect(),
+                ),
+                metrics: true,
+                logs: false,
+                traces: false,
+            }],
+        };
+
+        // A space is legal in TOML but not in an HTTP header name.
+        let bad_name = destination("x collector key", "value");
+        assert!(matches!(
+            super::validate_gateway_telemetry(Some(&bad_name)),
+            Err(ConfigError::InvalidGatewayTelemetryHeader {
+                index: 0,
+                part: "name",
+                ..
+            })
+        ));
+
+        // A newline in the value would otherwise be a header-injection vector.
+        let bad_value = destination("x-collector-key", "line\nbreak");
+        assert!(matches!(
+            super::validate_gateway_telemetry(Some(&bad_value)),
+            Err(ConfigError::InvalidGatewayTelemetryHeader {
+                index: 0,
+                part: "value",
+                ..
+            })
+        ));
+
+        // The error must not leak the value, which is typically a secret.
+        let rendered = super::validate_gateway_telemetry(Some(&destination(
+            "x-collector-key",
+            "super\u{0}secret",
+        )))
+        .unwrap_err()
+        .to_string();
+        assert!(rendered.contains("x-collector-key"), "{rendered}");
+        assert!(!rendered.contains("secret"), "{rendered}");
+
+        // A well-formed header is still accepted.
+        let good = destination("x-collector-key", "collector-secret");
+        assert!(super::validate_gateway_telemetry(Some(&good)).is_ok());
+    }
+
+    #[test]
+    fn gateway_telemetry_signals_default_to_metrics_only() {
+        use figment::providers::{Format, Toml};
+        let telemetry: super::GatewayTelemetryConfig = figment::Figment::from(Toml::string(
+            "[[forward_to]]\nurl = \"https://collector.example\"\n",
+        ))
+        .extract()
+        .unwrap();
+        let destination = &telemetry.forward_to[0];
+        assert!(destination.metrics);
+        assert!(!destination.logs);
+        assert!(!destination.traces);
+        assert!(destination.headers.is_none());
+    }
+
+    #[test]
+    fn gateway_telemetry_signals_parse_explicit_values() {
+        use figment::providers::{Format, Toml};
+        let telemetry: super::GatewayTelemetryConfig = figment::Figment::from(Toml::string(
+            "[[forward_to]]\nurl = \"https://collector.example\"\nmetrics = false\nlogs = true\ntraces = true\nheaders = { \"x-api-key\" = \"secret\" }\n",
+        ))
+        .extract()
+        .unwrap();
+        let destination = &telemetry.forward_to[0];
+        assert!(!destination.metrics);
+        assert!(destination.logs);
+        assert!(destination.traces);
+        assert_eq!(destination.headers.as_ref().unwrap()["x-api-key"], "secret");
     }
 
     #[test]
