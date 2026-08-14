@@ -8,13 +8,13 @@ use wiremock::{
 };
 
 use crate::{
-    auth::inbound::InboundAuth,
+    auth::inbound::{is_consumed_by_shunt, InboundAuth},
     config::{AccountConfig, ApiKeyHeader, AuthMode, ProviderKind},
     gateway::{approval::Identity, jwt, GatewayAuth},
     server::AppState,
 };
 
-use super::{anthropic_provider, fetch, is_consumed_by_shunt, InboundCredentialContext};
+use super::{anthropic_provider, fetch, InboundCredentialContext};
 
 /// Point the default anthropic provider at `base_url` with the given auth.
 fn config_for(base_url: &str, auth: AuthMode) -> crate::config::Config {
@@ -321,6 +321,42 @@ async fn a_gateway_jwt_present_only_in_the_api_key_slot_is_not_forwarded() {
         InboundCredentialContext {
             static_auth: None,
             gateway_auth: Some(&gateway),
+        },
+    )
+    .await;
+
+    assert!(models.is_none());
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_static_token_configured_on_the_authorization_header_is_not_forwarded_raw() {
+    // `[server.auth] header = "authorization"` is a valid configuration —
+    // `InboundAuthConfig::resolve` only validates the name is a well-formed
+    // `HeaderName` — and `InboundAuth::authenticate_client` authenticates such
+    // a caller off the *whole* header value, with no `Bearer ` scheme
+    // required. Verification that reads only the Bearer payload sees nothing
+    // consumed for a raw token, so the gate token itself gets relayed to the
+    // upstream: the same leak as the `Bearer` case, one slot shape over.
+    let server = MockServer::start().await;
+    // No mock is mounted: `received_requests` proves no relay was attempted.
+    let state = state_for(&server.uri(), AuthMode::Passthrough);
+    let auth = InboundAuth::new(
+        HeaderName::from_static("authorization"),
+        vec![("test-client".to_string(), "static-gate-token".to_string())],
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert("authorization", "static-gate-token".parse().unwrap());
+    // The gate this caller actually passes, so the leak is reachable rather
+    // than hypothetical.
+    assert_eq!(auth.authenticate_client(&headers), Some("test-client"));
+
+    let models = fetch(
+        &state,
+        &headers,
+        InboundCredentialContext {
+            static_auth: Some(&auth),
+            gateway_auth: None,
         },
     )
     .await;
