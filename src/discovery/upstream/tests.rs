@@ -123,6 +123,46 @@ fn gateway_jwt() -> String {
     )
 }
 
+/// Start a mock server that answers `x-api-key: sk-ant-genuine-upstream-key`
+/// with one model, paired with a passthrough `AppState` and `GatewayAuth` —
+/// the shared fixture for the "gateway JWT in `Authorization` is stripped,
+/// the distinct genuine `x-api-key` survives" tests below.
+async fn passthrough_state_with_genuine_api_key_upstream() -> (MockServer, AppState, GatewayAuth) {
+    let server = MockServer::start().await;
+    mount_models_ok_with_headers(
+        &server,
+        &[("x-api-key", "sk-ant-genuine-upstream-key")],
+        single_model_page("claude-opus-5"),
+    )
+    .await;
+    let state = state_for(&server.uri(), AuthMode::Passthrough);
+    let gateway = gateway_auth();
+    (server, state, gateway)
+}
+
+/// Drive `fetch` with a gateway-auth context and assert the genuine
+/// `x-api-key` reached the upstream while `authorization` was stripped.
+async fn assert_genuine_api_key_forwarded_and_authorization_stripped(
+    server: &MockServer,
+    state: &AppState,
+    gateway: &GatewayAuth,
+    headers: HeaderMap,
+) {
+    let models = fetch(
+        state,
+        &headers,
+        InboundCredentialContext {
+            static_auth: None,
+            gateway_auth: Some(gateway),
+        },
+    )
+    .await;
+
+    assert_eq!(models.unwrap().len(), 1);
+    let request = &server.received_requests().await.unwrap()[0];
+    assert!(request.headers.get("authorization").is_none());
+}
+
 #[tokio::test]
 async fn forwards_caller_credential_and_maps_every_field() {
     let server = MockServer::start().await;
@@ -271,16 +311,7 @@ async fn a_gateway_jwt_in_authorization_does_not_block_a_distinct_api_key() {
     // Regression coverage for the per-slot fix: a gateway JWT in `Authorization`
     // alongside a genuine, *different* upstream key in `x-api-key` must forward
     // that key rather than treating the whole request as gateway-consumed.
-    let server = MockServer::start().await;
-    mount_models_ok_with_headers(
-        &server,
-        &[("x-api-key", "sk-ant-genuine-upstream-key")],
-        single_model_page("claude-opus-5"),
-    )
-    .await;
-
-    let state = state_for(&server.uri(), AuthMode::Passthrough);
-    let gateway = gateway_auth();
+    let (server, state, gateway) = passthrough_state_with_genuine_api_key_upstream().await;
     let mut headers = HeaderMap::new();
     headers.insert(
         "authorization",
@@ -288,19 +319,8 @@ async fn a_gateway_jwt_in_authorization_does_not_block_a_distinct_api_key() {
     );
     headers.insert("x-api-key", "sk-ant-genuine-upstream-key".parse().unwrap());
 
-    let models = fetch(
-        &state,
-        &headers,
-        InboundCredentialContext {
-            static_auth: None,
-            gateway_auth: Some(&gateway),
-        },
-    )
-    .await;
-
-    assert_eq!(models.unwrap().len(), 1);
-    let request = &server.received_requests().await.unwrap()[0];
-    assert!(request.headers.get("authorization").is_none());
+    assert_genuine_api_key_forwarded_and_authorization_stripped(&server, &state, &gateway, headers)
+        .await;
 }
 
 #[tokio::test]
@@ -380,6 +400,127 @@ fn non_utf8_value_is_not_consumed_by_shunt() {
         Some(&auth),
         None
     ));
+}
+
+#[test]
+fn garbage_three_segment_string_is_not_consumed_by_shunt() {
+    // Malformed-input control: right segment count, no valid base64/JSON
+    // payload — must not panic and must not be treated as shunt's own.
+    let auth = gateway_auth();
+    assert!(!is_consumed_by_shunt(b"a.b.c", Some(&auth), None));
+}
+
+/// A different secret than `gateway_auth()` verifies with — for minting a
+/// well-formed, `aud = "shunt"` token that fails signature verification
+/// (e.g. after a secret rotation) but is still shape-recognized.
+const OTHER_SECRET: &[u8] = b"fedcba9876543210fedcba9876543210";
+
+/// A different `public_url` than `GATEWAY_URL` — for minting a token as if by
+/// a sibling instance sharing the same `jwt_secret` but configured under a
+/// different issuer.
+const SIBLING_URL: &str = "https://sibling.gateway.example";
+
+fn identity_for_test() -> Identity {
+    Identity {
+        sub: "dev".to_string(),
+        email: "dev@example.com".to_string(),
+        name: "Dev".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn expired_gateway_jwt_in_x_api_key_is_not_forwarded() {
+    // #358 case 1: shunt itself minted this token (aud = "shunt", real
+    // secret), but its ttl is 0, so it is already expired by the time
+    // `verify_at` runs. It must still not reach the upstream.
+    let server = MockServer::start().await;
+    let state = state_for(&server.uri(), AuthMode::Passthrough);
+    let gateway = gateway_auth();
+    let expired = jwt::mint(&identity_for_test(), GATEWAY_URL, GATEWAY_SECRET, 0);
+    assert!(gateway.authenticate_token(&expired).is_none());
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-api-key", expired.parse().unwrap());
+
+    let models = fetch(
+        &state,
+        &headers,
+        InboundCredentialContext {
+            static_auth: None,
+            gateway_auth: Some(&gateway),
+        },
+    )
+    .await;
+
+    assert!(models.is_none());
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn wrong_issuer_gateway_jwt_in_authorization_is_not_forwarded() {
+    // #358 case 2, the sharper one: a fleet sharing one `jwt_secret` across
+    // differing `public_url` values. This token is minted for a sibling
+    // instance, is still live, and fails verification here purely on issuer
+    // mismatch — but `aud` is still "shunt", so shape still catches it. The
+    // genuine upstream key in `x-api-key` must survive.
+    let (server, state, gateway) = passthrough_state_with_genuine_api_key_upstream().await;
+    let sibling_token = jwt::mint(&identity_for_test(), SIBLING_URL, GATEWAY_SECRET, 3600);
+    assert!(gateway.authenticate_token(&sibling_token).is_none());
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "authorization",
+        format!("Bearer {sibling_token}").parse().unwrap(),
+    );
+    headers.insert("x-api-key", "sk-ant-genuine-upstream-key".parse().unwrap());
+
+    assert_genuine_api_key_forwarded_and_authorization_stripped(&server, &state, &gateway, headers)
+        .await;
+}
+
+#[tokio::test]
+async fn bad_signature_gateway_jwt_is_not_forwarded() {
+    // #358 case 3: minted under a different secret (e.g. post-rotation), so
+    // verification rejects it on signature — but it is well-formed with
+    // `aud = "shunt"`, so shape still catches it.
+    let server = MockServer::start().await;
+    let state = state_for(&server.uri(), AuthMode::Passthrough);
+    let gateway = gateway_auth();
+    let token = jwt::mint(&identity_for_test(), GATEWAY_URL, OTHER_SECRET, 3600);
+    assert!(gateway.authenticate_token(&token).is_none());
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-api-key", token.parse().unwrap());
+
+    let models = fetch(
+        &state,
+        &headers,
+        InboundCredentialContext {
+            static_auth: None,
+            gateway_auth: Some(&gateway),
+        },
+    )
+    .await;
+
+    assert!(models.is_none());
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn bare_authorization_header_with_an_invalid_shunt_jwt_is_not_forwarded() {
+    // #358 case 4: `[server.auth] header = "authorization"` lets a bare
+    // `Authorization: <token>` (no `Bearer ` scheme) pass the gate, so the
+    // by-value check must also see the raw header value. Here the raw value
+    // is an expired shunt-minted JWT.
+    let (server, state, gateway) = passthrough_state_with_genuine_api_key_upstream().await;
+    let expired = jwt::mint(&identity_for_test(), GATEWAY_URL, GATEWAY_SECRET, 0);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("authorization", expired.parse().unwrap());
+    headers.insert("x-api-key", "sk-ant-genuine-upstream-key".parse().unwrap());
+
+    assert_genuine_api_key_forwarded_and_authorization_stripped(&server, &state, &gateway, headers)
+        .await;
 }
 
 #[tokio::test]
