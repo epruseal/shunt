@@ -217,6 +217,13 @@ impl GatewayAuth {
                     .eq_ignore_ascii_case("bearer")
                     .then_some(token.trim())
             })?;
+        self.authenticate_token(token)
+    }
+
+    /// Verify a bare token value — no `Bearer ` prefix — against this gateway's
+    /// issuer and every configured signing key, so a token minted under a
+    /// rotated-out secret still verifies while that secret is still listed.
+    pub fn authenticate_token(&self, token: &str) -> Option<jwt::Claims> {
         self.jwt_secrets
             .iter()
             .find_map(|secret| jwt::verify(token, &self.public_url, secret))

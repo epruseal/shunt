@@ -73,10 +73,45 @@ On a gated (injected-credential) route the gateway strips `authorization` and `x
 from the forwarded headers after a successful check — the injected-credential adapters
 replace those headers with the provider credential anyway, but the boundary must not
 depend on adapter behavior. Passthrough routes are never gated, so the client's `Bearer` /
-`x-api-key` remain the real upstream Anthropic credential and are forwarded unchanged.
+`x-api-key` are forwarded as the caller presented them — except a slot that holds shunt's
+own `[server.gateway]` JWT, which is cleared from that slot regardless of gating (see below).
 Operators mixing passthrough and mapped models on one shared gateway should keep handing
 out dedicated `x-shunt-token` values: the `Bearer` slot then stays free to carry the real
 Anthropic credential for passthrough models.
+
+That advice **mitigates** the mixed case for a **static** token in the common case, where the
+operator hands the token out for use only via `x-shunt-token` — it does not enforce the
+boundary the way the JWT check below does. A client that instead delivers a static token
+through a rotating-credential mechanism such as `apiKeyHelper` hits the same both-slots
+problem the JWT case has: no free slot left to move it to. And unlike the JWT check,
+`headers_for_route` (`proxy/failover.rs`) never checks a static token against a slot's value
+at all — only `discovery/upstream.rs`'s `is_consumed_by_shunt` does — so today a static token
+that gated a mixed chain is still forwarded upstream on a same-origin passthrough attempt.
+That gap is tracked as #357 and is not closed by this fix.
+
+It does not resolve the mixed case for a `[server.gateway]` JWT either, for two reasons, so
+each slot is checked by the value it holds instead:
+
+- A caller delivering the JWT through an `apiKeyHelper` — the mechanism that refreshes a
+  rotating credential — has it in **both** `Authorization` and `x-api-key`, because that is
+  [how the credential variable maps to a header](https://code.claude.com/docs/en/llm-gateway-connect#how-the-credential-variable-maps-to-a-header).
+  There is no free slot left to move it out of.
+- "Gated" is decided per route **chain**, not per route, so a chain mixing mapped and
+  passthrough entries is authenticated by that JWT and then reaches its passthrough attempt
+  with the caller's headers intact. The same slot-by-slot check applies on a purely
+  passthrough chain too, which is never gated at all — the JWT can still land in either slot.
+
+So on a same-origin passthrough attempt, `authorization` and `x-api-key` are checked
+independently, by what each slot actually holds: a slot is cleared only if its own value
+verifies as shunt's gateway JWT, on the passthrough attempt of a chain (`proxy/failover.rs`)
+and in upstream model discovery (`discovery/upstream.rs`). The origin filter runs first — an
+off-origin failover attempt strips both slots outright before this by-value check ever runs;
+the by-value check applies only to whichever slots the origin filter retained. Within a
+same-origin attempt, the other slot's presence never triggers a strip by itself. Consequence
+to expect: a gateway-JWT caller who also presents a genuine upstream credential in the other
+slot still has that credential forwarded on a same-origin attempt — only the JWT-bearing slot
+is cleared. A gateway JWT with no accompanying upstream credential in either slot still falls
+back to the builtin catalog for discovery, since no forwardable credential remains.
 
 ## 3. Comparison & hygiene
 

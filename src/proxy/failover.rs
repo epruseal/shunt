@@ -570,14 +570,38 @@ fn headers_for_route(
     let injects_credential = !is_passthrough_route(state, route);
     if !injects_credential {
         // Passthrough forwards the caller's own upstream credential. That
-        // credential is origin-specific to the primary upstream, so it is kept
-        // only while the destination origin matches the primary's: a failover
-        // attempt to a *different* origin strips `authorization` / `x-api-key`
-        // and fails closed rather than replay a host-specific token off-origin.
-        // A same-origin failover (e.g. two passthrough entries on one host)
-        // still carries the credential, so that fallback keeps working. The
-        // primary route is the origin the credential was presented for, so it is
-        // kept without parsing any URL (the single-upstream hot path).
+        // credential is origin-specific to the primary upstream, so a slot is
+        // kept only while the destination origin matches the primary's: a
+        // failover attempt to a *different* origin strips both `authorization`
+        // and `x-api-key` and fails closed rather than replay a host-specific
+        // token off-origin. A same-origin failover (e.g. two passthrough
+        // entries on one host) keeps a slot that holds the caller's own
+        // upstream credential; the primary route is the origin the credential
+        // was presented for, so it is kept without parsing any URL (the
+        // single-upstream hot path).
+        //
+        // Within a same-origin attempt, each retained slot is also checked *by
+        // value* against shunt's own gateway JWT and stripped only if it holds
+        // one — never both slots just because one of them does. `authorization`
+        // and `x-api-key` are the two slots an `apiKeyHelper` can fill (it
+        // fills both), so shunt's own identity token can land in either or
+        // both, beside a genuine upstream credential in the other slot that
+        // must keep flowing. `check_inbound_auth`'s auth gate authenticates
+        // once for the whole route chain, so a chain mixing mapped and
+        // passthrough routes can still reach this branch same-origin with a
+        // gateway JWT in one of these slots. A static `[server.auth]` token
+        // can use an alternative slot in the common case — operators mixing
+        // passthrough and mapped models hand out dedicated `x-shunt-token`
+        // values so `authorization`/`x-api-key` stay free for the caller's
+        // real credential (`docs/m4-inbound-auth.md` §2) — but that is
+        // advisory, not enforced here: a static token delivered through a
+        // rotating-credential mechanism like `apiKeyHelper` hits the same
+        // both-slots problem, and unlike the gateway JWT this function never
+        // checks a static token's value (only `discovery/upstream.rs`'s
+        // `is_consumed_by_shunt` does), so it survives a same-origin
+        // passthrough attempt even when it should be stripped (#357). A
+        // gateway JWT has no advisory alternative and is always checked here
+        // by value.
         let mut headers = base.clone();
         let same_origin = is_primary
             || matches!(
@@ -587,6 +611,30 @@ fn headers_for_route(
         if !same_origin {
             headers.remove("authorization");
             headers.remove("x-api-key");
+            tracing::debug!(
+                provider = %route.provider,
+                "stripped passthrough credential slots: off_origin"
+            );
+            return headers;
+        }
+        if inbound.gateway_claims.is_some() {
+            headers.remove("authorization");
+            tracing::debug!(
+                provider = %route.provider,
+                slot = "authorization",
+                "stripped passthrough credential slot: gateway_jwt"
+            );
+        }
+        if headers
+            .get("x-api-key")
+            .is_some_and(|value| is_gateway_jwt(state, value))
+        {
+            headers.remove("x-api-key");
+            tracing::debug!(
+                provider = %route.provider,
+                slot = "x-api-key",
+                "stripped passthrough credential slot: gateway_jwt"
+            );
         }
         return headers;
     }
@@ -641,6 +689,21 @@ fn provider_origin(state: &AppState, provider: &str) -> Option<String> {
     (origin != "null").then_some(origin)
 }
 
+/// Whether `value` — the raw contents of a header slot, no `Bearer ` prefix —
+/// is shunt's own gateway JWT rather than the caller's upstream credential.
+/// `false` when no `[server.gateway]` auth is configured or the value is not
+/// valid UTF-8: a non-UTF-8 value cannot be a JWT, so it is treated as
+/// not-ours and kept.
+fn is_gateway_jwt(state: &AppState, value: &HeaderValue) -> bool {
+    let Some(auth) = state.gateway_auth.as_ref() else {
+        return false;
+    };
+    let Ok(token) = value.to_str() else {
+        return false;
+    };
+    auth.authenticate_token(token.trim()).is_some()
+}
+
 fn stamp_gateway_headers(
     response: &mut axum::response::Response,
     upstream: &str,
@@ -657,3 +720,6 @@ fn stamp_gateway_headers(
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
