@@ -13,20 +13,23 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use crate::{
-    config::{Config, GatewayAdminConfig, GatewayConfig, GatewayEnforcementConfig, GroupLimitMode},
+    config::{AdminConfig, AdminKey, Config, SpendConfig},
     server::build_router,
 };
 
 const WRITE_KEY: &str = "write-key-0123456789abcdef0123456789";
 const READ_KEY: &str = "read-key-0123456789abcdef01234567890";
+/// A legacy `tokens_env` pair. Those are the write tier, so it must behave
+/// exactly like `WRITE_KEY`.
+const TOKEN_KEY: &str = "token-key-0123456789abcdef0123456789";
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// `[server.admin]` + `[server.spend]` and deliberately **no**
+/// `[server.gateway]`: the whole suite therefore runs against a config that
+/// would not boot at all if the spend surface still required gateway login.
 struct SpendEnv {
     _guard: MutexGuard<'static, ()>,
-    secret_env: String,
-    users_env: String,
-    write_env: String,
-    read_env: String,
+    tokens_env: String,
 }
 
 impl SpendEnv {
@@ -38,64 +41,50 @@ impl SpendEnv {
         let guard = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let suffix = format!("{}_{}", std::process::id(), label);
-        let secret_env = format!("SHUNT_SPEND_TEST_SECRET_{suffix}");
-        let users_env = format!("SHUNT_SPEND_TEST_USERS_{suffix}");
-        let write_env = format!("SHUNT_SPEND_TEST_WRITE_{suffix}");
-        let read_env = format!("SHUNT_SPEND_TEST_READ_{suffix}");
-        std::env::set_var(&secret_env, "0123456789abcdef0123456789abcdef");
-        std::env::set_var(&users_env, "dev@example.com:password");
-        std::env::set_var(&write_env, format!("writer:{WRITE_KEY}"));
-        std::env::set_var(&read_env, format!("reader:{READ_KEY}"));
+        let tokens_env = format!("SHUNT_SPEND_TEST_TOKENS_{}_{}", std::process::id(), label);
+        std::env::set_var(&tokens_env, format!("ops:{TOKEN_KEY}"));
         let mut config = Config::default();
-        config.server.gateway = Some(GatewayConfig {
-            public_url: "https://gateway.example".into(),
-            jwt_secret_env: Some(secret_env.clone()),
-            users_env: users_env.clone(),
-            token_ttl_seconds: Some(3600),
-            trust_forwarded_for: false,
-            policies: None,
-            telemetry: None,
-            state_path: None,
-            admin: Some(GatewayAdminConfig {
-                write_keys_env: write_env.clone(),
-                read_keys_env: read_env.clone(),
-                blocked_message: None,
-                audit_retention_days: 365,
-                spend_retention_months: 13,
-                identity_retention_days: 90,
-                group_limit_mode: GroupLimitMode::Min,
-                state_path,
-                write_keys: Vec::new(),
-                read_keys: Vec::new(),
-            }),
-            enforcement: GatewayEnforcementConfig::default(),
-            oidc: None,
-            session: None,
+        config.server.admin = Some(admin_config(&tokens_env));
+        config.server.spend = Some(SpendConfig {
+            state_path,
+            ..SpendConfig::default()
         });
+        assert!(
+            config.server.gateway.is_none(),
+            "the spend surface must not need [server.gateway]"
+        );
         (
             config,
             Self {
                 _guard: guard,
-                secret_env,
-                users_env,
-                write_env,
-                read_env,
+                tokens_env,
             },
         )
     }
 }
 
+fn admin_config(tokens_env: &str) -> AdminConfig {
+    AdminConfig {
+        header: "x-shunt-admin-token".to_string(),
+        tokens_env: tokens_env.to_string(),
+        tokens_file: None,
+        write_keys: vec![AdminKey {
+            id: "writer".to_string(),
+            key: WRITE_KEY.into(),
+        }],
+        read_keys: vec![AdminKey {
+            id: "reader".to_string(),
+            key: READ_KEY.into(),
+        }],
+        session_ttl_secs: 3600,
+        pending_ttl_secs: 600,
+        oidc: None,
+    }
+}
+
 impl Drop for SpendEnv {
     fn drop(&mut self) {
-        for key in [
-            &self.secret_env,
-            &self.users_env,
-            &self.write_env,
-            &self.read_env,
-        ] {
-            std::env::remove_var(key);
-        }
+        std::env::remove_var(&self.tokens_env);
     }
 }
 
@@ -624,8 +613,136 @@ async fn delete_and_unknown_ids_use_the_pinned_shapes() {
     assert_error_response(&response, &body, StatusCode::NOT_FOUND);
 }
 
+/// THE COUPLING TEST. `[server.admin]` + `[server.spend]` with no
+/// `[server.gateway]` at all must boot and serve the spend endpoints. Before
+/// this change the spend surface lived under `[server.gateway.admin]`, so
+/// enabling it forced a deployment to configure gateway login — a signing
+/// secret plus static users or OIDC — that it never used.
 #[tokio::test]
-async fn routes_are_absent_without_gateway_admin_config() {
+async fn spend_surface_boots_and_serves_without_any_gateway_configuration() {
+    let (config, _env) = SpendEnv::config("no-gateway");
+    assert!(config.server.gateway.is_none());
+    assert!(config.server.admin.is_some() && config.server.spend.is_some());
+
+    let (router, _, _) = build_router(config).expect("a gateway-less spend config must boot");
+
+    let (response, _) = send(
+        &router,
+        request("GET", "/v1/organizations/spend_limits", WRITE_KEY, None),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let (response, body) = post(&router, WRITE_KEY, organization(json!("100"), "monthly")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body["amount"], "100");
+}
+
+/// A legacy `tokens_env` pair is the write tier, so it must behave exactly like
+/// a `write_keys` entry — and be attributed as `admin-token:<name>` rather than
+/// `admin-key:<id>` in the audit trail.
+#[tokio::test]
+async fn legacy_tokens_env_credential_behaves_like_a_write_key() {
+    let (config, _env) = SpendEnv::config("legacy-token");
+    let (router, _, state) = build_router(config).unwrap();
+
+    let (response, created) = post(&router, TOKEN_KEY, organization(json!("1"), "daily")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let (response, _) = send(
+        &router,
+        request(
+            "GET",
+            &format!("/v1/organizations/spend_limits/{id}"),
+            TOKEN_KEY,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let (response, _) = send(
+        &router,
+        request(
+            "DELETE",
+            &format!("/v1/organizations/spend_limits/{id}"),
+            TOKEN_KEY,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let actors: Vec<String> = state
+        .gateway_stores
+        .spend
+        .export()
+        .audit
+        .iter()
+        .map(|record| record.actor.clone())
+        .collect();
+    assert_eq!(actors, vec!["admin-token:ops", "admin-token:ops"]);
+}
+
+/// The spend routes accept the admin credential in the configured header as
+/// well as in `x-api-key`, for every credential kind.
+#[tokio::test]
+async fn spend_routes_accept_both_credential_slots() {
+    let (config, _env) = SpendEnv::config("both-slots");
+    let (router, _, _) = build_router(config).unwrap();
+
+    for credential in [TOKEN_KEY, WRITE_KEY, READ_KEY] {
+        for slot in ["x-shunt-admin-token", "x-api-key"] {
+            let request = Request::get("/v1/organizations/spend_limits")
+                .header(slot, credential)
+                .body(Body::empty())
+                .unwrap();
+            let (response, _) = send(&router, request).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{credential} in {slot} must authenticate the spend surface"
+            );
+        }
+    }
+}
+
+/// A request can carry a valid credential in *both* accepted slots — a proxy
+/// that adds the admin header to a request that already holds `x-api-key` does
+/// exactly that. The audit trail records one actor, so which one must not be
+/// incidental: the configured header is scanned first and supplies it. Here the
+/// header credential (`admin-key:writer`) also sorts *below* the `x-api-key` one
+/// (`admin-token:ops`), so comparing whole credentials would blame the wrong
+/// slot.
+#[tokio::test]
+async fn both_slots_carrying_a_same_tier_credential_attribute_to_the_configured_header() {
+    let (config, _env) = SpendEnv::config("slot-priority");
+    let (router, _, state) = build_router(config).unwrap();
+
+    let request = Request::post("/v1/organizations/spend_limits")
+        .header("x-shunt-admin-token", WRITE_KEY)
+        .header("x-api-key", TOKEN_KEY)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            organization(json!("100"), "monthly").to_string(),
+        ))
+        .unwrap();
+    let (response, _) = send(&router, request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let actors: Vec<String> = state
+        .gateway_stores
+        .spend
+        .export()
+        .audit
+        .iter()
+        .map(|record| record.actor.clone())
+        .collect();
+    assert_eq!(actors, vec!["admin-key:writer"]);
+}
+
+#[tokio::test]
+async fn routes_are_absent_without_the_spend_section() {
     let response = build_router(Config::default())
         .unwrap()
         .0
@@ -639,18 +756,19 @@ async fn routes_are_absent_without_gateway_admin_config() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
-/// Routes are registered from the presence of `[server.gateway.admin]` alone,
-/// so a block whose key env vars resolve to nothing leaves the surface present
-/// but unusable. The companion test in `config.rs` only proves the boot warning
-/// fires and the lists come back empty; it would not catch an `authenticate`
-/// refactor that read "no keys configured" as "auth disabled". Assert the
-/// fail-closed behavior over HTTP, where that regression would actually show.
+/// Routes are registered from the presence of `[server.spend]` alone, so a
+/// credential the `[server.admin]` section does not hold must be refused on a
+/// surface that exists. This would not catch an `authenticate` refactor that
+/// read "route registered" as "auth satisfied" unless it is asserted over HTTP,
+/// which is what this does.
 #[tokio::test]
-async fn configured_admin_block_without_resolved_keys_denies_every_request() {
-    let (config, env) = SpendEnv::config("keyless");
-    // Keep the admin block, drop only the key material the harness exported.
-    std::env::set_var(&env.write_env, "");
-    std::env::set_var(&env.read_env, "");
+async fn spend_routes_exist_but_refuse_a_credential_the_admin_section_does_not_hold() {
+    let (mut config, _env) = SpendEnv::config("keyless");
+    // Keep `[server.spend]` and `[server.admin]`, but drop the key arrays the
+    // harness configured, leaving only the unrelated `tokens_env` pair.
+    let admin = config.server.admin.as_mut().unwrap();
+    admin.write_keys.clear();
+    admin.read_keys.clear();
 
     let (router, _, _) = build_router(config).unwrap();
 
@@ -672,4 +790,13 @@ async fn configured_admin_block_without_resolved_keys_denies_every_request() {
     )
     .await;
     assert_error_response(&response, &body, StatusCode::UNAUTHORIZED);
+
+    // The surviving legacy token still works, so the refusal above is about the
+    // credential and not about the surface being disabled.
+    let (response, _) = send(
+        &router,
+        request("GET", "/v1/organizations/spend_limits", TOKEN_KEY, None),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
 }
