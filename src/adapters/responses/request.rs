@@ -91,7 +91,16 @@ pub(super) fn request_builder(
         }
         // A Responses provider configured with passthrough auth is a
         // misconfiguration; send no credential and let the upstream reject it.
-        Credential::CursorOauth { .. } | Credential::Passthrough => {}
+        //
+        // An Antigravity token belongs to the same class: config validation
+        // pins `antigravity_oauth` to `kind = "antigravity"`, so it cannot
+        // legitimately reach a Responses upstream. Fail closed rather than
+        // bearer it — the hosts on this path (OpenAI, xAI, Cursor) are not the
+        // origin the subscription token was issued for, so a reachable bug here
+        // would be a credential leak rather than a 401.
+        Credential::CursorOauth { .. }
+        | Credential::AntigravityOauth { .. }
+        | Credential::Passthrough => {}
     }
     request
 }
@@ -383,5 +392,27 @@ mod tests {
         assert!(request.headers().get("chatgpt-account-id").is_none());
         assert!(request.headers().get("originator").is_none());
         assert!(request.headers().get("version").is_none());
+    }
+
+    #[test]
+    fn antigravity_oauth_sends_no_credential_on_the_responses_path() {
+        // Config validation pins `antigravity_oauth` to `kind = "antigravity"`,
+        // so this arm is unreachable in a valid config — but if it were ever
+        // reached, it must fail closed rather than bearer a subscription token
+        // issued for a different origin (OpenAI/xAI/Cursor are not it).
+        let state = AppState::new(Config::default(), reqwest::Client::new()).unwrap();
+
+        let request = build_test_request(
+            &state,
+            &codex_route(),
+            Credential::AntigravityOauth {
+                access_token: "antigravity-token".to_string(),
+                project_id: "proj-1".to_string(),
+            },
+            None,
+        );
+
+        assert!(request.headers().get("authorization").is_none());
+        assert!(request.headers().get("x-api-key").is_none());
     }
 }

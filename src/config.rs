@@ -1578,7 +1578,7 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub retry: RetryConfig,
     /// Directories the Antigravity CLI may be pointed at by request content
-    /// (`kind = "antigravity"` only).
+    /// (`kind = "antigravity_cli"` only).
     ///
     /// `agy` runs with `--dangerously-skip-permissions`, so whatever directory
     /// it starts in is a directory an unattended agent can read, write, and run
@@ -1599,7 +1599,7 @@ pub struct ProviderConfig {
     /// is used.
     #[serde(default)]
     pub workspace_roots: Vec<String>,
-    /// Run the Antigravity CLI with `--sandbox` (`kind = "antigravity"` only).
+    /// Run the Antigravity CLI with `--sandbox` (`kind = "antigravity_cli"` only).
     ///
     /// On by default. Without it, `--dangerously-skip-permissions` leaves an
     /// unattended agent with shell access and no workspace boundary: refusing a
@@ -1865,8 +1865,21 @@ pub enum ProviderKind {
     /// in the Code Assist `{model,project,request}` envelope. Auth reuses a
     /// Google OAuth subscription token (`google_oauth`).
     Gemini,
-    /// Local Antigravity CLI binary (`agy`) execution.
+    /// Antigravity over its native HTTP backend. Wire-identical to the Code
+    /// Assist path `kind = "gemini"` speaks (`v1internal:generateContent` under
+    /// the `{model,project,request}` envelope), but authenticated with an
+    /// Antigravity subscription token rather than a Gemini CLI one, and carrying
+    /// `ideType: ANTIGRAVITY` through project discovery. Requires
+    /// `auth = "antigravity_oauth"`.
     Antigravity,
+    /// Local Antigravity CLI binary (`agy`) execution.
+    ///
+    /// **Deprecated.** Superseded by `kind = "antigravity"`, which reaches the
+    /// same service over HTTP without depending on an installed binary, on
+    /// `PATH`, or on a subprocess. Retained so existing deployments keep working
+    /// while they migrate; it will be removed once the HTTP transport reaches
+    /// parity.
+    AntigravityCli,
 }
 
 /// How shunt authenticates to an upstream.
@@ -1893,6 +1906,12 @@ pub enum AuthMode {
     /// Only valid for
     /// `kind = "gemini"`.
     GoogleOauth,
+    /// Antigravity subscription OAuth, acquired via `shunt login antigravity`
+    /// and stored in ~/.shunt/antigravity-auth.json. Shares Google's OAuth
+    /// endpoints with [`AuthMode::GoogleOauth`] but uses the Antigravity client
+    /// and scopes, so the two credentials are not interchangeable. Only valid
+    /// for `kind = "antigravity"`.
+    AntigravityOauth,
     /// No authentication header sent (e.g. local subprocess CLI adapters).
     None,
 }
@@ -2138,6 +2157,31 @@ pub enum ConfigError {
     GoogleOauthNonGoogleHost { provider: String, host: String },
     #[error("providers.{provider} uses auth = \"google_oauth\" but base_url is not https; refusing to send a subscription token over plaintext")]
     GoogleOauthNotHttps { provider: String },
+    #[error("providers.{provider} uses auth = \"antigravity_oauth\" but kind is not \"antigravity\"; another adapter would forward the client's own credential instead of the Antigravity token")]
+    AntigravityOauthWrongKind { provider: String },
+    #[error("providers.{provider} uses auth = \"antigravity_oauth\" but base_url host {host} is not a googleapis.com host; refusing to send a subscription token off-origin")]
+    AntigravityOauthNonGoogleHost { provider: String, host: String },
+    #[error("providers.{provider} uses auth = \"antigravity_oauth\" but base_url is not https; refusing to send a subscription token over plaintext")]
+    AntigravityOauthNotHttps { provider: String },
+    #[error(
+        "providers.{provider} uses kind = \"antigravity\" with auth = \"{auth}\", but \
+         kind = \"antigravity\" is now the native HTTP upstream and requires \
+         auth = \"antigravity_oauth\". The local `agy` CLI transport moved to \
+         kind = \"antigravity_cli\" (built-in provider `antigravity-cli`), which is \
+         deprecated. Pick one explicitly rather than have the transport change underneath you."
+    )]
+    AntigravityKindRequiresOauth { provider: String, auth: String },
+    #[error(
+        "providers.antigravity has no `auth` key, so it deep-merges the built-in \
+         antigravity_oauth default instead of being caught by the kind = \"antigravity\" \
+         guard. kind = \"antigravity\" is now the native HTTP upstream and requires an \
+         explicit auth = \"antigravity_oauth\". The local `agy` CLI transport moved to \
+         kind = \"antigravity_cli\" (built-in provider `antigravity-cli`), which is \
+         deprecated. Pick one explicitly rather than have the transport change underneath you."
+    )]
+    AntigravityLegacyTableMissingAuth,
+    #[error("{0}")]
+    AntigravityMigrationRequired(String),
     #[error("providers.{provider}.accounts requires auth = \"claude_oauth\" or \"chatgpt_oauth\"")]
     AccountsRequireOauthProvider { provider: String },
     #[error("providers.{provider} uses auth = \"claude_oauth\" but kind is not \"anthropic\"")]
@@ -2439,6 +2483,30 @@ impl ProviderConfig {
             sandbox: true,
         }
     }
+
+    /// An `Antigravity`-kind provider on the Antigravity HTTP backend, reusing
+    /// an Antigravity subscription token (`antigravity_oauth`). Used for the
+    /// built-in `antigravity` provider.
+    fn antigravity(base_url: &str) -> Self {
+        Self {
+            kind: ProviderKind::Antigravity,
+            base_url: base_url.to_string(),
+            auth: AuthMode::AntigravityOauth,
+            api_key_env: None,
+            api_key_header: ApiKeyHeader::Bearer,
+            effort: None,
+            service_tier: None,
+            count_tokens: CountTokens::default(),
+            accounts: Vec::new(),
+            account_scope: Vec::new(),
+            websocket: false,
+            tool_search: None,
+            request_compression: true,
+            retry: RetryConfig::default(),
+            workspace_roots: Vec::new(),
+            sandbox: true,
+        }
+    }
 }
 
 impl Default for Config {
@@ -2524,10 +2592,20 @@ impl Default for Config {
                 ProviderConfig::gemini("https://cloudcode-pa.googleapis.com"),
             ),
             (
-                // Local Antigravity CLI binary (`agy`) execution for Gemini models.
+                // Antigravity over its native HTTP backend, authenticated with
+                // `shunt login antigravity`. Same service the `agy` CLI reaches,
+                // without the subprocess.
                 "antigravity".to_string(),
+                ProviderConfig::antigravity("https://cloudcode-pa.googleapis.com"),
+            ),
+            (
+                // Local Antigravity CLI binary (`agy`) execution for Gemini
+                // models. Deprecated in favour of the `antigravity` provider
+                // above; retained for deployments still on the subprocess
+                // transport.
+                "antigravity-cli".to_string(),
                 ProviderConfig {
-                    kind: ProviderKind::Antigravity,
+                    kind: ProviderKind::AntigravityCli,
                     base_url: "http://localhost".to_string(),
                     auth: AuthMode::None,
                     api_key_env: None,
@@ -2635,6 +2713,51 @@ impl ConfigFormat {
     }
 }
 
+/// Refuses a `[providers.antigravity]` shape that omits `auth` before it ever
+/// reaches the merge against the built-in `antigravity` default.
+///
+/// Figment deep-merges nested tables: any key the *effective* config omits is
+/// filled in from the base (`Serialized::defaults(Config::default())`)
+/// layer, and the built-in `antigravity` entry already sets
+/// `auth = "antigravity_oauth"`. A pre-#372 config never carried an `auth`
+/// key under this name -- `kind = "antigravity"` meant "run the local `agy`
+/// binary", and there was nothing to authenticate over HTTP with -- so after
+/// the merge it would end up with `auth = "antigravity_oauth"` anyway,
+/// passing the `AntigravityKindRequiresOauth` guard in [`Config::validate`]
+/// (which only ever sees the already-merged value) and silently switching
+/// transport. `effective_figment` is the file's own table (if any) merged
+/// with any `providers.antigravity.*` env overrides layered on top --
+/// exactly the layering `Config::load` itself applies below -- rather than
+/// the built-in-defaults figment. Probing the file layer alone (the previous
+/// shape of this check) missed both directions: a legacy shape assembled
+/// entirely, or completed, via `SHUNT_PROVIDERS__ANTIGRAVITY__*` env vars was
+/// invisible to a check that only ever looked at the file, and a file table
+/// an env var legitimately completes with `auth` was rejected before the env
+/// layer had a chance to complete it.
+fn reject_legacy_antigravity_table_without_auth(
+    effective_figment: &Figment,
+) -> Result<(), ConfigError> {
+    let Ok(value) = effective_figment.find_value("providers.antigravity") else {
+        return Ok(());
+    };
+    let Some(dict) = value.as_dict() else {
+        return Ok(());
+    };
+    // An explicit `kind` naming something else (e.g. migrating straight to
+    // `antigravity_cli` under this table name) is not the ambiguous legacy
+    // shape; an omitted `kind` inherits the built-in default, which is
+    // `antigravity`.
+    let kind_is_antigravity = dict
+        .get("kind")
+        .and_then(figment::value::Value::as_str)
+        .map(|kind| kind == "antigravity")
+        .unwrap_or(true);
+    if kind_is_antigravity && !dict.contains_key("auth") {
+        return Err(ConfigError::AntigravityLegacyTableMissingAuth);
+    }
+    Ok(())
+}
+
 /// Normalizes a raw `service_tier` config value to its Responses wire form.
 /// `default` is preserved as its own sentinel string rather than collapsed to
 /// `None`: `None` also means "not configured", and collapsing the two made an
@@ -2660,6 +2783,12 @@ impl Config {
         };
         let mut figment = Figment::from(Serialized::defaults(Self::default()));
         let mut file_declares_upstreams = false;
+        // The file layer alone (no built-in defaults merged in), kept around
+        // past this block so it can be re-merged with the env layer below to
+        // decide the legacy-antigravity-table guard against the *effective*
+        // config rather than the file alone. `None` when there is no config
+        // file.
+        let mut file_figment: Option<Figment> = None;
         // Literal (non-reference) string values found in the file, keyed by
         // value and valued by the dotted field path(s) they appeared at —
         // used only to warn about a `Secret` field holding a plaintext
@@ -2697,21 +2826,42 @@ impl Config {
             never_literal_values = substituted.resolved_values;
             // Probe only the file layer: serialized defaults always contain the
             // built-in providers, and env overrides are allowed under either form.
-            let file_figment = match format {
+            let probed_file_figment = match format {
                 ConfigFormat::Toml => Figment::from(Toml::string(&substituted.text)),
                 ConfigFormat::Yaml => Figment::from(Yaml::string(&substituted.text)),
             };
-            let file_declares_providers = file_figment.find_value("providers").is_ok();
-            file_declares_upstreams = file_figment.find_value("upstreams").is_ok();
+            let file_declares_providers = probed_file_figment.find_value("providers").is_ok();
+            file_declares_upstreams = probed_file_figment.find_value("upstreams").is_ok();
             if file_declares_providers && file_declares_upstreams {
                 return Err(ConfigError::MixedProviderDeclarationForms);
             }
             // The parser is chosen by extension so TOML and YAML configs are
             // both accepted; an unknown extension is treated as TOML.
-            figment = figment.merge(file_figment);
+            figment = figment.merge(&probed_file_figment);
+            file_figment = Some(probed_file_figment);
         }
         never_literal_values.extend(secrets::shunt_env_values());
         let env = Env::prefixed("SHUNT_").split("__");
+        // Decide the legacy-antigravity-table guard against the *effective*
+        // providers.antigravity shape: the file's own table (if any) merged
+        // with any `providers.antigravity.*` env overrides layered on top,
+        // mirroring exactly how the env layer is scoped for the real
+        // extraction below (`file_declares_upstreams` excludes `providers.*`
+        // env keys under the ordered-upstreams form). Built without the
+        // `Serialized::defaults` base layer, so an omitted `auth` is still
+        // visibly absent rather than already backfilled from the built-in
+        // default.
+        let provider_env = if file_declares_upstreams {
+            env.clone().filter(|key| !key.starts_with("providers."))
+        } else {
+            env.clone()
+        };
+        let mut effective_provider_figment = Figment::new();
+        if let Some(file_figment) = &file_figment {
+            effective_provider_figment = effective_provider_figment.merge(file_figment);
+        }
+        effective_provider_figment = effective_provider_figment.merge(provider_env);
+        reject_legacy_antigravity_table_without_auth(&effective_provider_figment)?;
         // Scopes the literal-value map for the extraction below so
         // `Secret::deserialize` can record which config-file paths held a
         // secret written verbatim, for the aggregated warning after
@@ -2733,6 +2883,7 @@ impl Config {
         if file_declares_upstreams {
             config.apply_ordered_provider_env(env)?;
         }
+        config.backfill_antigravity_cli_migration_auth(&effective_provider_figment);
         let config = config.validate()?;
         // One aggregated warning per load naming every `Secret` field whose
         // value was written literally in the config file — never the value
@@ -2839,6 +2990,51 @@ impl Config {
             self.upstreams_ordered = true;
         }
         Ok(())
+    }
+
+    /// Writing `kind = "antigravity_cli"` under `[providers.antigravity]`,
+    /// with nothing else, is the documented way to migrate that name back
+    /// to the deprecated `agy` subprocess transport (see
+    /// `reject_legacy_antigravity_table_without_auth` above, which lets
+    /// this exact shape through). Figment's deep-merge still backfills the
+    /// omitted `auth` from the built-in `antigravity` default's `auth =
+    /// "antigravity_oauth"`, since the merge has no notion that changing
+    /// `kind` invalidates the rest of that default -- `validate` then
+    /// rejects the result as `AntigravityOauthWrongKind`, breaking the very
+    /// migration path the guard above exists to allow. Reassign `auth` to
+    /// what the built-in `antigravity-cli` provider itself uses instead.
+    ///
+    /// Scoped to this one documented name/kind pair rather than generalized
+    /// to arbitrary provider names: generalizing would also silently
+    /// resolve unrelated kind-mismatched legacy tables (e.g. repurposing
+    /// `[providers.antigravity]` to some unrelated kind without an explicit
+    /// `auth`) that today fail loudly and correctly at `validate`, turning
+    /// that clear, actionable error into a silently invented `auth` choice
+    /// instead.
+    fn backfill_antigravity_cli_migration_auth(&mut self, effective_figment: &Figment) {
+        let Ok(value) = effective_figment.find_value("providers.antigravity") else {
+            return;
+        };
+        let Some(dict) = value.as_dict() else {
+            return;
+        };
+        let migrating_to_cli = dict
+            .get("kind")
+            .and_then(figment::value::Value::as_str)
+            .map(|kind| kind == "antigravity_cli")
+            .unwrap_or(false);
+        if !migrating_to_cli || dict.contains_key("auth") {
+            return;
+        }
+        if let Some(cli_auth) = Self::default()
+            .providers
+            .get("antigravity-cli")
+            .map(|provider| provider.auth)
+        {
+            if let Some(provider) = self.providers.get_mut("antigravity") {
+                provider.auth = cli_auth;
+            }
+        }
     }
 
     /// Validates and normalizes every configured `service_tier` (provider-level
@@ -3020,7 +3216,7 @@ impl Config {
         // request because a reload can change this config value but not the
         // listener the process actually bound.
         if let Some(name) = self.providers.iter().find_map(|(name, provider)| {
-            (provider.kind == ProviderKind::Antigravity && !provider.sandbox).then_some(name)
+            (provider.kind == ProviderKind::AntigravityCli && !provider.sandbox).then_some(name)
         }) {
             if !self.server.bind_is_loopback() {
                 return Err(ConfigError::UnsandboxedAntigravityOnPublicBind {
@@ -3228,6 +3424,48 @@ impl Config {
                     }
                     if !host_is_google_codeassist(host) {
                         return Err(ConfigError::GoogleOauthNonGoogleHost {
+                            provider: name.clone(),
+                            host: host.to_string(),
+                        });
+                    }
+                }
+            }
+            // `kind = "antigravity"` used to mean "run the local `agy` binary".
+            // It now means the native HTTP upstream, so a config carrying the
+            // old meaning must not resolve quietly to a different transport
+            // with different credentials, egress, and failure modes. Anything
+            // that is not the new auth mode is rejected by name.
+            if provider.kind == ProviderKind::Antigravity
+                && provider.auth != AuthMode::AntigravityOauth
+            {
+                return Err(ConfigError::AntigravityKindRequiresOauth {
+                    provider: name.clone(),
+                    auth: serde_json::to_value(provider.auth)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_string))
+                        .unwrap_or_else(|| "unknown".to_string()),
+                });
+            }
+            // Mirrors the `google_oauth` guards above: the Antigravity token is
+            // a subscription bearer on the same Google host family, so it must
+            // stay on a googleapis.com host over https and be carried by the
+            // adapter that injects it rather than one that forwards the
+            // client's own credential.
+            if provider.auth == AuthMode::AntigravityOauth {
+                if provider.kind != ProviderKind::Antigravity {
+                    return Err(ConfigError::AntigravityOauthWrongKind {
+                        provider: name.clone(),
+                    });
+                }
+                let host = url.host_str().unwrap_or_default();
+                if !host_is_loopback(host) {
+                    if url.scheme() != "https" {
+                        return Err(ConfigError::AntigravityOauthNotHttps {
+                            provider: name.clone(),
+                        });
+                    }
+                    if !host_is_google_codeassist(host) {
+                        return Err(ConfigError::AntigravityOauthNonGoogleHost {
                             provider: name.clone(),
                             host: host.to_string(),
                         });
@@ -3915,7 +4153,7 @@ mod tests {
 
         let antigravity = |sandbox: bool| {
             let mut provider = ProviderConfig::gemini("http://localhost");
-            provider.kind = ProviderKind::Antigravity;
+            provider.kind = ProviderKind::AntigravityCli;
             provider.auth = AuthMode::None;
             provider.sandbox = sandbox;
             provider
@@ -6539,6 +6777,280 @@ id = "claude-sonnet-5"
         let error = config.validate().unwrap_err();
         assert!(matches!(error, ConfigError::CursorOauthNotHttps { .. }));
         assert!(error.to_string().contains("plaintext"));
+    }
+
+    #[test]
+    fn default_seeds_the_native_antigravity_provider_and_the_deprecated_cli_one() {
+        let config = Config::default();
+
+        // `antigravity` is the native HTTP upstream.
+        let native = config.provider("antigravity").unwrap();
+        assert_eq!(native.kind, ProviderKind::Antigravity);
+        assert_eq!(native.auth, AuthMode::AntigravityOauth);
+        assert_eq!(native.base_url, "https://cloudcode-pa.googleapis.com");
+
+        // The `agy` subprocess transport kept its behaviour under a new name.
+        let cli = config.provider("antigravity-cli").unwrap();
+        assert_eq!(cli.kind, ProviderKind::AntigravityCli);
+        assert_eq!(cli.auth, AuthMode::None);
+        assert_eq!(cli.base_url, "http://localhost");
+        assert!(cli.sandbox);
+
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn a_legacy_antigravity_block_is_rejected_by_name_rather_than_retargeted() {
+        // The whole point of the rename: a config that meant "run the local
+        // `agy` binary" must not resolve quietly to an OAuth HTTP upstream with
+        // different credentials, egress, and failure modes.
+        // The two shapes a legacy config can actually have: the old built-in
+        // preset used `none`, and an omitted `auth` defaults to passthrough.
+        // (`api_key` is not a legacy shape and is caught earlier by the
+        // missing-`api_key_env` guard.)
+        for auth in [AuthMode::None, AuthMode::Passthrough] {
+            let mut config = Config::default();
+            let provider = config.providers.get_mut("antigravity").unwrap();
+            provider.auth = auth;
+            let error = config.validate().unwrap_err();
+            assert!(
+                matches!(error, ConfigError::AntigravityKindRequiresOauth { .. }),
+                "auth {auth:?} should be refused, got: {error}"
+            );
+            // The message has to name both ways forward, or the operator has to
+            // guess which transport they are on.
+            let text = error.to_string();
+            assert!(text.contains("antigravity_oauth"), "message: {text}");
+            assert!(text.contains("antigravity_cli"), "message: {text}");
+        }
+    }
+
+    #[test]
+    fn a_legacy_antigravity_table_without_auth_is_rejected_not_silently_retargeted() {
+        // Shaped like a real pre-#372 config: `kind = "antigravity"` meant "run
+        // the local `agy` binary", so it never carried an `auth` key (there was
+        // nothing to authenticate over HTTP with) and carried CLI-only knobs
+        // like `workspace_roots`/`sandbox`. Figment deep-merges this table over
+        // the built-in `antigravity` default, which *does* set
+        // `auth = "antigravity_oauth"` -- if the merge fills the missing `auth`
+        // key from the default rather than the table being rejected outright,
+        // this legacy config would resolve quietly to the new OAuth HTTP
+        // upstream instead of erroring by name like the sibling test above.
+        //
+        // `Config::load` also reads the real process env, and the sibling
+        // tests below set `SHUNT_PROVIDERS__ANTIGRAVITY__*` -- a name
+        // `Env::prefixed("SHUNT_").split("__")` fixes, so it cannot be given
+        // a per-test-unique suffix like the ordinary `CONFIG_ENV_LOCK` tests
+        // use. Taking the same lock here, even though this test sets no env
+        // var itself, is what keeps it from observing one of those vars left
+        // set by a concurrently running sibling.
+        let _guard = CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!(
+            "shunt-config-test-legacy-antigravity-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shunt.toml");
+        std::fs::write(
+            &path,
+            "[providers.antigravity]\n\
+             kind = \"antigravity\"\n\
+             base_url = \"http://localhost\"\n\
+             workspace_roots = [\"/home/user/project\"]\n\
+             sandbox = true\n",
+        )
+        .unwrap();
+
+        let error = Config::load(Some(&path))
+            .expect_err("a legacy antigravity table without `auth` must not load");
+        assert!(
+            matches!(error, ConfigError::AntigravityLegacyTableMissingAuth),
+            "expected AntigravityLegacyTableMissingAuth, got: {error}"
+        );
+        let text = error.to_string();
+        assert!(text.contains("antigravity_oauth"), "message: {text}");
+        assert!(text.contains("antigravity_cli"), "message: {text}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_env_only_legacy_antigravity_shape_is_rejected() {
+        // Same legacy shape as the sibling file-table test above, but
+        // assembled entirely through `SHUNT_PROVIDERS__ANTIGRAVITY__*` env
+        // vars rather than a `[providers.antigravity]` file table. Before the
+        // guard was moved to look at the *effective* (file + env) figment
+        // instead of the file layer alone, this shape was invisible to it:
+        // there was no file table for the guard to inspect, so it let the
+        // config through, and the built-in `antigravity` default's
+        // `auth = "antigravity_oauth"` was silently deep-merged in.
+        let _guard = CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!(
+            "shunt-config-test-env-legacy-antigravity-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shunt.toml");
+        // No `providers.antigravity` table at all -- the config file has
+        // nothing to say about it.
+        std::fs::write(&path, "[server]\ndefault_provider = \"anthropic\"\n").unwrap();
+
+        std::env::set_var(
+            "SHUNT_PROVIDERS__ANTIGRAVITY__BASE_URL",
+            "http://localhost:9999",
+        );
+
+        let error = Config::load(Some(&path))
+            .expect_err("an env-only legacy antigravity shape must not load");
+        assert!(
+            matches!(error, ConfigError::AntigravityLegacyTableMissingAuth),
+            "expected AntigravityLegacyTableMissingAuth, got: {error}"
+        );
+
+        std::env::remove_var("SHUNT_PROVIDERS__ANTIGRAVITY__BASE_URL");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_legacy_antigravity_table_completed_by_env_auth_is_accepted() {
+        // The mirror image of the two rejection tests above: a file table
+        // shaped like a pre-#372 legacy config (`kind = "antigravity"`, no
+        // `auth`) that a `SHUNT_PROVIDERS__ANTIGRAVITY__AUTH` env var
+        // legitimately completes. Before the guard was moved to look at the
+        // effective (file + env) figment, it ran against the file layer
+        // alone and rejected this config before the env layer ever had a
+        // chance to supply the missing `auth` key.
+        let _guard = CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!(
+            "shunt-config-test-env-completed-antigravity-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shunt.toml");
+        std::fs::write(
+            &path,
+            "[providers.antigravity]\nkind = \"antigravity\"\nbase_url = \"http://localhost\"\n",
+        )
+        .unwrap();
+
+        std::env::set_var("SHUNT_PROVIDERS__ANTIGRAVITY__AUTH", "antigravity_oauth");
+
+        let config = Config::load(Some(&path))
+            .expect("a legacy table completed by an env-supplied auth must load");
+        let antigravity = config.provider("antigravity").unwrap();
+        assert_eq!(antigravity.kind, ProviderKind::Antigravity);
+        assert_eq!(antigravity.auth, AuthMode::AntigravityOauth);
+
+        std::env::remove_var("SHUNT_PROVIDERS__ANTIGRAVITY__AUTH");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn antigravity_cli_migration_backfills_auth_from_the_cli_default() {
+        // The documented migration path off the ambiguous legacy shape
+        // above: a `[providers.antigravity]` table whose only content is
+        // `kind = "antigravity_cli"`, opting explicitly into the deprecated
+        // subprocess transport. Without
+        // `backfill_antigravity_cli_migration_auth`, the merge still
+        // inherits `auth = antigravity_oauth` from the built-in
+        // `antigravity` default for this same name (the identity that
+        // `kind` just overrode), and `validate` rejects the result as
+        // `AntigravityOauthWrongKind` -- breaking the very migration path
+        // this shape is supposed to allow.
+        let _guard = CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!(
+            "shunt-config-test-antigravity-cli-migration-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shunt.toml");
+        std::fs::write(
+            &path,
+            "[providers.antigravity]\nkind = \"antigravity_cli\"\n",
+        )
+        .unwrap();
+
+        let config = Config::load(Some(&path))
+            .expect("the documented antigravity -> antigravity_cli migration must load");
+        let antigravity = config.provider("antigravity").unwrap();
+        assert_eq!(antigravity.kind, ProviderKind::AntigravityCli);
+        assert_eq!(antigravity.auth, AuthMode::None);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn antigravity_oauth_requires_the_antigravity_kind() {
+        let mut config = Config::default();
+        // Carrying the token on an anthropic-kind provider would forward the
+        // client's own credential instead of injecting the Antigravity one.
+        config.providers.get_mut("antigravity").unwrap().kind = ProviderKind::Anthropic;
+        let error = config.validate().unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::AntigravityOauthWrongKind { .. }
+        ));
+    }
+
+    #[test]
+    fn antigravity_oauth_rejects_an_off_origin_host() {
+        let mut config = Config::default();
+        config.providers.get_mut("antigravity").unwrap().base_url =
+            "https://evil.example.com".to_string();
+        let error = config.validate().unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::AntigravityOauthNonGoogleHost { .. }
+        ));
+        assert!(error.to_string().contains("evil.example.com"));
+    }
+
+    #[test]
+    fn antigravity_oauth_requires_https() {
+        let mut config = Config::default();
+        config.providers.get_mut("antigravity").unwrap().base_url =
+            "http://cloudcode-pa.googleapis.com".to_string();
+        let error = config.validate().unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::AntigravityOauthNotHttps { .. }
+        ));
+        assert!(error.to_string().contains("plaintext"));
+    }
+
+    #[test]
+    fn the_native_antigravity_provider_rides_the_gemini_adapter() {
+        // Stage 1 is wire-identical to Code Assist, so it must dispatch to the
+        // Gemini adapter rather than the `agy` subprocess one.
+        use crate::routing::AdapterKind;
+        assert_eq!(
+            AdapterKind::from(ProviderKind::Antigravity),
+            AdapterKind::Gemini
+        );
+        assert_eq!(
+            AdapterKind::from(ProviderKind::AntigravityCli),
+            AdapterKind::AntigravityCli
+        );
     }
 
     #[test]
