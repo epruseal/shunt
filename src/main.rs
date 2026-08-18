@@ -374,7 +374,27 @@ fn login(
             )
         }
         "antigravity" if name.is_none() && !long_lived && mode.is_none() => {
-            runtime()?.block_on(shunt::auth::antigravity::login::run())
+            runtime()?.block_on(async {
+                // Logging in should not require a fully valid gateway config,
+                // so a config that will not load is not fatal here — but it
+                // must not silently drop a configured `base_url` either, or an
+                // operator debugging why their loopback backend never saw the
+                // discovery call has nothing to go on. Say so, then fall back.
+                // Which slot is trusted, and why the lookup is not by name
+                // alone, lives with `login_base_url`.
+                let config = match Config::load(config_path) {
+                    Ok(config) => Some(config),
+                    Err(error) => {
+                        eprintln!(
+                            "Could not read the config ({error}); signing in against the default \
+                             Antigravity endpoint. A configured base_url will not be used."
+                        );
+                        None
+                    }
+                };
+                let base_url = shunt::auth::antigravity::login_base_url(config.as_ref());
+                shunt::auth::antigravity::login::run(&base_url).await
+            })
         }
         "antigravity" => {
             anyhow::bail!(
