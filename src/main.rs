@@ -118,6 +118,49 @@ enum Command {
         #[command(subcommand)]
         action: DashboardAction,
     },
+    /// Log in to a self-hosted shunt gateway and print its access token. This
+    /// is the *client* side of `[server.gateway]` — unrelated to `shunt login`,
+    /// which authenticates shunt against an upstream provider.
+    Gateway {
+        #[command(subcommand)]
+        action: GatewayAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum GatewayAction {
+    /// Approve this machine against a shunt gateway via its OAuth device flow.
+    Login {
+        /// Base URL of the gateway, e.g. `https://gateway.example.com`.
+        url: String,
+        /// Print the verification URL instead of opening a browser.
+        #[arg(long)]
+        manual: bool,
+    },
+    /// Print the gateway access token to stdout, refreshing it when stale, for
+    /// use as a Claude Code `apiKeyHelper`.
+    Token,
+    /// Remove the stored gateway session.
+    Logout,
+    /// Launch Claude Code against this gateway; everything after `claude` is
+    /// forwarded to it verbatim.
+    ///
+    /// The generated `--settings` document is scoped to that one `claude`
+    /// process: it does not modify `~/.claude/settings.json`, and it overrides
+    /// any `apiKeyHelper` or `ANTHROPIC_BASE_URL` already configured for that
+    /// invocation alone. That process scoping is the reason this subcommand
+    /// exists.
+    ///
+    /// Arguments are forwarded unchanged, with two exceptions when they lead
+    /// the list: shunt's own `--help` prints this text, and `--config` is
+    /// rejected with an error rather than silently consumed. Pass either after
+    /// a `--` separator (`shunt gateway claude -- --help`) to send it to
+    /// `claude` instead.
+    Claude {
+        /// Arguments passed straight through to `claude`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -164,6 +207,7 @@ fn main() -> anyhow::Result<()> {
             cli.config.as_deref(),
         ),
         Some(Command::Dashboard { action }) => dashboard(action, cli.config),
+        Some(Command::Gateway { action }) => gateway(action, cli.config.as_deref()),
         None if cli.check => check(cli.config),
         None => run(cli.config),
     }
@@ -475,6 +519,55 @@ fn runtime() -> anyhow::Result<tokio::runtime::Runtime> {
         .context("failed to start tokio runtime")
 }
 
+/// `shunt gateway <action>`. Only the launcher runs without a runtime: it reads
+/// the cached session and execs, while login, token, and logout all need one —
+/// logout because it removes the session under the async session lock.
+fn gateway(action: GatewayAction, global_config: Option<&std::path::Path>) -> anyhow::Result<()> {
+    match action {
+        GatewayAction::Login { url, manual } => {
+            runtime()?.block_on(shunt::auth::gateway::login::run(&url, manual))
+        }
+        GatewayAction::Token => runtime()?.block_on(gateway_token()),
+        GatewayAction::Logout => runtime()?.block_on(shunt::auth::gateway::login::logout()),
+        GatewayAction::Claude { args } => {
+            reject_swallowed_config(global_config)?;
+            // No runtime: the launcher only reads the cached session and execs.
+            shunt::auth::gateway::launch::run(&args)
+        }
+    }
+}
+
+/// `--config` is `global = true`, so clap consumes it before the launcher's
+/// trailing-var-arg list ever sees it — `shunt gateway claude --config foo`
+/// parses cleanly and forwards *nothing*, handing the user a `claude` session
+/// missing every argument they typed, with no indication why. The flag has no
+/// meaning here either (the launcher reads the cached session and
+/// `current_exe()`, never `shunt.toml`), so there is no intent to guess at:
+/// refuse the invocation and name the escape.
+fn reject_swallowed_config(global_config: Option<&std::path::Path>) -> anyhow::Result<()> {
+    let Some(path) = global_config else {
+        return Ok(());
+    };
+    let path = path.display();
+    anyhow::bail!(
+        "`--config {path}` is not used by `shunt gateway claude`: this command reads the stored \
+         gateway session and its own executable path, never a shunt config file. shunt consumed \
+         the flag rather than forwarding it, so the invocation is refused instead of silently \
+         dropping it.\n\nDrop the flag to run against the stored session. If you meant \
+         `claude`'s own `--config`, pass it after `--`:\n\n    shunt gateway claude -- --config \
+         <claude's config>"
+    )
+}
+
+async fn gateway_token() -> anyhow::Result<()> {
+    // stdout carries only the token: Claude Code v2.1.227+ fails an
+    // `apiKeyHelper` whose output is anything else, so every message, warning,
+    // and hint on this path goes to stderr.
+    let token = shunt::auth::gateway::auth::resolve_token().await?;
+    println!("{token}");
+    Ok(())
+}
+
 async fn token() -> anyhow::Result<()> {
     let path = shunt::auth::claude::auth::default_credentials_path();
     let client = reqwest::Client::new();
@@ -771,6 +864,138 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    fn forwarded(argv: &[&str]) -> Vec<String> {
+        match Cli::try_parse_from(argv).map(|cli| cli.command) {
+            Ok(Some(Command::Gateway {
+                action: GatewayAction::Claude { args },
+            })) => args,
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gateway_claude_forwards_arguments_verbatim() {
+        // The launcher must not interpret Claude Code's flags: `--model opus`
+        // in particular has to reach `claude`, not be swallowed here.
+        assert_eq!(
+            forwarded(&[
+                "shunt",
+                "gateway",
+                "claude",
+                "-p",
+                "hi",
+                "--model",
+                "opus",
+                "--verbose",
+            ]),
+            ["-p", "hi", "--model", "opus", "--verbose"]
+        );
+        assert_eq!(
+            forwarded(&["shunt", "gateway", "claude", "--model", "opus"]),
+            ["--model", "opus"]
+        );
+        // An unknown-to-shunt flag is data, not an error.
+        assert_eq!(
+            forwarded(&[
+                "shunt",
+                "gateway",
+                "claude",
+                "--dangerously-skip-permissions"
+            ]),
+            ["--dangerously-skip-permissions"]
+        );
+        assert!(forwarded(&["shunt", "gateway", "claude"]).is_empty());
+    }
+
+    #[test]
+    fn gateway_claude_needs_a_double_dash_for_shunt_owned_flags() {
+        // Measured clap behavior: shunt's own global `--config` and the
+        // generated `--help` win when they lead the argument list, so the
+        // subcommand's help documents `--` as the escape.
+        assert!(Cli::try_parse_from(["shunt", "gateway", "claude", "--help"]).is_err());
+        assert_eq!(
+            forwarded(&["shunt", "gateway", "claude", "--", "--help"]),
+            ["--help"]
+        );
+        assert_eq!(
+            forwarded(&["shunt", "gateway", "claude", "--", "--config", "foo"]),
+            ["--config", "foo"]
+        );
+        // A leading `--` is consumed by clap and never reaches `claude`.
+        assert_eq!(
+            forwarded(&["shunt", "gateway", "claude", "--", "--model", "opus"]),
+            ["--model", "opus"]
+        );
+        // Once any other argument leads, `--config` forwards untouched and the
+        // guard below stays out of the way.
+        assert_eq!(
+            forwarded(&["shunt", "gateway", "claude", "-p", "hi", "--config", "foo"]),
+            ["-p", "hi", "--config", "foo"]
+        );
+    }
+
+    #[test]
+    fn gateway_claude_refuses_a_config_flag_it_would_otherwise_swallow() {
+        // clap parses this *successfully* — the global `--config` is consumed
+        // and the forwarded list comes out empty — so the parser cannot be the
+        // place this is caught. Without the dispatcher guard the user gets a
+        // `claude` session missing every argument they typed and no error.
+        let cli =
+            Cli::try_parse_from(["shunt", "gateway", "claude", "--config", "foo", "-p", "hi"])
+                .expect("clap accepts it; that is the problem");
+        assert_eq!(cli.config, Some(PathBuf::from("foo")));
+
+        let error = gateway(
+            GatewayAction::Claude {
+                args: vec!["-p".to_string(), "hi".to_string()],
+            },
+            cli.config.as_deref(),
+        )
+        .expect_err("a swallowed --config must abort rather than launch claude without it");
+        let message = error.to_string();
+        assert!(
+            message.contains("--config foo"),
+            "the error must name the flag it refused: {message}"
+        );
+        assert!(
+            message.contains("never a shunt config file"),
+            "the error must say why the flag has no meaning here: {message}"
+        );
+        // The remedy must not be "forward shunt's config path to claude". That
+        // is what the first wording prescribed, and it answers a question the
+        // user did not ask: `-- --config foo` hands *shunt's* config to claude.
+        assert!(
+            !message.contains("-- --config foo"),
+            "the error must not prescribe forwarding shunt's own config path: {message}"
+        );
+
+        // Every other subcommand keeps `--config` working exactly as before,
+        // and the guard is scoped to the launcher.
+        assert!(reject_swallowed_config(None).is_ok());
+        assert_eq!(
+            Cli::try_parse_from(["shunt", "--config", "foo", "check"])
+                .unwrap()
+                .config,
+            Some(PathBuf::from("foo"))
+        );
+    }
+
+    #[test]
+    fn config_is_the_only_flag_shunt_takes_from_the_forwarded_list() {
+        // `--config` is the sole `global = true` argument on `Cli`; `--check`
+        // is declared without it, so it is not propagated into subcommands and
+        // forwards like any other Claude Code flag. There is no `--version`.
+        assert_eq!(
+            forwarded(&["shunt", "gateway", "claude", "--check"]),
+            ["--check"]
+        );
+        assert!(
+            Cli::try_parse_from(["shunt", "gateway", "claude", "--check"])
+                .is_ok_and(|cli| !cli.check)
+        );
+        assert!(Cli::try_parse_from(["shunt", "--version"]).is_err());
     }
 
     #[test]

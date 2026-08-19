@@ -535,6 +535,140 @@ file, so the static + `setup-token` route stays the simplest and safest default.
 > `apiKeyHelper` + an OAuth token would only satisfy the discovery gate and mapped-model routes —
 > Claude passthrough would 401.
 
+#### The `shunt gateway token` credential helper
+
+A different helper for a different credential. `shunt token` above prints an **upstream Claude
+subscription** token; `shunt gateway token` prints an access token issued by a **shunt deployment
+that has `[server.gateway]` enabled**, so each user carries their own gateway session instead of a
+shared client token. The two are independent — neither reads the other's storage — and `shunt
+login <provider>` and `shunt token` keep their existing upstream meaning.
+
+Sign in once per machine, then wire the helper:
+
+```bash
+shunt gateway login https://gateway.example.com   # device flow; approve in a browser
+shunt gateway token                                # prints the access token
+shunt gateway logout                               # discards the stored session
+```
+
+`shunt gateway login` reads the deployment's `/.well-known/oauth-authorization-server` document,
+prints a verification URL plus a user code, opens a browser (`--manual` prints the URL instead),
+and polls until you approve. A URL that is plain `http://` and not loopback is accepted but warns:
+the device code and refresh token would travel unencrypted, on every later refresh as well as
+during this login. `shunt gateway token` repeats that warning on stderr each time it actually
+refreshes — tied to a refresh rather than to every helper invocation, since the cached-token fast
+path makes no network call at all. If the deployment answers the discovery request with `404`, it is most likely
+missing `[server.gateway]`. Discovery and the device-code request are each bounded on the same
+budget as the refresh path, so a deployment that completes the TCP handshake and then never answers
+reports a timeout instead of waiting indefinitely with only Ctrl-C to end it. The approval poll is
+deliberately excluded: waiting is its job, and it already has its own deadline plus a per-attempt
+transport retry.
+
+The discovery document is remote input, so two floors apply to what it can direct shunt to do. The
+device code and refresh token are POSTed only to an endpoint advertised over `https`, or over `http`
+to a loopback address — anything else fails discovery naming the offending endpoint, rather than
+receiving the credential. That floor has one narrow widening, for the private-network and VPN
+deployments that have no certificate to present: a gateway reached over plain `http`, accepted with
+the unencrypted-traffic warning that repeats on every refresh, may advertise plaintext endpoints on
+its **own origin** — scheme, host, and port all matching the operator-supplied base URL. The origin
+is computed from that base URL and never from the document, so a hostile document cannot nominate
+its own. Any other plaintext endpoint is refused unless its host is loopback — that carve-out is
+independent of this widening and holds for every gateway, an `https` one included. (The check has to
+happen here rather than falling out of the HTTP clients: the refresh POST follows no redirects at
+all, and the redirect-hardened client that discovery uses vets only redirect *targets*, which a
+document naming a bad endpoint outright never produces.) The verification URL is likewise handed to
+the OS handler only when it is `http` or `https`: the gateway picks that string, and a `file://` or
+`smb://` value would otherwise be acted on with no confirmation. It is printed either way.
+
+The session lands in `~/.shunt/gateway/session.json` (override with `SHUNT_GATEWAY_SESSION_FILE`),
+written owner-only — file `0600` inside a `0700` directory. Note that the similarly named
+`SHUNT_GATEWAY_TOKEN` is unrelated: it is the static override for `shunt token`, described above.
+
+```json
+{
+  "apiKeyHelper": "/path/to/shunt gateway token"
+}
+```
+
+`shunt gateway token` prints the token and nothing else to stdout; every message goes to stderr.
+It serves the stored token until it is within 5 minutes of expiry, then refreshes it. The
+gateway's refresh tokens rotate and are single-use, so the refresh runs under an exclusive file
+lock and re-reads the session after acquiring it: several Claude Code sessions can call the helper
+at the same moment and only one refresh happens. Without that, the losing caller would replay a
+spent refresh token, which revokes the whole rotation family and signs the user out everywhere.
+`shunt gateway login` and `shunt gateway logout` take the same lock and hold it across their own
+write, so neither can be undone by an in-flight refresh's writeback landing after it.
+
+Neither the lock wait nor the refresh itself is unbounded. Each gateway round-trip is wrapped in a
+timeout, and the lock is acquired non-blocking on a deadline rather than with a bare `LOCK_EX`. The
+case that motivates both: a deployment that completes the TCP handshake and then never answers.
+The holder would wait forever inside the critical section, and every other `apiKeyHelper` on the
+machine would block behind it silently — one unreachable gateway taking down every Claude Code
+session. The timeout is applied with `tokio::time::timeout` inside the gateway module rather than
+as `reqwest`'s `.timeout()`, which is process-wide on the shared refresh client and also covers the
+response body (streaming paths must never set it).
+
+Crossing the 5-minute buffer makes a refresh *due*, not mandatory. If the refresh fails while the
+cached token is still genuinely unexpired, that token is served with a warning on stderr, so a
+brief network blip four minutes before real expiry does not become a user-visible auth failure;
+once the token has actually expired the command fails hard. That fallback needs proof that nothing
+was rotated, so it is restricted to the two failures that provably never presented the refresh
+token: discovery, which never carries it, and a token POST that could not open a connection. From
+the moment the POST is sent the gateway may already have rotated the token, so the bound expiring,
+an unreadable or unparseable body, and any error the gateway names all fail the command instead —
+serving the cached token there would leave a spent refresh token on disk for the next helper run
+to replay. `expires_in` is clamped on the way in — a gateway reporting it in milliseconds would
+otherwise cache a dead token as valid for weeks, with no recovery but deleting `session.json` by
+hand. Clamping is safe even when it is wrong, since a too-short cached expiry only triggers an
+earlier refresh. Finally, a token that would fail Claude Code's `apiKeyHelper` validator
+(1..=16384 characters of printable ASCII, no whitespace) is refused with a diagnostic naming the
+gateway rather than printed to fail authentication silently — and `shunt gateway login` puts the
+token it is issued through that same gate before storing anything, so a deployment that cannot
+produce a conforming one fails the login instead of saving a session that reports success and can
+never be used.
+
+`shunt gateway logout` removes the session but deliberately leaves the empty sibling `.lock` file
+in place: that inode is what logout, login, and refresh serialize on, and unlinking it would let an
+in-flight holder keep a lock on the old inode while the next process locks a freshly created one,
+so the two would stop excluding each other.
+
+#### Launching Claude Code with `shunt gateway claude`
+
+`shunt gateway claude` does the wiring per invocation instead of asking you to edit settings:
+
+```bash
+shunt gateway claude
+shunt gateway claude -p 'summarize this repo' --model opus
+```
+
+It launches `claude` with an inline `--settings` document that points `ANTHROPIC_BASE_URL` at the
+gateway from the stored session and sets `apiKeyHelper` to this shunt binary's absolute path plus
+`gateway token`. The document applies to that one process — `~/.claude/settings.json` is never
+modified — and it takes precedence over an `ANTHROPIC_BASE_URL` already exported in the shell, so
+it is safe to run inside a shell configured for a different gateway (measured against Claude Code
+2.1.234).
+
+Everything after `claude` is forwarded verbatim, so Claude Code's own flags reach it unchanged.
+Two exceptions when they lead the argument list: `--help` prints shunt's help, and `--config` is
+**rejected with an error** rather than silently consumed by shunt's global option. Pass either
+after `--` to forward it:
+
+```bash
+shunt gateway claude -- --config /path/to/claude/config
+```
+
+This route supplies the credential through `apiKeyHelper`, which leaves Claude Code in its
+ordinary first-party mode; it does **not** put the client into a signed-in Claude apps gateway
+session the way `forceLoginMethod: "gateway"` does. Which credential slot the token arrives in is
+what selects that mode, and a gateway session additionally resolves the `opus`/`sonnet` aliases to
+older model ids. This is not "no restrictions": the route still sets a credential, so Claude Code's
+credential-type gate — the one any `apiKeyHelper` trips, covering prompt-cache TTL defaults, Remote
+Control, voice dictation, and artifact publishing — applies here exactly as it does to `shunt token`
+above. The two gates are independent. The consequence to plan around: shunt's per-user `GET /managed/settings` policy
+channel is fetched by a signed-in gateway session, and a helper-credential session was not
+observed requesting it (measured against Claude Code 2.1.234) — use `forceLoginMethod: "gateway"`
+when you need the client to enforce per-user policy.
+
 ### 5.3 Provide the mapped provider's credential (to shunt, not Claude Code)
 
 - **OpenAI provider:** export the key named by `api_key_env` (default `OPENAI_API_KEY`) in the

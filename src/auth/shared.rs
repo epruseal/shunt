@@ -14,6 +14,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use anyhow::Context as _;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use rand::RngCore;
 use serde_json::Value;
@@ -71,7 +72,11 @@ pub fn is_token_valid_at(token: &str, now: SystemTime) -> bool {
 
 /// Whether the long-lived `refresh_token` may be POSTed to `url`: HTTPS anywhere,
 /// or plain `http://` only to loopback. Vets the initial URL and each redirect hop.
-fn is_safe_refresh_url(url: &reqwest::Url) -> bool {
+///
+/// The single definition of that floor. [`crate::auth::gateway::auth`] applies it
+/// to the endpoints a *discovery document* names, which no redirect policy can
+/// see — a second copy of this predicate would be free to drift from this one.
+pub(crate) fn is_safe_refresh_url(url: &reqwest::Url) -> bool {
     url.scheme() == "https"
         || (url.scheme() == "http"
             && crate::config::host_is_loopback(url.host_str().unwrap_or_default()))
@@ -170,17 +175,28 @@ pub fn validate_account_name(name: &str) -> anyhow::Result<()> {
 /// stores. An override that is set but empty or whitespace-only is treated as
 /// unset rather than resolving to a cwd-relative path.
 pub fn default_accounts_dir(env_var: &str, subdir: &str) -> PathBuf {
+    env_path_override(env_var)
+        .or_else(|| home_dir().map(|home| home.join(".shunt").join("accounts").join(subdir)))
+        .unwrap_or_else(|| PathBuf::from(".shunt/accounts").join(subdir))
+}
+
+/// Read a path from `$<env_var>`, treating a value that is set but empty or
+/// whitespace-only as unset rather than as a working-directory-relative path.
+/// Shared by [`default_accounts_dir`] and the gateway session store
+/// ([`crate::auth::gateway::store`]) so that rule cannot drift between them.
+pub(crate) fn env_path_override(env_var: &str) -> Option<PathBuf> {
     env::var_os(env_var)
         .filter(|value| !value.to_string_lossy().trim().is_empty())
         .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("HOME")
-                .filter(|home| !home.is_empty())
-                .or_else(|| env::var_os("USERPROFILE").filter(|home| !home.is_empty()))
-                .map(PathBuf::from)
-                .map(|home| home.join(".shunt").join("accounts").join(subdir))
-        })
-        .unwrap_or_else(|| PathBuf::from(".shunt/accounts").join(subdir))
+}
+
+/// The user's home directory: `HOME`, falling back to `USERPROFILE` on Windows
+/// where `HOME` is unset. An empty value is treated as unset.
+pub(crate) fn home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .or_else(|| env::var_os("USERPROFILE").filter(|home| !home.is_empty()))
+        .map(PathBuf::from)
 }
 
 fn account_files(dir: &Path) -> io::Result<Vec<(String, PathBuf)>> {
@@ -678,18 +694,33 @@ fn warn_scan_identity_collisions(provider: &str, dir: &Path, accounts: &[Account
 /// (no chmod-after-create window on a multi-user host), then atomically write
 /// `value` via [`write_auth_file_atomic`]. Both stores import credentials this way.
 pub(crate) fn write_account_file(path: &Path, value: &Value) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder.create(parent)?;
+    // A bare relative filename ("session.json") yields `Some("")` here, and an
+    // empty parent names no directory to create: the file lands in the current
+    // directory, which already exists. Skipped explicitly, matching
+    // `gateway::store::lock_blocking` — today `create_dir_all` happens to
+    // short-circuit on the empty path, but that is an implementation detail of
+    // `std` to lean on rather than the guarantee this path needs.
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        create_private_dir(parent)?;
     }
     write_auth_file_atomic(path, value)?;
     Ok(())
+}
+
+/// Create `dir` and its ancestors owner-only (`0700` on Unix) — born private,
+/// with no chmod-after-create window on a multi-user host.
+pub(crate) fn create_private_dir(dir: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)
 }
 
 pub(crate) fn format_iso8601(time: SystemTime) -> String {
@@ -735,6 +766,94 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
     (y, m, d)
 }
 
+/// Open `url` in the user's default browser. Every interactive login flow
+/// (Claude, Cursor, Antigravity, and the gateway device flow) hands the user
+/// off to a browser, so the OS dispatch lives here instead of being copied into
+/// each provider's login module.
+///
+/// Windows goes through `rundll32 url.dll,FileProtocolHandler` rather than
+/// `cmd /c start`: authorization URLs carry `&` query separators, which cmd.exe
+/// would treat as command separators and truncate the URL.
+pub(crate) fn open_url(url: &str) -> anyhow::Result<()> {
+    let status = if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(url).status()?
+    } else if cfg!(target_os = "windows") {
+        std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
+            .status()?
+    } else {
+        std::process::Command::new("xdg-open").arg(url).status()?
+    };
+    if !status.success() {
+        anyhow::bail!("browser open command exited with {status}");
+    }
+    Ok(())
+}
+
+/// Launch the browser and wait for the opener **asynchronously**, so the wait
+/// can be dropped.
+///
+/// Not [`open_url`] on `spawn_blocking`, which is what this used to be. The
+/// opener is not a quick handoff — `open` / `rundll32` / `xdg-open` are waited
+/// on, and a desktop handler that never exits makes that wait unbounded. A
+/// blocking-pool task cannot be cancelled once it has started, so dropping the
+/// future left the wait running, and dropping the *runtime* then waits for it:
+/// `main` runs every CLI action as `runtime()?.block_on(...)` on a temporary
+/// runtime, so the process would hang at exit with the work already finished
+/// and the success line already printed. An async wait is droppable, so neither
+/// the future nor runtime shutdown is held.
+///
+/// `kill_on_drop` is deliberately **not** set. `xdg-open` commonly execs into
+/// the handler, so killing the child can kill the browser the user is in the
+/// middle of approving in. Tokio leaves a dropped child running by default,
+/// which orphans it — correct for a CLI that is exiting anyway, and it holds
+/// nothing.
+///
+/// `flow` names the login flow in the error — "Claude OAuth", "gateway login".
+/// A shared body must not mean a shared diagnostic: several flows can open a
+/// browser in one session, and a bare "browser open failed" leaves the user
+/// unable to tell which one broke. It wraps *every* failure here — the spawn
+/// and a non-zero exit alike — where the `spawn_blocking` version could only
+/// name the flow on a join failure and let the rest propagate unattributed.
+pub(crate) async fn open_url_async(flow: &str, url: &str) -> anyhow::Result<()> {
+    wait_for_browser_open(browser_open_command(url))
+        .await
+        .with_context(|| format!("{flow} browser open failed"))
+}
+
+/// The per-platform opener, built but not spawned — split out so
+/// [`wait_for_browser_open`] can be driven by a test with a command of its own.
+///
+/// Windows goes through `rundll32 url.dll,FileProtocolHandler` for the same
+/// reason as [`open_url`]: `cmd /c start` truncates a URL at its first `&`.
+fn browser_open_command(url: &str) -> tokio::process::Command {
+    let mut command = if cfg!(target_os = "macos") {
+        tokio::process::Command::new("open")
+    } else if cfg!(target_os = "windows") {
+        tokio::process::Command::new("rundll32")
+    } else {
+        tokio::process::Command::new("xdg-open")
+    };
+    if cfg!(target_os = "windows") {
+        command.args(["url.dll,FileProtocolHandler", url]);
+    } else {
+        command.arg(url);
+    }
+    command
+}
+
+/// Spawn `command` and await its exit.
+///
+/// The seam the drop-safety test drives: everything here is `.await`, so a
+/// caller that drops this future drops the wait with it.
+async fn wait_for_browser_open(mut command: tokio::process::Command) -> anyhow::Result<()> {
+    let status = command.status().await?;
+    if !status.success() {
+        anyhow::bail!("browser open command exited with {status}");
+    }
+    Ok(())
+}
+
 /// Test-only RAII guard that sets an environment variable on construction and
 /// removes it on drop, so a panic between set and cleanup cannot leak the
 /// override into a sibling test. Shared by the Claude and Codex store test
@@ -778,6 +897,34 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    /// A `SHUNT_GATEWAY_SESSION_FILE` (or any account path) naming a file in
+    /// the current directory has `Some("")` as its parent, which names no
+    /// directory to create. This pins the writability of that path so the
+    /// empty-parent handling cannot regress into a failed login.
+    #[test]
+    fn a_bare_relative_filename_has_no_parent_to_create() {
+        let name = format!(
+            "shunt-bare-relative-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = Path::new(&name);
+        assert_eq!(
+            path.parent().map(Path::to_path_buf),
+            Some(PathBuf::new()),
+            "the case under test is the empty parent, not an absent one"
+        );
+
+        write_account_file(path, &serde_json::json!({"probe": true}))
+            .expect("a file in the current directory must be writable");
+        assert!(path.exists());
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -1555,5 +1702,59 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Dropping the browser-open wait must not delay runtime shutdown.
+    ///
+    /// This is the failure the async wait exists to remove. On `spawn_blocking`
+    /// the wait could not be cancelled once started, so dropping the future
+    /// left it running and dropping the runtime then blocked on it — and every
+    /// CLI action in `main` runs as `runtime()?.block_on(...)` on a temporary
+    /// runtime, so the process hung at exit with its work already done.
+    ///
+    /// `sleep 60` stands in for a desktop handler that never returns. The
+    /// assertion is on real wall-clock, deliberately: what is under test is
+    /// whether an OS-level wait is still held, and a paused clock cannot
+    /// observe that. The bound is far below the sleep and far above any
+    /// legitimate teardown, so a slow runner yields a visible false red rather
+    /// than a silent pass.
+    ///
+    /// Unix only — `sleep` is not a Windows command.
+    #[cfg(unix)]
+    #[test]
+    fn dropping_the_browser_open_wait_does_not_delay_runtime_shutdown() {
+        let started = std::time::Instant::now();
+        {
+            // Current-thread, not multi-thread: the property under test is that
+            // runtime drop waits for blocking-pool work, which both flavours
+            // have. Spawning one worker instead of one per CPU keeps this test
+            // from perturbing the rest of the suite, which runs in parallel.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            runtime.block_on(async {
+                let mut command = tokio::process::Command::new("sleep");
+                command.arg("60");
+                let wait = wait_for_browser_open(command);
+                tokio::pin!(wait);
+                // Long enough that the child is really spawned and being
+                // waited on, so the drop below has something to drop.
+                tokio::select! {
+                    _ = &mut wait => panic!("`sleep 60` cannot have finished already"),
+                    _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+                }
+                // `wait` is dropped here, with the child still running.
+            });
+            // ...and the runtime is dropped here, which is where a blocking
+            // wait would have parked until the child exited.
+        }
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(15),
+            "dropping the wait and the runtime took {elapsed:?}, so the browser open is still \
+             holding shutdown; `sleep 60` should have been orphaned, not waited on"
+        );
     }
 }
