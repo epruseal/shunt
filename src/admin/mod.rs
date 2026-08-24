@@ -956,7 +956,9 @@ async fn pool(State(state): State<AppState>, headers: HeaderMap) -> Response {
     // separate time budget on top. Only the production default is ever used
     // on this path; a shrunk budget exists solely for tests.
     let budgets = plan::BackfillBudgets::default();
-    let deadline = tokio::time::Instant::now() + budgets.total;
+    let deadline = tokio::time::Instant::now()
+        .checked_add(budgets.total)
+        .unwrap_or_else(tokio::time::Instant::now);
     let mut providers = Vec::new();
     for (name, provider) in &state.config.providers {
         if !matches!(

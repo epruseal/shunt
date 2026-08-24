@@ -419,15 +419,27 @@ analog. Since issue #195 this recorded state also feeds Codex account selection 
 
 The optional `plan` field is derived from credential data already held by
 shunt: Claude reads `claudeAiOauth.subscriptionType`, and Codex reads the
-`chatgpt_plan_type` claim from its stored JWT. When an imported, refreshable
-Claude credential has no stored subscription type, the request makes a bounded
-`GET /api/oauth/profile` backfill and caches the result. Setup-token and
-`token_env` accounts are not backfilled. A missing, failed, or unrecognized
-lookup omits `plan` for that account and does not affect routing or quota state.
-Because the backfill reuses the normal Claude account resolver, reading this
-endpoint may rotate and write back an expired OAuth credential; operators that
-need a strictly non-writing read should avoid relying on that path until the
-credential is already valid.
+`chatgpt_plan_type` claim from its stored JWT. Whenever an imported Claude
+credential's on-disk access token is still valid, the request also makes a
+bounded `GET /api/oauth/profile` backfill and caches the result — this runs
+even for an account whose file already carries a subscription type, since
+that value alone carries no multiplier detail and the profile lookup can
+refine it toward a more precise one, while never discarding it if the lookup
+is coarser or fails; this backfill only ever reads a token already on disk,
+it never refreshes and never writes back. An account whose on-disk token has
+already expired keeps whatever plan (or lack of one) it already had until a
+later view, once normal traffic elsewhere refreshes it; an idle account with
+no traffic and no usage polling can stay at that same value indefinitely
+while its on-disk token stays expired. Setup-token and `token_env` accounts
+are not backfilled. A missing, failed, or unrecognized lookup leaves the
+existing plan (or its absence) unaffected.
+
+Budget exhaustion never erases a file-derived plan: the file-read phase is
+guaranteed its own `min_slice` floor above the shared deadline, so an earlier
+provider's stalled backfill can never starve this cheap local read. Even in
+the pathological case where the file phase does not finish within that
+floor, any plan already cached from an earlier resolution still appears in
+the response.
 
 ## Shared foundations with gateway login
 
