@@ -1012,7 +1012,13 @@ mod tests {
     }
 
     /// Test 26: `resets_at` is accepted as either a Unix epoch integer or an
-    /// RFC 3339 string, per window, in the same response.
+    /// RFC 3339 string, per window, in the same response. Both fixtures are
+    /// wall-clock independent: the epoch value is computed at run time (the
+    /// same idiom as `future_reset` below, since this module only imports
+    /// `time::Duration`, not `std::time::Duration`) instead of a hardcoded
+    /// literal that would itself expire and start failing this assertion,
+    /// and the RFC 3339 string uses the maximum representable four-digit
+    /// year so it never lands in the past.
     #[tokio::test]
     async fn codex_poll_accepts_epoch_and_rfc3339_resets() {
         use wiremock::matchers::{method, path};
@@ -1025,12 +1031,26 @@ mod tests {
         );
         let account = codex_account_with_credentials(&creds);
 
+        let primary_reset = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3600;
+
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/wham/usage"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "primary_window": { "used_percent": 5.0, "resets_at": 1_800_000_000u64 },
-                "secondary_window": { "used_percent": 9.0, "resets_at": "2026-09-01T00:00:00Z" }
+                "primary_window": { "used_percent": 5.0, "resets_at": primary_reset },
+                // 9999-12-31T23:59:59Z: the max year `parse_rfc3339_to_epoch_secs`
+                // accepts (1970..=9999), chosen so this reset is always in the
+                // future without pinning a specific date. Note `window_headroom`
+                // (accounts.rs) clamps `now` into `[reset - window_len, reset]`,
+                // so a reset this far out would otherwise read as "window just
+                // opened" and understate headroom -- safe only here because this
+                // test never exercises headroom (`pool: None` throughout, and
+                // this snapshot assertion reads `reset_7d` directly).
+                "secondary_window": { "used_percent": 9.0, "resets_at": "9999-12-31T23:59:59Z" }
             })))
             .expect(1)
             .mount(&server)
@@ -1050,8 +1070,8 @@ mod tests {
         assert!(applied);
 
         let snap = pool.snapshot("codex", std::slice::from_ref(&account), None, None);
-        assert_eq!(snap[0].reset_5h, Some(1_800_000_000));
-        assert!(snap[0].reset_7d.is_some());
+        assert_eq!(snap[0].reset_5h, Some(primary_reset));
+        assert_eq!(snap[0].reset_7d, Some(253_402_300_799));
 
         let _ = std::fs::remove_file(creds);
     }
