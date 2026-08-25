@@ -222,7 +222,7 @@ mod tests {
                 key: crate::accounts::account_key("anthropic", &account("acct-a")),
                 quota: QuotaState {
                     utilization_5h: Some(0.42),
-                    reset_5h: Some(9_999_999_999),
+                    reset_5h: Some(unix_now() + 3_600),
                     status: Some("allowed".to_string()),
                     observed_at_5h: Some(unix_now()),
                     ..Default::default()
@@ -279,7 +279,10 @@ mod tests {
             crate::accounts::account_key("anthropic", &account("acct-a"))
         );
         assert_eq!(persisted_account.quota.utilization_5h, Some(0.42));
-        assert_eq!(persisted_account.quota.reset_5h, Some(9_999_999_999));
+        assert_eq!(
+            persisted_account.quota.reset_5h,
+            pool.accounts[0].quota.reset_5h
+        );
         assert_eq!(persisted_account.quota.status.as_deref(), Some("allowed"));
         assert_eq!(
             persisted_account.quota.observed_at_5h, pool.accounts[0].quota.observed_at_5h,
@@ -370,7 +373,8 @@ mod tests {
     #[tokio::test]
     async fn restore_warm_starts_pool_snapshot() {
         let path = temp_file("restore");
-        save(&path, &sample_pool()).expect("save succeeds");
+        let pool = sample_pool();
+        save(&path, &pool).expect("save succeeds");
         let state = state_with_path(path.clone());
 
         restore(&state).await;
@@ -380,7 +384,7 @@ mod tests {
             .snapshot("anthropic", &[account("acct-a")], None, None);
         assert!(snapshots[0].has_state);
         assert_eq!(snapshots[0].utilization_5h, Some(0.42));
-        assert_eq!(snapshots[0].reset_5h, Some(9_999_999_999));
+        assert_eq!(snapshots[0].reset_5h, pool.accounts[0].quota.reset_5h);
         assert_eq!(snapshots[0].status.as_deref(), Some("allowed"));
         remove_test_dir(&path);
     }
@@ -424,7 +428,7 @@ mod tests {
                 key: crate::accounts::account_key("anthropic", &account("acct-a")),
                 quota: QuotaState {
                     utilization_5h: Some(1.0),
-                    reset_5h: Some(1),
+                    reset_5h: Some(unix_now().saturating_sub(1)),
                     status: Some("rejected".to_string()),
                     ..Default::default()
                 },

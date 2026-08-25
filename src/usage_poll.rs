@@ -382,6 +382,24 @@ mod tests {
         }
     }
 
+    fn refreshable_claude_credential_json(uuid: Option<&str>) -> String {
+        let expires_at_ms = (std::time::SystemTime::now() + Duration::from_secs(3_600))
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_millis() as u64;
+        let mut value = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "live-token",
+                "refreshToken": "r",
+                "expiresAt": expires_at_ms
+            }
+        });
+        if let Some(uuid) = uuid {
+            value["shuntAccountUuid"] = serde_json::Value::String(uuid.to_string());
+        }
+        value.to_string()
+    }
+
     #[tokio::test]
     async fn refreshable_only_for_imported_credential_files() {
         // Imported login: has a non-empty refreshToken -> eligible.
@@ -430,10 +448,7 @@ mod tests {
 
         // An imported credential whose access token is far from expiry, so
         // resolve_claude_account returns it without hitting the token endpoint.
-        let creds = write_temp(
-            "poll",
-            r#"{"claudeAiOauth":{"accessToken":"live-token","refreshToken":"r","expiresAt":4000000000000}}"#,
-        );
+        let creds = write_temp("poll", &refreshable_claude_credential_json(None));
         let account = account_with_credentials(&creds);
 
         let server = MockServer::start().await;
@@ -473,10 +488,7 @@ mod tests {
 
         // A refreshable credential whose usage fetch fails (500): the poller must
         // degrade quietly, leaving the account with no recorded state.
-        let creds = write_temp(
-            "fetch-error",
-            r#"{"claudeAiOauth":{"accessToken":"live-token","refreshToken":"r","expiresAt":4000000000000}}"#,
-        );
+        let creds = write_temp("fetch-error", &refreshable_claude_credential_json(None));
         let account = account_with_credentials(&creds);
 
         let server = MockServer::start().await;
@@ -516,10 +528,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let creds = write_temp(
-            "claude-empty",
-            r#"{"claudeAiOauth":{"accessToken":"live-token","refreshToken":"r","expiresAt":4000000000000}}"#,
-        );
+        let creds = write_temp("claude-empty", &refreshable_claude_credential_json(None));
         let account = account_with_credentials(&creds);
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -558,10 +567,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let creds = write_temp(
-            "claude-partial",
-            r#"{"claudeAiOauth":{"accessToken":"live-token","refreshToken":"r","expiresAt":4000000000000}}"#,
-        );
+        let creds = write_temp("claude-partial", &refreshable_claude_credential_json(None));
         let account = account_with_credentials(&creds);
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -603,10 +609,7 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let creds = write_temp(
-            "poll-all",
-            r#"{"claudeAiOauth":{"accessToken":"live-token","refreshToken":"r","expiresAt":4000000000000}}"#,
-        );
+        let creds = write_temp("poll-all", &refreshable_claude_credential_json(None));
         let account = account_with_credentials(&creds);
 
         let server = MockServer::start().await;
@@ -669,7 +672,7 @@ mod tests {
 
         let creds = write_temp(
             "poll-dedup",
-            r#"{"claudeAiOauth":{"accessToken":"live-token","refreshToken":"r","expiresAt":4000000000000},"shuntAccountUuid":"shared-uuid"}"#,
+            &refreshable_claude_credential_json(Some("shared-uuid")),
         );
         let mut account = account_with_credentials(&creds);
         account.uuid = Some("shared-uuid".to_string());
@@ -734,7 +737,7 @@ mod tests {
 
         let creds = write_temp(
             "refreshable-alias",
-            r#"{"claudeAiOauth":{"accessToken":"live-token","refreshToken":"r","expiresAt":4000000000000}}"#,
+            &refreshable_claude_credential_json(None),
         );
         let static_alias = AccountConfig {
             name: "static-alias".to_string(),
@@ -1419,7 +1422,7 @@ mod tests {
 
         let claude_creds = write_temp(
             "both-families-claude",
-            r#"{"claudeAiOauth":{"accessToken":"live-token","refreshToken":"r","expiresAt":4000000000000}}"#,
+            &refreshable_claude_credential_json(None),
         );
         let claude_account = account_with_credentials(&claude_creds);
         let claude_server = MockServer::start().await;
