@@ -6328,6 +6328,97 @@ mod tests {
         );
     }
 
+    /// X7 (verification-FAIL fix): concurrent `select_order` calls racing the
+    /// same stale near-quota account must promote it at most once per
+    /// interval. A single-shot two-thread race cannot catch a regression that
+    /// splits the select-then-stamp critical section (see the "Splitting the
+    /// lock..." comment above `probe_selection`) into two separate lock
+    /// acquisitions -- the race window such a split opens is nanoseconds
+    /// wide -- so this repeats the race 200 times, resetting `last_probe_at`
+    /// to `None` under the entries lock each round (same direct-field-access
+    /// pattern as `recent_aggregate_rejection_suppresses_probe` above) so
+    /// every round starts from an identical "never probed" state. Adoption
+    /// criterion (not "determinism"): mutating `select_order_inner` to
+    /// acquire the entries lock once to compute `probe_selection` and again,
+    /// separately, to write `last_probe_at`, was confirmed locally to make
+    /// this test fail within the 200 rounds below; that mutation was
+    /// reverted, not shipped. If this test cannot detect that mutation on a
+    /// given toolchain/host, drop it -- the single-flight invariant it guards
+    /// is independently documented at the "Splitting the lock..." comment.
+    #[test]
+    fn concurrent_stale_probe_selection_never_double_promotes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pool_cfg = PoolConfig {
+            default_threshold: Some(0.5),
+            reprobe_seconds: Some(60),
+            ..Default::default()
+        };
+        let pool = AccountPool::new();
+        let mut a = account("codex-a");
+        a.store_family = Some(StoreFamily::Chatgpt);
+        let mut b = account("codex-b");
+        b.store_family = Some(StoreFamily::Chatgpt);
+        let accounts = vec![a, b];
+        let session = "concurrent-probe-race";
+
+        let initial = pool.select_order("codex", &accounts, Some(session), None, Some(&pool_cfg));
+        let stale = initial[0];
+        // Observed once, 61s in the past -- same offset as
+        // `stale_near_codex_account_probes_ahead_once` above, and for the
+        // same two reasons: it clears the reprobe interval (60s) so the
+        // observation-freshness gate never suppresses eligibility across any
+        // of the 200 rounds below (only `last_probe_at`, reset every round,
+        // gates re-selection here), while staying far inside
+        // `expire_stale_quota`'s 5-hour window so the stamp survives every
+        // round. Unix epoch (0) was tried first and made the whole scenario
+        // degenerate silently: `expire_stale_quota` (accounts.rs:1493) wipes
+        // any observation older than `WINDOW_5H_SECS`, so the utilization
+        // this stamps was cleared back to `None` before the near-quota check
+        // ever ran, `assessment.near` stayed false for every racer, and the
+        // sticky-first early return then put `stale` at `order[0]`
+        // unconditionally -- the assertion below still passed, but it was no
+        // longer exercising `probe_selection`/`last_probe_at` at all.
+        stamp_near_quota(&pool, "codex", &accounts[stale], unix_now() - 61);
+
+        const ROUNDS: usize = 200;
+        const RACERS: usize = 8;
+        for round in 0..ROUNDS {
+            {
+                let mut entries = pool.entries.lock().expect("account health lock poisoned");
+                let health = entries
+                    .get_mut(&account_key("codex", &accounts[stale]))
+                    .expect("stamp_near_quota above already inserted this entry");
+                health.last_probe_at = None;
+            }
+            let promotions = AtomicUsize::new(0);
+            std::thread::scope(|scope| {
+                for _ in 0..RACERS {
+                    scope.spawn(|| {
+                        let order = pool.select_order(
+                            "codex",
+                            &accounts,
+                            Some(session),
+                            None,
+                            Some(&pool_cfg),
+                        );
+                        if order[0] == stale {
+                            promotions.fetch_add(1, Ordering::SeqCst);
+                        }
+                    });
+                }
+            });
+            assert_eq!(
+                promotions.load(Ordering::SeqCst),
+                1,
+                "round {round}: exactly one concurrent select_order call must promote \
+                 the stale account -- select and stamp happen inside the same lock \
+                 acquisition, so no other racing call in this round can still observe \
+                 it unprobed"
+            );
+        }
+    }
+
     #[test]
     fn claude_family_accounts_are_never_probed() {
         let pool_cfg = PoolConfig {
