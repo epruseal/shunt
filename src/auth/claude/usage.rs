@@ -114,7 +114,11 @@ fn normalize_percent(percent: f64) -> f64 {
 /// `None` on any malformed component so a bad timestamp degrades to "no reset"
 /// rather than poisoning the whole snapshot. The codebase carries no date crate;
 /// this is a focused, self-contained parser for exactly this endpoint's shape.
-fn parse_rfc3339_to_epoch_secs(input: &str) -> Option<u64> {
+///
+/// `pub(crate)`: also reused by `crate::auth::codex::usage`'s wham/usage parser,
+/// whose `resets_at` field accepts the same RFC 3339 shape as an alternative to
+/// an epoch integer, rather than duplicating this parser a second time.
+pub(crate) fn parse_rfc3339_to_epoch_secs(input: &str) -> Option<u64> {
     let (date, rest) = input.split_once('T')?;
     let mut date_parts = date.split('-');
     let year: i64 = date_parts.next()?.parse().ok()?;
