@@ -50,6 +50,7 @@ struct OtelInstruments {
     requests_shed: Counter<u64>,
     _pool_utilization: ObservableGauge<f64>,
     pool_rotations: Counter<u64>,
+    pool_reprobes: Counter<u64>,
     codex_ws_overflow: Counter<u64>,
     _upstream_status: ObservableGauge<f64>,
 }
@@ -154,6 +155,12 @@ fn otel_instruments() -> &'static OtelInstruments {
             pool_rotations: meter
                 .u64_counter("shunt.pool.rotations")
                 .with_description("Account-pool rotations by low-cardinality reason")
+                .build(),
+            pool_reprobes: meter
+                .u64_counter("shunt.pool.reprobes")
+                .with_description(
+                    "Opportunistic re-probes of a stale near-quota Codex/ChatGPT account",
+                )
                 .build(),
             codex_ws_overflow: meter
                 .u64_counter("shunt.codex_ws_overflow")
@@ -270,6 +277,20 @@ pub fn record_pool_rotation(provider: &str, reason: &'static str) {
         KeyValue::new("reason", reason),
     ];
     otel_instruments().pool_rotations.add(1, &attributes);
+}
+
+/// Record one opportunistic re-probe: a stale near-quota Codex/ChatGPT
+/// account promoted to the front of selection so it takes live traffic and
+/// refreshes its observed quota. Provider-only and account-free, like
+/// [`record_pool_rotation`] — the probe-selection log line carries the
+/// account name for anything that needs finer granularity.
+pub fn record_pool_reprobe(provider: &str) {
+    sentry::metrics::counter("shunt.pool.reprobes", 1)
+        .attribute("provider", provider.to_owned())
+        .capture();
+
+    let attributes = [KeyValue::new("provider", provider.to_owned())];
+    otel_instruments().pool_reprobes.add(1, &attributes);
 }
 
 /// Replace the current `shunt.upstream.status` severity for one provider

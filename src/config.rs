@@ -230,6 +230,16 @@ pub struct PoolConfig {
     /// request, and a single-identity pool only ever has a last candidate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ramp_initial_concurrency: Option<u32>,
+    /// Interval, in seconds, at which a stale near-quota Codex/ChatGPT-family
+    /// account is opportunistically promoted to the front of selection once,
+    /// so it takes live traffic and refreshes its observed quota (issue
+    /// #135's safety net for pools with no usage poller). Unset defaults to
+    /// 900 seconds when `[server.pool]` is configured; `0` disables
+    /// re-probing. When `[server.pool]` itself is absent, re-probing is
+    /// disabled regardless of this value (pre-#135 behavior). Claude and
+    /// Kimi accounts are never probed (see `reprobe_interval`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reprobe_seconds: Option<u64>,
 }
 
 pub(crate) fn default_hard_threshold() -> f64 {
@@ -248,6 +258,7 @@ impl Default for PoolConfig {
             usage_refresh_seconds: None,
             state_path: None,
             ramp_initial_concurrency: None,
+            reprobe_seconds: None,
         }
     }
 }
