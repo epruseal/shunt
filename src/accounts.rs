@@ -214,6 +214,19 @@ pub struct UsageSnapshot {
     pub seven_day_oi: Option<UsageWindow>,
 }
 
+impl UsageSnapshot {
+    /// True when the fetch succeeded but reported no window at all. A usage
+    /// poller must not call [`AccountPool::note_usage`] on an empty snapshot:
+    /// doing so would mark the account observed and dedup it (see the poller
+    /// call sites in `usage_poll.rs`) on the strength of a response that
+    /// carried no actual signal — e.g. a brand-new account with no
+    /// consumption yet, which both the Codex and Claude usage parsers
+    /// legitimately report as `Ok` with every window `None`.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.five_hour.is_none() && self.seven_day.is_none() && self.seven_day_oi.is_none()
+    }
+}
+
 /// How long an identity must sit with no in-flight requests before storm
 /// control drops its admission allowance back to the initial value. An account
 /// that was idle this long (typically because the pool's traffic was sticky on
