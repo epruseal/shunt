@@ -209,6 +209,14 @@ async fn poll_account(
     };
     match claude::usage::fetch_usage(client, base_url, &access_token).await {
         Ok(snapshot) => {
+            // The Claude parser intentionally accepts partial responses, but
+            // an entirely unrecognizable 200 body also becomes an all-None
+            // snapshot. Applying that would mark the account observed and let
+            // `poll_all` dedup every other alias without any quota signal.
+            if snapshot.is_empty() {
+                tracing::debug!(provider, account = %account.name, "usage poller: claude usage snapshot reported no windows, skipping");
+                return false;
+            }
             pool.note_usage(provider, account, &snapshot);
             tracing::debug!(provider, account = %account.name, "usage poller: applied usage snapshot");
             true
@@ -494,6 +502,97 @@ mod tests {
             !snap[0].has_state,
             "a failed usage fetch must not record state"
         );
+
+        let _ = std::fs::remove_file(creds);
+    }
+
+    /// A successful HTTP response whose JSON shape the Claude usage parser
+    /// does not recognize must not mark the account observed or dedup its
+    /// other aliases. The tolerant parser returns an all-None snapshot here,
+    /// so the poller owns this guard rather than turning the response into a
+    /// parser error.
+    #[tokio::test]
+    async fn poll_account_skips_note_usage_on_unrecognizable_200_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let creds = write_temp(
+            "claude-empty",
+            r#"{"claudeAiOauth":{"accessToken":"live-token","refreshToken":"r","expiresAt":4000000000000}}"#,
+        );
+        let account = account_with_credentials(&creds);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/oauth/usage"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "garbage": true })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let pool = AccountPool::new();
+        let applied = poll_account(
+            &reqwest::Client::new(),
+            &pool,
+            "anthropic",
+            &server.uri(),
+            &account,
+        )
+        .await;
+        assert!(!applied, "an empty snapshot must not count as applied");
+        let snap = pool.snapshot("anthropic", std::slice::from_ref(&account), None, None);
+        assert!(
+            !snap[0].has_state,
+            "an empty snapshot must not mark the account observed"
+        );
+
+        let _ = std::fs::remove_file(creds);
+    }
+
+    /// A partial Claude response remains applicable when one malformed window
+    /// is accompanied by a valid Fable-scoped weekly window. This pins the
+    /// third `UsageSnapshot` field as a sufficient signal on its own.
+    #[tokio::test]
+    async fn poll_account_applies_partial_snapshot_with_only_fable_window() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let creds = write_temp(
+            "claude-partial",
+            r#"{"claudeAiOauth":{"accessToken":"live-token","refreshToken":"r","expiresAt":4000000000000}}"#,
+        );
+        let account = account_with_credentials(&creds);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/oauth/usage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "five_hour": { "utilization": "malformed" },
+                "limits": [{
+                    "kind": "weekly_scoped",
+                    "scope": { "model": { "display_name": "Fable" } },
+                    "percent": 42.0
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let pool = AccountPool::new();
+        let applied = poll_account(
+            &reqwest::Client::new(),
+            &pool,
+            "anthropic",
+            &server.uri(),
+            &account,
+        )
+        .await;
+        assert!(applied, "a valid Fable window must make the snapshot apply");
+        let snap = pool.snapshot("anthropic", std::slice::from_ref(&account), None, None);
+        assert!(snap[0].has_state);
+        assert_eq!(snap[0].utilization_5h, None);
+        assert_eq!(snap[0].utilization_7d, None);
+        assert_eq!(snap[0].utilization_7d_oi, Some(0.42));
 
         let _ = std::fs::remove_file(creds);
     }
