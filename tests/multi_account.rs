@@ -106,12 +106,27 @@ fn unique_temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
+fn future_expiry_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis()
+        .saturating_add(3_600_000) as i64
+}
+
 /// Write a refreshable store account file whose access token is valid far into
 /// the future, so it is used verbatim on the first upstream POST (the 401 is
 /// what drives the RefreshRetry path) rather than being refreshed on read.
-fn write_store_account(dir: &std::path::Path, name: &str, access: &str, refresh: &str, uuid: &str) {
+fn write_store_account(
+    dir: &std::path::Path,
+    name: &str,
+    access: &str,
+    refresh: &str,
+    uuid: &str,
+    expires_at_ms: i64,
+) {
     let body = format!(
-        r#"{{"claudeAiOauth":{{"accessToken":"{access}","refreshToken":"{refresh}","expiresAt":4102444800000}},"shuntAccountUuid":"{uuid}"}}"#
+        r#"{{"claudeAiOauth":{{"accessToken":"{access}","refreshToken":"{refresh}","expiresAt":{expires_at_ms}}},"shuntAccountUuid":"{uuid}"}}"#
     );
     fs::write(dir.join(format!("{name}.json")), body).unwrap();
 }
@@ -490,6 +505,7 @@ async fn refresh_retry_refreshes_then_succeeds_on_401() {
     let _env = REFRESH_ENV_LOCK.lock().await;
     let stale = ["fake-oauth-", "refresh-stale"].concat();
     let fresh = ["fake-oauth-", "refresh-fresh"].concat();
+    let expires_at_ms = future_expiry_ms();
 
     let accounts_dir = unique_temp_dir("succeeds");
     write_store_account(
@@ -498,6 +514,7 @@ async fn refresh_retry_refreshes_then_succeeds_on_401() {
         &stale,
         "refresh-token-a",
         "uuid-a",
+        expires_at_ms,
     );
     std::env::set_var("SHUNT_CLAUDE_ACCOUNTS_DIR", &accounts_dir);
 
@@ -564,6 +581,7 @@ async fn refresh_retry_non_success_rotates_to_next_account() {
     let stale = ["fake-oauth-", "rotate-stale"].concat();
     let fresh = ["fake-oauth-", "rotate-fresh"].concat();
     let token_b = ["fake-oauth-", "rotate-b"].concat();
+    let expires_at_ms = future_expiry_ms();
     std::env::set_var("SHUNT_TEST_MULTI_ROTATE_B", &token_b);
 
     let accounts_dir = unique_temp_dir("rotates");
@@ -573,6 +591,7 @@ async fn refresh_retry_non_success_rotates_to_next_account() {
         &stale,
         "refresh-token-a",
         "uuid-a",
+        expires_at_ms,
     );
     std::env::set_var("SHUNT_CLAUDE_ACCOUNTS_DIR", &accounts_dir);
 
@@ -747,6 +766,7 @@ async fn refresh_retry_still_unauthorized_cools_down_and_rotates() {
     let stale = ["fake-oauth-", "still401-stale"].concat();
     let fresh = ["fake-oauth-", "still401-fresh"].concat();
     let token_b = ["fake-oauth-", "still401-b"].concat();
+    let expires_at_ms = future_expiry_ms();
     std::env::set_var("SHUNT_TEST_MULTI_STILL401_B", &token_b);
 
     let accounts_dir = unique_temp_dir("still401");
@@ -756,6 +776,7 @@ async fn refresh_retry_still_unauthorized_cools_down_and_rotates() {
         &stale,
         "refresh-token-a",
         "uuid-a",
+        expires_at_ms,
     );
     std::env::set_var("SHUNT_CLAUDE_ACCOUNTS_DIR", &accounts_dir);
 
@@ -919,9 +940,9 @@ async fn pause_same_retry_succeeds_and_relays_without_rotating() {
 /// Write a store account file marked as a long-lived, non-refreshable setup token
 /// (`shuntCredentialKind: "setup_token"`, no refreshToken) with a far-future
 /// expiry so its access token is used verbatim on the upstream POST.
-fn write_setup_token_account(dir: &std::path::Path, name: &str, access: &str) {
+fn write_setup_token_account(dir: &std::path::Path, name: &str, access: &str, expires_at_ms: i64) {
     let body = format!(
-        r#"{{"claudeAiOauth":{{"accessToken":"{access}","expiresAt":4102444800000,"shuntCredentialKind":"setup_token"}}}}"#
+        r#"{{"claudeAiOauth":{{"accessToken":"{access}","expiresAt":{expires_at_ms},"shuntCredentialKind":"setup_token"}}}}"#
     );
     fs::write(dir.join(format!("{name}.json")), body).unwrap();
 }
@@ -938,10 +959,11 @@ async fn static_setup_token_account_cools_down_without_refreshing() {
     let _env = REFRESH_ENV_LOCK.lock().await;
     let setup = ["fake-oauth-", "setup-static"].concat();
     let token_b = ["fake-oauth-", "setupstatic-b"].concat();
+    let expires_at_ms = future_expiry_ms();
     std::env::set_var("SHUNT_TEST_MULTI_SETUPSTATIC_B", &token_b);
 
     let accounts_dir = unique_temp_dir("setupstatic");
-    write_setup_token_account(&accounts_dir, "account-a", &setup);
+    write_setup_token_account(&accounts_dir, "account-a", &setup, expires_at_ms);
     std::env::set_var("SHUNT_CLAUDE_ACCOUNTS_DIR", &accounts_dir);
 
     // The refresh endpoint must never be called for a setup token.
