@@ -259,6 +259,16 @@ async fn poll_codex_account(
     };
     match codex::usage::fetch_usage(client, base_url, &access_token, &account_id).await {
         Ok(snapshot) => {
+            // A recognizable-but-empty response (e.g. `{"primary_window":{}}`
+            // for a brand-new account with no consumption yet) parses as `Ok`
+            // with every window `None` -- see the parser's own doc comment.
+            // Applying that to the pool would mark the account observed and
+            // let `poll_all`'s physical-account dedup skip every other alias,
+            // permanently starving this account of a real observation.
+            if snapshot.is_empty() {
+                tracing::debug!(provider, account = %account.name, "usage poller: codex wham usage snapshot reported no windows, skipping");
+                return false;
+            }
             pool.note_usage(provider, account, &snapshot);
             tracing::debug!(provider, account = %account.name, "usage poller: applied codex wham usage snapshot");
             true
@@ -1097,6 +1107,105 @@ mod tests {
 
         let _ = std::fs::remove_file(creds_500);
         let _ = std::fs::remove_file(creds_bad);
+    }
+
+    /// X1 (verification-FAIL fix): a 200 response that parses successfully
+    /// but carries no recognizable window at all (e.g. `{"primary_window":
+    /// {}}`, a legitimate response for a brand-new account with no
+    /// consumption yet) must not be applied to the pool — `note_usage` would
+    /// mark the account observed and let `poll_all`'s physical-account dedup
+    /// permanently skip its other aliases. This is the `Ok` path, distinct
+    /// from `codex_poll_records_no_state_on_error`'s sub-case 2 (an
+    /// unrecognizable body, which the parser itself rejects with `Err`).
+    #[tokio::test]
+    async fn codex_poll_skips_note_usage_on_empty_snapshot() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let access_token = chatgpt_access_token("acct-empty");
+        let creds = write_temp(
+            "codex-empty",
+            &codex_credential_json(&access_token, Some("refresh"), "acct-empty"),
+        );
+        let account = codex_account_with_credentials(&creds);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "primary_window": {} })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let pool = AccountPool::new();
+        let config = codex_backend_config(&server.uri(), account.clone());
+        let applied = poll_codex_account(
+            &reqwest::Client::new(),
+            &pool,
+            &config,
+            "codex",
+            &server.uri(),
+            &account,
+        )
+        .await;
+        assert!(!applied, "an empty snapshot must not count as applied");
+        let snap = pool.snapshot("codex", std::slice::from_ref(&account), None, None);
+        assert!(
+            !snap[0].has_state,
+            "an empty snapshot must not mark the account observed"
+        );
+
+        let _ = std::fs::remove_file(creds);
+    }
+
+    /// X1/N5 boundary: a response where one window parses and the other is
+    /// structurally malformed is *not* empty — it must still apply and
+    /// report `true`. This is the boundary the whole is_empty() guard rests
+    /// on: it must trigger only when *every* window is `None`, never when
+    /// just one is.
+    #[tokio::test]
+    async fn codex_poll_applies_partial_snapshot_when_one_window_is_malformed() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let access_token = chatgpt_access_token("acct-partial");
+        let creds = write_temp(
+            "codex-partial",
+            &codex_credential_json(&access_token, Some("refresh"), "acct-partial"),
+        );
+        let account = codex_account_with_credentials(&creds);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                // primary_window parses; secondary_window's used_percent is
+                // out of range (>100) so parse_window skips it alone.
+                "primary_window": { "used_percent": 12.0 },
+                "secondary_window": { "used_percent": 150.0 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let pool = AccountPool::new();
+        let config = codex_backend_config(&server.uri(), account.clone());
+        let applied = poll_codex_account(
+            &reqwest::Client::new(),
+            &pool,
+            &config,
+            "codex",
+            &server.uri(),
+            &account,
+        )
+        .await;
+        assert!(
+            applied,
+            "a snapshot with at least one valid window must still apply"
+        );
+        let snap = pool.snapshot("codex", std::slice::from_ref(&account), None, None);
+        assert!(snap[0].has_state);
+        assert_eq!(snap[0].utilization_5h, Some(0.12));
+        assert_eq!(snap[0].utilization_7d, None);
+
+        let _ = std::fs::remove_file(creds);
     }
 
     /// Test 29: a credential file with no `tokens.refresh_token` (not an
