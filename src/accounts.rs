@@ -86,8 +86,12 @@ enum QuotaWindow {
 
 /// Dashboard bucket for one Codex rate-limit window. Codex identifies these by
 /// duration, not by the primary/secondary header position.
+///
+/// `pub(crate)`: also the bucket type `crate::auth::codex::usage`'s wham/usage
+/// parser resolves via [`codex_window_bucket`], so the JSON poller's window
+/// identification cannot drift from the header parser's.
 #[derive(Debug, Clone, Copy)]
-enum CodexWindow {
+pub(crate) enum CodexWindow {
     FiveHour,
     Weekly,
 }
@@ -1600,7 +1604,9 @@ fn preserve_future_reset(stored: Option<u64>, polled: Option<u64>, now: u64) -> 
     polled.or_else(|| stored.filter(|&reset| reset > now))
 }
 
-fn codex_window_bucket(minutes: i64) -> Option<CodexWindow> {
+/// `pub(crate)`: shared with `crate::auth::codex::usage`'s wham/usage parser —
+/// see [`CodexWindow`].
+pub(crate) fn codex_window_bucket(minutes: i64) -> Option<CodexWindow> {
     if within_five_percent(minutes, 300) {
         Some(CodexWindow::FiveHour)
     } else if within_five_percent(minutes, 10_080) {

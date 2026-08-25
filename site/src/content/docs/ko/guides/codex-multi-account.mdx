@@ -115,6 +115,8 @@ admin web 화면을 통해 스토어 관리 계정을 삭제하면, 동일한 �
 - 기록된 사용량은 [Anthropic 풀](/ko/guides/anthropic-multi-account/)에서와 정확히 동일하게 선택에 반영됩니다: 임계값(내장 `0.98`, 또는 [`[server.pool]`](/ko/reference/configuration/#serverpool-선택)/계정별 소프트 임계값)에 도달했거나 이를 넘긴 스티키 계정은 여유가 가장 큰 계정에 선제적으로 자리를 넘기며, `burn_rate_avoidance`와 priority/여유 기준 정렬이 적용됩니다. `x-codex-rate-limit-reached-type` 값은 표시용으로만 기록됩니다.
 - `[server.pool] ramp_initial_concurrency`가 설정되어 있으면 슬로 스타트 admission 게이트가 페일오버 직후 방금 선택된 계정에 트래픽이 몰리는 것을 막습니다. [`[server.pool]`](/ko/reference/configuration/#serverpool-선택)을 참고하세요.
 - `[server.pool]`이 설정되어 있으면 오래된 근접 쿼터 계정을 `reprobe_seconds`(기본 900초, `0`이면 비활성)당 한 번씩 선택 순서 맨 앞으로 승격하고 예약합니다. admission이나 자격 증명 확인에 실패하면 예약을 취소하고, 첫 HTTP 전송이 시작될 때 재탐침 시각과 `shunt.pool.reprobes`를 커밋합니다. [`[server.pool]`](/ko/reference/configuration/#serverpool-선택)을 참고하세요. WebSocket 전송을 켠 프로바이더의 outbound Responses 풀은 예약을 만들지 않고 스트림 내부 rate-limit 이벤트를 안전하게 회전시키지 못하므로 재탐침을 억제합니다. 선택형 inbound Codex HTTP 엔드포인트는 계속 탐침하므로 해당 프로바이더의 카운터는 inbound 탐침만 셉니다. Codex usage 폴러가 없으면 제외된 outbound 마크는 관측시각 기반 창 수명 경계에서 만료될 때까지 남습니다. 신선도는 각 논리 창 5h, 공유 7d, Fable 7d에서 사용률 관측 시각과 status 관측 시각 중 최신 값을 사용하며, 네 번째 값으로 독립된 aggregate status 관측 시각을 사용합니다. 사용률만 갱신하는 폴링은 창별 status 신선도를 갱신하지 않습니다.
+- `[server.pool]`이 설정되어 있으면, 다른 관측 신호가 없는 오래된 근접 쿼터 계정이 `reprobe_seconds`(기본 900초, `0`이면 비활성)당 한 번씩 선택 순서 맨 앞으로 기회적으로 승격되어 실제 요청으로 쿼터를 갱신합니다. [`[server.pool]`](/ko/reference/configuration/#serverpool-선택)을 참고하세요. 이 경로는 WebSocket을 쓰지 않는 outbound 선택과 선택형 inbound Codex HTTP 엔드포인트에서 아래 사용량 폴러가 꺼져 있거나 폴링 사이일 때의 대체 수단입니다. WebSocket 전송을 켠 프로바이더는 스트림 내부 rate-limit 이벤트를 안전하게 회전시키지 못하므로 outbound Responses 재탐침을 억제하고, `shunt.pool.reprobes`는 inbound 탐침만 셉니다. 설정된 폴러는 imported이며 갱신 가능한 계정에만 조기 복구를 제공합니다. 폴러가 없거나 자격 없는 계정의 outbound 마크는 관측시각 기반 창 수명 경계에서 만료됩니다.
+- `[server.pool]`이 설정되어 있으면 다른 관측 신호가 없는 오래된 근접 쿼터 계정을 `reprobe_seconds`(기본 900초, `0`이면 비활성)당 한 번씩 선택 순서 맨 앞으로 승격하고 예약합니다. admission이나 자격 증명 확인에 실패하면 예약을 취소하고, 첫 HTTP 전송이 시작될 때 재탐침 시각과 `shunt.pool.reprobes`를 커밋합니다. [`[server.pool]`](/ko/reference/configuration/#serverpool-선택)을 참고하세요. WebSocket 전송을 켠 프로바이더의 outbound Responses 풀은 예약을 만들지 않고 스트림 내부 rate-limit 이벤트를 안전하게 회전시키지 못하므로 재탐침을 억제합니다. 선택형 inbound Codex HTTP 엔드포인트는 계속 탐침하므로 해당 프로바이더의 카운터는 inbound 탐침만 셉니다. Codex usage 폴러가 없으면 제외된 outbound 마크는 관측시각 기반 창 수명 경계에서 만료될 때까지 남습니다. 신선도는 각 논리 창 5h, 공유 7d, Fable 7d_oi에서 사용률 관측 시각과 status 관측 시각 중 최신 값을 사용하고, 네 번째 값은 독립된 aggregate status 관측 시각으로 둡니다. 사용률만 갱신하는 폴링은 창별 status 신선도를 갱신하지 않습니다. 설정된 폴러는 imported이며 갱신 가능한 계정에만 조기 복구를 제공하고, 폴러가 없거나 자격 없는 계정의 outbound 마크는 관측시각 기반 창 수명 경계에서 만료됩니다.
 - 성공 응답은 그 계정의 쿨다운을 해제합니다.
 
 | 트리거 | 쿨다운 |
@@ -125,6 +127,14 @@ admin web 화면을 통해 스토어 관리 계정을 삭제하면, 동일한 �
 | 429 업스트림 응답 | 숫자 `retry-after`, 1–3600초로 클램프, 기본 60초 |
 | `token_env` 계정에서의 401 | 5분 |
 | `credentials`/스토어 계정에서의 401 — 갱신 실패 또는 재시도도 401 | 5분 |
+
+## 사용량 폴러
+
+양수 [`usage_refresh_seconds`](/ko/reference/configuration/#serverpool-선택)는 모든 imported(갱신 가능한) `chatgpt_oauth` 계정에 대해서도 `GET /wham/usage`를 폴링해, Anthropic 풀이 `GET /api/oauth/usage`로 하는 것과 동일한 방식으로 헤더 기반 5h/주간 쿼터 상태를 재보정합니다. 이는 `reprobe_seconds`가 실제 요청으로 메우는 것과 같은 간극을 메웁니다. 풀이 쿼터 근접을 이유로 제외한 계정은 더 이상 프록시 요청을 받지 못하므로 그 계정의 `x-codex-*` 헤더는 갱신되지 않습니다 — 실제로는 창이 이미 리셋된 지 오래되었더라도 마찬가지입니다. 폴러는 대신 대역 외에서 근거 있는 사용량을 읽어옵니다.
+
+**이는 공식 문서화된 OpenAI/ChatGPT API가 아닙니다.** 그 형태의 근거는 게시된 문서가 아니라 Codex CLI 자체에서 관측된 60초 주기 폴링 동작이므로, 예고 없이 바뀌거나 사라질 수 있습니다. 파싱은 처음부터 끝까지 의도적으로 관대하고 fail-soft하게 동작합니다: 인식할 수 없는 응답 형태나 식별 가능한 레이트리밋 창이 없는 응답은 오류 상태가 아니라 해당 폴에 신호 없음으로 취급됩니다 — 계정은 이미 가지고 있던 쿼터 상태를 그대로 유지하고, 다음 틱에서 다시 시도합니다. 창 하나가 손상된 형태여도 그 형제 창의 적용을 막지 않습니다. 이 경로의 파싱 실패는 계정을 비정상으로 표시하거나 요청 라우팅에 영향을 주지 않으며, 헤더 기반 상태를 대체값으로 남겨둘 뿐입니다.
+
+자격 조건은 Claude 쪽과 동일합니다: imported 로그인(스토어 관리 계정, 또는 `tokens.refresh_token`이 있는 인라인 `credentials` 경로)만 폴링할 수 있습니다 — 순수 `token_env` 베어러 토큰은 정적이므로 건너뜁니다.
 
 ## 페일오버 규칙
 
@@ -178,7 +188,6 @@ x-shunt-account: backup
 
 ## 남은 후속 작업
 
-- **아웃오브밴드 사용량 재보정:** Anthropic 풀은 권위 있는 사용량 API(`usage_refresh_seconds`)를 폴링할 수 있습니다. 이 브랜치는 ChatGPT 백엔드의 비공개·문서화되지 않은 usage API를 폴링하지 않으므로 Codex 쿼터 상태는 여기서 응답 헤더로 갱신됩니다. 아웃오브밴드 Codex 폴러는 #430에 예약되어 있습니다.
 - **관리자 웹 프로비저닝:** 옵트인 [관리자 화면](/ko/guides/admin-remote-provisioning/)은 브라우저에서 ChatGPT OAuth를 실행해 갱신 가능한 Codex 계정을 저장하고, 공유 풀 테이블에 표시하며, 보고된 5h/7d 사용량을 보여줄 수 있습니다(Codex에는 대응물이 없어 `7d_oi`는 비어 있습니다).
 
 계정 풀 내부 동작 전체는 [M10 동작 명세](https://github.com/pleaseai/shunt/blob/main/docs/m10-codex-multi-account.md)를, 단일 계정 설정·모델 라우팅·effort/컨텍스트 구성은 [ChatGPT / Codex 가이드](/ko/guides/codex/)를 참고하세요.
