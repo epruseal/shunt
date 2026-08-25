@@ -235,9 +235,10 @@ pub struct PoolConfig {
     /// so it takes live traffic and refreshes its observed quota (issue
     /// #135's safety net for pools with no usage poller). Unset defaults to
     /// 900 seconds when `[server.pool]` is configured; `0` disables
-    /// re-probing. When `[server.pool]` itself is absent, re-probing is
-    /// disabled regardless of this value (pre-#135 behavior). Claude and
-    /// Kimi accounts are never probed (see `reprobe_interval`).
+    /// re-probing; a positive value below 60 is clamped up to a 60-second
+    /// floor. When `[server.pool]` itself is absent, re-probing is disabled
+    /// regardless of this value (pre-#135 behavior). Claude and Kimi accounts
+    /// are never probed (see `reprobe_interval`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reprobe_seconds: Option<u64>,
 }
@@ -2996,6 +2997,29 @@ impl Config {
         Ok(())
     }
 
+    /// Warns once at load when `[server.pool] reprobe_seconds` is a positive
+    /// value below the 60-second floor `reprobe_interval` (accounts.rs)
+    /// silently clamps up to. That function is the single read site for
+    /// `reprobe_seconds` and is called on every `select_order` request, so a
+    /// warning there would spam one line per request; surfacing it here
+    /// instead means it fires exactly once, at config load, mirroring how
+    /// `usage_refresh_seconds`'s own clamp is instead surfaced once per boot
+    /// (at poller spawn, since that value has no per-request read site).
+    fn warn_reprobe_seconds_below_floor(&self) {
+        let Some(pool) = &self.server.pool else {
+            return;
+        };
+        if let Some(configured) = pool.reprobe_seconds {
+            if configured > 0 && configured < 60 {
+                tracing::warn!(
+                    configured_seconds = configured,
+                    effective_seconds = 60,
+                    "reprobe_seconds is below the 60s floor; using 60"
+                );
+            }
+        }
+    }
+
     /// Warns when a provider or route has an explicitly configured
     /// `service_tier` that resolves to the `xai`/`grok` Responses flavor:
     /// that flavor never sends `service_tier` on the wire (xAI's Responses
@@ -3176,6 +3200,7 @@ impl Config {
                 }
             }
         }
+        self.warn_reprobe_seconds_below_floor();
         // Fail closed at boot: [server.status] sources are polled unattended in
         // the background, so a malformed URL or a duplicate provider label
         // would otherwise surface only as a silent, permanently-failing poller

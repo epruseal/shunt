@@ -62,7 +62,13 @@ const REPROBE_DEFAULT_SECS: u64 = 900;
 fn reprobe_interval(pool: Option<&PoolConfig>) -> Option<Duration> {
     match pool?.reprobe_seconds {
         Some(0) => None,
-        Some(seconds) => Some(Duration::from_secs(seconds)),
+        // Positive values below 60 are clamped up to a 60-second floor, same
+        // as `usage_refresh_seconds`. This is the single read site for
+        // `reprobe_seconds` (`select_order_inner` calls this every request),
+        // so the clamp lives only here; the operator-facing warning about it
+        // lives in `Config::validate` instead, which runs once at load, not
+        // once per request.
+        Some(seconds) => Some(Duration::from_secs(seconds.max(60))),
         None => Some(Duration::from_secs(REPROBE_DEFAULT_SECS)),
     }
 }
