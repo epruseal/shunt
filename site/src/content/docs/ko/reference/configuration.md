@@ -208,7 +208,7 @@ headers = { "x-api-key" = "..." }
 | `usage_refresh_seconds` | 비활성(`0`/미설정) | `GET /api/oauth/usage` 폴링 간격(초); 60 미만의 양수 값은 60초 하한으로 올림 |
 | `state_path` | 미설정 | 풀의 계정별 쿼터 상태를 저장할 파일; 재시작 시 빈 풀 대신 마지막으로 관측된 사용률에서 워밍업. 미설정이면 영속화 비활성(기본값) |
 | `ramp_initial_concurrency` | 비활성(`0`/미설정) | 폭주 제어: 방금 트래픽을 받기 시작한 계정 아이덴티티의 초기 동시 허용치. `0` 또는 미설정이면 허용 게이팅 비활성 |
-| `reprobe_seconds` | 이 테이블이 존재하면 `900`; `0`이면 비활성 | 오래된 근접 쿼터 Codex/ChatGPT 계정을 위한 기회적 재탐침 간격(초). `0`이면 재탐침 비활성; `[server.pool]` 자체가 없으면 이 값과 무관하게 재탐침 비활성(#135 이전 동작) |
+| `reprobe_seconds` | 이 테이블이 존재하면 `900`; `0`이면 비활성 | 오래된 근접 쿼터 Codex/ChatGPT 계정을 위한 기회적 재탐침 간격(초); 60 미만의 양수 값은 60초 하한으로 올림. `0`이면 재탐침 비활성; `[server.pool]` 자체가 없으면 이 값과 무관하게 재탐침 비활성(#135 이전 동작) |
 
 각 창 `X`에 대해 유효 소프트 임계값은 다음 순서로 결정됩니다: 계정 `threshold_X` → 계정 `threshold` → `default_threshold_X` → `default_threshold` → `hard_threshold`, 그리고 `hard_threshold`로 상한이 걸립니다. 모든 임계값은 `[0.0, 1.0]` 범위의 사용률 비율이며, 범위를 벗어나면 시작이 실패합니다. 임계값과 번-레이트 노브는 두 풀 계열 모두를 관장합니다: Anthropic 풀은 `anthropic-ratelimit-unified-*` 헤더로부터, Codex/ChatGPT 풀은 `x-codex-*` 5시간/주간 윈도우로부터 동작합니다(Codex에는 Fable 범위의 `7d_oi` 창이 없어 `default_threshold_fable`은 그곳에서 무력화됩니다). `usage_refresh_seconds`는 Anthropic 전용입니다 — Codex에는 out-of-band usage API가 없습니다.
 
