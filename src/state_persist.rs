@@ -11,7 +11,11 @@
 //! from upstream responses (and the usage API) regardless, so a missing, stale,
 //! or corrupt file only costs a cold start — never a boot failure. Restored
 //! windows whose reset has already passed are dropped lazily by the next
-//! `select_order`/`snapshot`, exactly as live ones are.
+//! `select_order`/`snapshot`, exactly as live ones are. A window that never
+//! carried a reset instant is bounded instead by its persisted observation
+//! time (`QuotaState::observed_at_5h`/`observed_at_7d`/`observed_at_7d_oi`):
+//! it expires one window length after that timestamp, whether restored from
+//! disk or recorded live, so a reset-less mark can never persist indefinitely.
 //!
 //! Only quota is persisted. Cooldowns are a monotonic [`std::time::Instant`]
 //! (not portable across a restart) and short-lived, so they are intentionally
@@ -201,6 +205,13 @@ mod tests {
     };
     use std::path::PathBuf;
 
+    fn unix_now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs()
+    }
+
     fn sample_pool() -> PersistedPool {
         PersistedPool {
             version: STATE_VERSION,
@@ -210,6 +221,7 @@ mod tests {
                     utilization_5h: Some(0.42),
                     reset_5h: Some(9_999_999_999),
                     status: Some("allowed".to_string()),
+                    observed_at_5h: Some(unix_now()),
                     ..Default::default()
                 },
             }],
@@ -252,7 +264,8 @@ mod tests {
     #[test]
     fn save_then_load_round_trips_quota() {
         let path = temp_file("roundtrip");
-        save(&path, &sample_pool()).expect("save succeeds");
+        let pool = sample_pool();
+        save(&path, &pool).expect("save succeeds");
 
         let loaded = load(&path).expect("load succeeds").expect("file present");
         assert_eq!(loaded.version, STATE_VERSION);
@@ -265,6 +278,10 @@ mod tests {
         assert_eq!(persisted_account.quota.utilization_5h, Some(0.42));
         assert_eq!(persisted_account.quota.reset_5h, Some(9_999_999_999));
         assert_eq!(persisted_account.quota.status.as_deref(), Some("allowed"));
+        assert_eq!(
+            persisted_account.quota.observed_at_5h, pool.accounts[0].quota.observed_at_5h,
+            "the observation time round-trips through disk like any other quota field"
+        );
 
         remove_test_dir(&path);
     }
@@ -424,6 +441,40 @@ mod tests {
         assert_eq!(snapshots[0].utilization_5h, None);
         assert_eq!(snapshots[0].reset_5h, None);
         assert_eq!(snapshots[0].status, None);
+        remove_test_dir(&path);
+    }
+
+    #[tokio::test]
+    async fn restore_bounds_reset_less_quota() {
+        // A state file written before observed_at_* existed carries a
+        // reset-less window with no observation timestamp at all. Restoring
+        // it must not leave that window unstamped: without a bound, it would
+        // read as "never observed," and for a reset-less mark
+        // `expire_stale_quota` treats that as expired immediately, defeating
+        // the warm start this persistence feature exists for.
+        let path = temp_file("legacy-reset-less");
+        let legacy = PersistedPool {
+            version: STATE_VERSION,
+            accounts: vec![PersistedAccount {
+                key: crate::accounts::account_key("anthropic", &account("acct-a")),
+                quota: QuotaState {
+                    utilization_7d: Some(0.9),
+                    ..Default::default()
+                },
+            }],
+        };
+        save(&path, &legacy).expect("save succeeds");
+        let before = unix_now();
+        let state = state_with_path(path.clone());
+
+        restore(&state).await;
+
+        let exported = state.accounts.export_quotas();
+        assert_eq!(exported.len(), 1);
+        assert!(
+            exported[0].1.observed_at_7d.is_some_and(|at| at >= before),
+            "a restored legacy window is backdated to boot time, not left unstamped"
+        );
         remove_test_dir(&path);
     }
 }

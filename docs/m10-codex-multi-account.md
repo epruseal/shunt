@@ -112,7 +112,7 @@ Selection state is per provider and survives config hot reloads for the life of 
 
 - If the request includes `x-claude-code-session-id`, shunt hashes it with SHA-256 to choose the sticky account — the same mechanism M8 uses, unchanged.
 - Without that header, shunt uses an independent round-robin counter for each provider.
-- Successful pooled responses record quota from `x-codex-primary-*` and `x-codex-secondary-*` headers. Each group is mapped by `window-minutes` (about 300 minutes → 5h; about 10080 minutes → 7d); other windows are ignored, and Codex has no `7d_oi` analog. The recorded windows feed both the admin dashboard and `select_order()` (issue #195): a sticky account at or past its threshold (the built-in `0.98`, or the `[server.pool]`/per-account soft thresholds) proactively yields to an account with more headroom before it ever returns a 429.
+- Successful pooled responses record quota from `x-codex-primary-*` and `x-codex-secondary-*` headers. Each group is mapped by `window-minutes` (about 300 minutes → 5h; about 10080 minutes → 7d); other windows are ignored, and Codex has no `7d_oi` analog. The recorded windows feed both the admin dashboard and `select_order()` (issue #195): a sticky account at or past its threshold (the built-in `0.98`, or the `[server.pool]`/per-account soft thresholds) proactively yields to an account with more headroom before it ever returns a 429. The `reset-at` header in a group can arrive blank; utilization is still recorded, and the window's observation time is stamped regardless, so a reset-less mark expires one window length after it was last observed instead of persisting indefinitely.
 - A successful response clears that account's cooldown.
 
 Cooldown durations:

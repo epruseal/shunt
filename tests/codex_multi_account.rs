@@ -1472,3 +1472,76 @@ async fn storm_control_last_candidate_is_always_admitted() {
 
     std::env::remove_var("SHUNT_TEST_CODEX_STORM_SOLO");
 }
+
+#[tokio::test]
+async fn codex_quota_rotation_with_empty_reset_header() {
+    // Reproduces the incident this change fixes: a deployed multi-account
+    // codex pool sent a valid window-minutes group with near-quota
+    // utilization but a blank `x-codex-primary-reset-at`. Proactive rotation
+    // must still trigger off the utilization alone — a missing reset must not
+    // suppress the recorded quota signal. (Re-entry once the mark ages out is
+    // covered by the unit tests `account_reenters_selection_after_reset_passes`
+    // and `account_reenters_selection_after_reset_less_mark_ages_out` in
+    // src/accounts.rs, not here, to avoid a sleep-based flaky wait in this
+    // integration test.)
+    if !can_bind_loopback() {
+        return;
+    }
+    let token_a = chatgpt_token(FAR_FUTURE_EXP, "acct-quota-noreset-a");
+    let token_b = chatgpt_token(FAR_FUTURE_EXP, "acct-quota-noreset-b");
+    std::env::set_var("SHUNT_TEST_CODEX_QUOTA_NORESET_A", &token_a);
+    std::env::set_var("SHUNT_TEST_CODEX_QUOTA_NORESET_B", &token_b);
+
+    let upstream = MockServer::start().await;
+    // Account-a succeeds but reports its 5h window at 99% used with an empty
+    // reset-at header — no reset instant is ever recorded for this window.
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .and(BearerToken(token_a.clone()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-codex-primary-window-minutes", "300")
+                .insert_header("x-codex-primary-used-percent", "99")
+                .insert_header("x-codex-primary-reset-at", "")
+                .set_body_string(sse_body("account a served")),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .and(BearerToken(token_b.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sse_body("account b served")))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let gateway = start_gateway_with(test_config(
+        &upstream.uri(),
+        account("account-a", "SHUNT_TEST_CODEX_QUOTA_NORESET_A"),
+        account("account-b", "SHUNT_TEST_CODEX_QUOTA_NORESET_B"),
+    ))
+    .await;
+
+    // Both requests carry a session id that hashes to account-a, so absent the
+    // quota signal the pool would stay sticky on account-a for both.
+    let session_id = session_id_for_account(0, 2);
+    let response = post_messages(&gateway, Some(&session_id)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("x-shunt-account").unwrap(),
+        "account-a"
+    );
+
+    let response = post_messages(&gateway, Some(&session_id)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("x-shunt-account").unwrap(),
+        "account-b",
+        "a near-quota sticky account with an empty reset header should still rotate off"
+    );
+    upstream.verify().await;
+
+    std::env::remove_var("SHUNT_TEST_CODEX_QUOTA_NORESET_A");
+    std::env::remove_var("SHUNT_TEST_CODEX_QUOTA_NORESET_B");
+}
