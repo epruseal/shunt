@@ -4533,6 +4533,24 @@ mod tests {
         }
     }
 
+    fn capture_logs<F, T>(operation: F) -> (T, String)
+    where
+        F: FnOnce() -> T,
+    {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let writer_output = Arc::clone(&output);
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || BufferWriter {
+                buffer: Arc::clone(&writer_output),
+            })
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, operation);
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        (result, logs)
+    }
+
     fn account(name: &str) -> AccountConfig {
         AccountConfig {
             name: name.to_string(),
@@ -4861,6 +4879,72 @@ mod tests {
         assert_eq!(bare.threshold, None);
         assert_eq!(bare.priority, 100, "serde default");
         assert!(!bare.disabled);
+    }
+
+    #[test]
+    fn reprobe_floor_warning_is_load_only_and_disabled_values_are_silent() {
+        let _guard = CONFIG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!(
+            "shunt-config-test-reprobe-floor-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let low_path = dir.join("low.toml");
+        std::fs::write(&low_path, "[server.pool]\nreprobe_seconds = 1\n").unwrap();
+        let (loaded, load_logs) = capture_logs(|| Config::load(Some(&low_path)));
+        let config = loaded.expect("a positive below-floor reprobe value loads");
+        assert_eq!(
+            load_logs
+                .matches("reprobe_seconds is below the floor")
+                .count(),
+            1,
+            "the successful load emits one floor warning: {load_logs}"
+        );
+
+        let (_, validate_logs) = capture_logs(|| {
+            config
+                .clone()
+                .validate()
+                .expect("first validation succeeds");
+            config.validate().expect("second validation succeeds");
+        });
+        assert_eq!(
+            validate_logs
+                .matches("reprobe_seconds is below the floor")
+                .count(),
+            0,
+            "runtime validation must not repeat the load warning: {validate_logs}"
+        );
+
+        let zero_path = dir.join("zero.toml");
+        std::fs::write(&zero_path, "[server.pool]\nreprobe_seconds = 0\n").unwrap();
+        let (_, zero_logs) = capture_logs(|| Config::load(Some(&zero_path)));
+        assert_eq!(
+            zero_logs
+                .matches("reprobe_seconds is below the floor")
+                .count(),
+            0,
+            "zero disables reprobes and must not warn: {zero_logs}"
+        );
+
+        let absent_path = dir.join("absent.toml");
+        std::fs::write(&absent_path, "").unwrap();
+        let (_, absent_logs) = capture_logs(|| Config::load(Some(&absent_path)));
+        assert_eq!(
+            absent_logs
+                .matches("reprobe_seconds is below the floor")
+                .count(),
+            0,
+            "an absent pool must not warn: {absent_logs}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

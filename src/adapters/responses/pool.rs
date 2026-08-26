@@ -853,6 +853,146 @@ mod tests {
             .is_some());
     }
 
+    #[test]
+    fn reprobe_helpers_ignore_mismatching_indices_and_cleanup_reservations() {
+        let provider = "pool-reprobe-helper-mismatch";
+        let mut config = Config::default();
+        config.server.pool = Some(PoolConfig {
+            default_threshold: Some(0.5),
+            reprobe_seconds: Some(60),
+            ..Default::default()
+        });
+        let state = AppState::new(config, reqwest::Client::new()).unwrap();
+        let mut stale = AccountConfig {
+            name: "pool-helper-stale".to_string(),
+            ..Default::default()
+        };
+        stale.store_family = Some(StoreFamily::Chatgpt);
+        let mut healthy = AccountConfig {
+            name: "pool-helper-healthy".to_string(),
+            ..Default::default()
+        };
+        healthy.store_family = Some(StoreFamily::Chatgpt);
+        let accounts = vec![stale, healthy];
+        let session = "pool-reprobe-helper-mismatch-session";
+        let initial = state.accounts.select_order(
+            provider,
+            &accounts,
+            Some(session),
+            Some("test-model"),
+            state.config.server.pool.as_ref(),
+        );
+        let stale_index = initial[0];
+        state.accounts.import_quotas([(
+            account_key(provider, &accounts[stale_index]),
+            QuotaState {
+                utilization_5h: Some(0.9),
+                observed_at_5h: Some(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                        - 61,
+                ),
+                ..Default::default()
+            },
+        )]);
+        let wrong_index = 1 - stale_index;
+
+        let (_, mut commit_reservation) = state.accounts.select_order_deferred(
+            provider,
+            &accounts,
+            Some(session),
+            Some("test-model"),
+            state.config.server.pool.as_ref(),
+        );
+        let before = crate::metrics::pool_reprobe_count_for_tests(provider);
+        commit_reprobe_for_account(&mut commit_reservation, wrong_index);
+        assert_eq!(
+            state
+                .accounts
+                .last_probe_at_for_test(provider, &accounts[stale_index]),
+            None,
+            "a mismatching index must not commit another account's reservation"
+        );
+        assert_eq!(
+            crate::metrics::pool_reprobe_count_for_tests(provider),
+            before
+        );
+        commit_reprobe_for_account(&mut commit_reservation, stale_index);
+        assert!(state
+            .accounts
+            .last_probe_at_for_test(provider, &accounts[stale_index])
+            .is_some());
+        assert_eq!(
+            crate::metrics::pool_reprobe_count_for_tests(provider),
+            before + 1
+        );
+
+        let cancel_provider = "pool-reprobe-helper-cancel";
+        let session = "pool-reprobe-helper-cancel-session";
+        let cancel_pool = state.accounts.clone();
+        let initial = cancel_pool.select_order(
+            cancel_provider,
+            &accounts,
+            Some(session),
+            Some("test-model"),
+            state.config.server.pool.as_ref(),
+        );
+        let stale_index = initial[0];
+        cancel_pool.import_quotas([(
+            account_key(cancel_provider, &accounts[stale_index]),
+            QuotaState {
+                utilization_5h: Some(0.9),
+                observed_at_5h: Some(
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                        - 61,
+                ),
+                ..Default::default()
+            },
+        )]);
+        let wrong_index = 1 - stale_index;
+        let (_, mut cancel_reservation) = cancel_pool.select_order_deferred(
+            cancel_provider,
+            &accounts,
+            Some(session),
+            Some("test-model"),
+            state.config.server.pool.as_ref(),
+        );
+        cancel_reprobe_for_account(&mut cancel_reservation, wrong_index);
+        let (_, blocked_reservation) = cancel_pool.select_order_deferred(
+            cancel_provider,
+            &accounts,
+            Some(session),
+            Some("test-model"),
+            state.config.server.pool.as_ref(),
+        );
+        assert!(
+            blocked_reservation.is_none(),
+            "a mismatching cancel must leave the original reservation pending"
+        );
+        cancel_reprobe_for_account(&mut cancel_reservation, stale_index);
+        assert_eq!(
+            cancel_pool.last_probe_at_for_test(cancel_provider, &accounts[stale_index]),
+            None
+        );
+        let (_, retry_reservation) = cancel_pool.select_order_deferred(
+            cancel_provider,
+            &accounts,
+            Some(session),
+            Some("test-model"),
+            state.config.server.pool.as_ref(),
+        );
+        assert!(
+            retry_reservation.is_some(),
+            "matching cancel must clean up the pending reservation"
+        );
+        drop(retry_reservation);
+    }
+
     #[tokio::test]
     async fn valid_token_resolution_does_not_wait_for_account_refresh_lock() {
         let dir = std::env::temp_dir().join(format!(

@@ -6459,6 +6459,178 @@ mod tests {
     }
 
     #[test]
+    fn reprobe_reservation_commit_cancel_and_drop_are_single_use() {
+        let pool_cfg = PoolConfig {
+            default_threshold: Some(0.5),
+            reprobe_seconds: Some(60),
+            ..Default::default()
+        };
+        let accounts = || {
+            let mut stale = account("reprobe-stale");
+            stale.store_family = Some(StoreFamily::Chatgpt);
+            let mut healthy = account("reprobe-healthy");
+            healthy.store_family = Some(StoreFamily::Chatgpt);
+            vec![stale, healthy]
+        };
+
+        let commit_provider = "reprobe-lifecycle-commit";
+        let commit_pool = Arc::new(AccountPool::new());
+        let commit_accounts = accounts();
+        let initial = commit_pool.select_order(
+            commit_provider,
+            &commit_accounts,
+            Some("reprobe-lifecycle-commit-session"),
+            None,
+            Some(&pool_cfg),
+        );
+        let stale = initial[0];
+        let observed_at = unix_now() - 61;
+        stamp_near_quota(
+            &commit_pool,
+            commit_provider,
+            &commit_accounts[stale],
+            observed_at,
+        );
+        let (order, reservation) = commit_pool.select_order_deferred(
+            commit_provider,
+            &commit_accounts,
+            Some("reprobe-lifecycle-commit-session"),
+            None,
+            Some(&pool_cfg),
+        );
+        assert_eq!(order[0], stale);
+        let mut reservation = reservation.expect("stale selection reserves once");
+        assert_eq!(
+            commit_pool.last_probe_at_for_test(commit_provider, &commit_accounts[stale]),
+            None,
+            "selection alone must not stamp dispatch time"
+        );
+        let before = crate::metrics::pool_reprobe_count_for_tests(commit_provider);
+        assert!(reservation.commit());
+        assert!(!reservation.commit(), "a reservation commits at most once");
+        assert!(commit_pool
+            .last_probe_at_for_test(commit_provider, &commit_accounts[stale])
+            .is_some());
+        assert_eq!(
+            crate::metrics::pool_reprobe_count_for_tests(commit_provider),
+            before + 1,
+            "one committed dispatch records one provider counter"
+        );
+        let committed_quota = commit_pool
+            .entries
+            .lock()
+            .expect("account health lock poisoned")
+            .get(&account_key(commit_provider, &commit_accounts[stale]))
+            .expect("committed account health remains observable")
+            .quota
+            .clone();
+        assert_eq!(
+            committed_quota.observed_at_5h,
+            Some(observed_at),
+            "committing a reprobe must not rewrite quota observation time"
+        );
+        drop(reservation);
+
+        let cancel_provider = "reprobe-lifecycle-cancel";
+        let cancel_pool = Arc::new(AccountPool::new());
+        let cancel_accounts = accounts();
+        let initial = cancel_pool.select_order(
+            cancel_provider,
+            &cancel_accounts,
+            Some("reprobe-lifecycle-cancel-session"),
+            None,
+            Some(&pool_cfg),
+        );
+        let stale = initial[0];
+        stamp_near_quota(
+            &cancel_pool,
+            cancel_provider,
+            &cancel_accounts[stale],
+            unix_now() - 61,
+        );
+        let (_, reservation) = cancel_pool.select_order_deferred(
+            cancel_provider,
+            &cancel_accounts,
+            Some("reprobe-lifecycle-cancel-session"),
+            None,
+            Some(&pool_cfg),
+        );
+        let mut reservation = reservation.expect("stale selection reserves once");
+        let before = crate::metrics::pool_reprobe_count_for_tests(cancel_provider);
+        reservation.cancel();
+        assert!(
+            !reservation.commit(),
+            "a cancelled reservation cannot commit"
+        );
+        assert_eq!(
+            cancel_pool.last_probe_at_for_test(cancel_provider, &cancel_accounts[stale]),
+            None
+        );
+        assert_eq!(
+            crate::metrics::pool_reprobe_count_for_tests(cancel_provider),
+            before,
+            "cancellation does not record a dispatch"
+        );
+        drop(reservation);
+        let (_, retry) = cancel_pool.select_order_deferred(
+            cancel_provider,
+            &cancel_accounts,
+            Some("reprobe-lifecycle-cancel-session"),
+            None,
+            Some(&pool_cfg),
+        );
+        assert!(
+            retry.is_some(),
+            "cancelling a reservation makes the stale account immediately eligible again"
+        );
+        drop(retry);
+
+        let drop_provider = "reprobe-lifecycle-drop";
+        let drop_pool = Arc::new(AccountPool::new());
+        let drop_accounts = accounts();
+        let initial = drop_pool.select_order(
+            drop_provider,
+            &drop_accounts,
+            Some("reprobe-lifecycle-drop-session"),
+            None,
+            Some(&pool_cfg),
+        );
+        let stale = initial[0];
+        stamp_near_quota(
+            &drop_pool,
+            drop_provider,
+            &drop_accounts[stale],
+            unix_now() - 61,
+        );
+        let (order, reservation) = drop_pool.select_order_deferred(
+            drop_provider,
+            &drop_accounts,
+            Some("reprobe-lifecycle-drop-session"),
+            None,
+            Some(&pool_cfg),
+        );
+        assert_eq!(order[0], stale);
+        drop(reservation);
+        assert_eq!(
+            drop_pool.last_probe_at_for_test(drop_provider, &drop_accounts[stale]),
+            None,
+            "dropping before dispatch cancels the reservation"
+        );
+        let (_, retry) = drop_pool.select_order_deferred(
+            drop_provider,
+            &drop_accounts,
+            Some("reprobe-lifecycle-drop-session"),
+            None,
+            Some(&pool_cfg),
+        );
+        assert!(
+            retry.is_some(),
+            "a dropped reservation leaves the account eligible"
+        );
+        drop(retry);
+    }
+
+    #[test]
     fn fresh_near_observation_suppresses_probe() {
         let pool_cfg = PoolConfig {
             default_threshold: Some(0.5),
