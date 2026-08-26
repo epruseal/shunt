@@ -341,13 +341,14 @@ impl AccountPool {
             .unwrap_or_default()
             .as_secs();
         let is_fable = is_fable_model(model);
-        let snapshots = {
+        let (snapshots, quota_expired) = {
             let mut entries = self.entries.lock().expect("account health lock poisoned");
             let mut snapshots = Vec::with_capacity(accounts.len());
+            let mut quota_expired = false;
             for account in accounts {
                 let health = entries.entry(account_key(&provider, account)).or_default();
                 health.enabled |= !account.disabled;
-                expire_stale_quota(&mut health.quota, unix_now);
+                quota_expired |= expire_stale_quota(&mut health.quota, unix_now);
                 // Assessing under the lock is pure CPU work and avoids cloning
                 // each account's QuotaState just to assess it after release.
                 let assessment = assess_quota(&health.quota, account, is_fable, pool, unix_now);
@@ -355,8 +356,11 @@ impl AccountPool {
                 let cooldown_until = governing_cooldown(health, is_fable);
                 snapshots.push((cooldown_until, assessment, weekly_reset));
             }
-            snapshots
+            (snapshots, quota_expired)
         };
+        if quota_expired {
+            self.mark_dirty();
+        }
 
         // The sticky/round-robin slot is computed over distinct identities so
         // adding or removing an alias cannot move an existing session. Disabled
@@ -468,31 +472,20 @@ impl AccountPool {
                 "anthropic-ratelimit-unified-5h-utilization",
                 &mut quota.utilization_5h,
             );
-            update_header(
-                headers,
-                "anthropic-ratelimit-unified-5h-reset",
-                &mut quota.reset_5h,
-            );
+            let reset_5h = header_value::<u64>(headers, "anthropic-ratelimit-unified-5h-reset");
             let wrote_utilization_7d = update_header(
                 headers,
                 "anthropic-ratelimit-unified-7d-utilization",
                 &mut quota.utilization_7d,
             );
-            update_header(
-                headers,
-                "anthropic-ratelimit-unified-7d-reset",
-                &mut quota.reset_7d,
-            );
+            let reset_7d = header_value::<u64>(headers, "anthropic-ratelimit-unified-7d-reset");
             let wrote_utilization_7d_oi = update_header(
                 headers,
                 "anthropic-ratelimit-unified-7d_oi-utilization",
                 &mut quota.utilization_7d_oi,
             );
-            update_header(
-                headers,
-                "anthropic-ratelimit-unified-7d_oi-reset",
-                &mut quota.reset_7d_oi,
-            );
+            let reset_7d_oi =
+                header_value::<u64>(headers, "anthropic-ratelimit-unified-7d_oi-reset");
             let wrote_status_5h =
                 update_string_header(headers, QUOTA_STATUS_HEADERS[0], &mut quota.status_5h);
             let wrote_status_7d =
@@ -510,18 +503,30 @@ impl AccountPool {
             // independent (see `QuotaState::observed_at_status`).
             if wrote_utilization_5h || wrote_status_5h {
                 quota.observed_at_5h = Some(now);
+                quota.reset_5h = preserve_future_reset(quota.reset_5h, reset_5h, now);
+            } else if let Some(reset) = reset_5h {
+                quota.reset_5h = Some(reset);
             }
             if wrote_utilization_7d || wrote_status_7d {
                 quota.observed_at_7d = Some(now);
+                quota.reset_7d = preserve_future_reset(quota.reset_7d, reset_7d, now);
+            } else if let Some(reset) = reset_7d {
+                quota.reset_7d = Some(reset);
             }
             if wrote_utilization_7d_oi || wrote_status_7d_oi {
                 quota.observed_at_7d_oi = Some(now);
+                quota.reset_7d_oi = preserve_future_reset(quota.reset_7d_oi, reset_7d_oi, now);
+            } else if let Some(reset) = reset_7d_oi {
+                quota.reset_7d_oi = Some(reset);
             }
             if wrote_status {
                 quota.observed_at_status = Some(now);
             }
 
-            let utilization = self.pool_utilization_for(provider, &mut entries, now);
+            // The post-lock dirty mark below covers both this observation and
+            // any expiry found while recomputing the provider metric.
+            let (utilization, _quota_expired) =
+                self.pool_utilization_for(provider, &mut entries, now);
             record_pool_utilization(provider, utilization);
         }
         self.mark_dirty();
@@ -554,9 +559,7 @@ impl AccountPool {
                 let minutes = header_value::<i64>(headers, minutes_header);
                 let utilization = header_value::<f64>(headers, utilization_header)
                     .filter(|value| value.is_finite() && (0.0..=100.0).contains(value));
-                let (Some(window), Some(utilization)) =
-                    (minutes.and_then(codex_window_bucket), utilization)
-                else {
+                let Some(window) = minutes.and_then(codex_window_bucket) else {
                     continue;
                 };
                 // The reset header can be blank (issue: a deployed multi-account
@@ -567,16 +570,20 @@ impl AccountPool {
                 let reset = header_value::<u64>(headers, reset_header);
                 match window {
                     CodexWindow::FiveHour => {
-                        quota.utilization_5h = Some(utilization / 100.0);
-                        quota.observed_at_5h = Some(now);
-                        if let Some(reset) = reset {
+                        if let Some(utilization) = utilization {
+                            quota.utilization_5h = Some(utilization / 100.0);
+                            quota.observed_at_5h = Some(now);
+                            quota.reset_5h = preserve_future_reset(quota.reset_5h, reset, now);
+                        } else if let Some(reset) = reset {
                             quota.reset_5h = Some(reset);
                         }
                     }
                     CodexWindow::Weekly => {
-                        quota.utilization_7d = Some(utilization / 100.0);
-                        quota.observed_at_7d = Some(now);
-                        if let Some(reset) = reset {
+                        if let Some(utilization) = utilization {
+                            quota.utilization_7d = Some(utilization / 100.0);
+                            quota.observed_at_7d = Some(now);
+                            quota.reset_7d = preserve_future_reset(quota.reset_7d, reset, now);
+                        } else if let Some(reset) = reset {
                             quota.reset_7d = Some(reset);
                         }
                     }
@@ -590,7 +597,10 @@ impl AccountPool {
                 quota.status = Some(status.to_string());
                 quota.observed_at_status = Some(now);
             }
-            let utilization = self.pool_utilization_for(provider, &mut entries, now);
+            // The post-lock dirty mark below covers both this observation and
+            // any expiry found while recomputing the provider metric.
+            let (utilization, _quota_expired) =
+                self.pool_utilization_for(provider, &mut entries, now);
             record_pool_utilization(provider, utilization);
         }
         self.mark_dirty();
@@ -632,7 +642,10 @@ impl AccountPool {
                 quota.reset_7d_oi = preserve_future_reset(quota.reset_7d_oi, window.resets_at, now);
                 quota.observed_at_7d_oi = Some(now);
             }
-            let utilization = self.pool_utilization_for(provider, &mut entries, now);
+            // The post-lock dirty mark below covers both this observation and
+            // any expiry found while recomputing the provider metric.
+            let (utilization, _quota_expired) =
+                self.pool_utilization_for(provider, &mut entries, now);
             record_pool_utilization(provider, utilization);
         }
         self.mark_dirty();
@@ -839,49 +852,58 @@ impl AccountPool {
             .unwrap_or_default()
             .as_secs();
         let is_fable = is_fable_model(model);
-        let mut entries = self.entries.lock().expect("account health lock poisoned");
-        accounts
-            .iter()
-            .map(|account| {
-                let key = account_key(provider, account);
-                let Some(health) = entries.get_mut(&key).filter(|health| health.observed) else {
-                    // Never selected, or selected but not yet answered (a default
-                    // entry from `select_order`): report a clean, available slot.
-                    return AccountSnapshot::unseen(account);
-                };
-                expire_stale_quota(&mut health.quota, unix_now);
-                let quota = assess_quota(&health.quota, account, is_fable, pool, unix_now);
-                let cooldown_secs_remaining = health
-                    .cooldown_until
-                    .and_then(|until| until.checked_duration_since(now))
-                    .map(|remaining| remaining.as_secs());
-                let cooldown_fable_secs_remaining = health
-                    .cooldown_until_fable
-                    .and_then(|until| until.checked_duration_since(now))
-                    .map(|remaining| remaining.as_secs());
-                let cooling = cooldown_secs_remaining.is_some()
-                    || (is_fable && cooldown_fable_secs_remaining.is_some());
-                AccountSnapshot {
-                    name: account.name.clone(),
-                    has_state: true,
-                    available: !account.disabled && !cooling && !quota.near,
-                    near_quota: quota.near,
-                    cooldown_secs_remaining,
-                    cooldown_fable_secs_remaining,
-                    priority: account.priority,
-                    disabled: account.disabled,
-                    headroom_secs: (pool.is_some() && quota.headroom.is_finite())
-                        .then_some(quota.headroom as i64),
-                    utilization_5h: health.quota.utilization_5h,
-                    reset_5h: health.quota.reset_5h,
-                    utilization_7d: health.quota.utilization_7d,
-                    reset_7d: health.quota.reset_7d,
-                    utilization_7d_oi: health.quota.utilization_7d_oi,
-                    reset_7d_oi: health.quota.reset_7d_oi,
-                    status: health.quota.status.clone(),
-                }
-            })
-            .collect()
+        let (snapshots, quota_expired) = {
+            let mut entries = self.entries.lock().expect("account health lock poisoned");
+            let mut quota_expired = false;
+            let snapshots = accounts
+                .iter()
+                .map(|account| {
+                    let key = account_key(provider, account);
+                    let Some(health) = entries.get_mut(&key).filter(|health| health.observed)
+                    else {
+                        // Never selected, or selected but not yet answered (a default
+                        // entry from `select_order`): report a clean, available slot.
+                        return AccountSnapshot::unseen(account);
+                    };
+                    quota_expired |= expire_stale_quota(&mut health.quota, unix_now);
+                    let quota = assess_quota(&health.quota, account, is_fable, pool, unix_now);
+                    let cooldown_secs_remaining = health
+                        .cooldown_until
+                        .and_then(|until| until.checked_duration_since(now))
+                        .map(|remaining| remaining.as_secs());
+                    let cooldown_fable_secs_remaining = health
+                        .cooldown_until_fable
+                        .and_then(|until| until.checked_duration_since(now))
+                        .map(|remaining| remaining.as_secs());
+                    let cooling = cooldown_secs_remaining.is_some()
+                        || (is_fable && cooldown_fable_secs_remaining.is_some());
+                    AccountSnapshot {
+                        name: account.name.clone(),
+                        has_state: true,
+                        available: !account.disabled && !cooling && !quota.near,
+                        near_quota: quota.near,
+                        cooldown_secs_remaining,
+                        cooldown_fable_secs_remaining,
+                        priority: account.priority,
+                        disabled: account.disabled,
+                        headroom_secs: (pool.is_some() && quota.headroom.is_finite())
+                            .then_some(quota.headroom as i64),
+                        utilization_5h: health.quota.utilization_5h,
+                        reset_5h: health.quota.reset_5h,
+                        utilization_7d: health.quota.utilization_7d,
+                        reset_7d: health.quota.reset_7d,
+                        utilization_7d_oi: health.quota.utilization_7d_oi,
+                        reset_7d_oi: health.quota.reset_7d_oi,
+                        status: health.quota.status.clone(),
+                    }
+                })
+                .collect();
+            (snapshots, quota_expired)
+        };
+        if quota_expired {
+            self.mark_dirty();
+        }
+        snapshots
     }
 
     /// Mark the pool's quota state as changed since the last flush. Called by
@@ -899,12 +921,24 @@ impl AccountPool {
 
     /// Snapshot every observed physical account's quota for on-disk persistence.
     pub(crate) fn export_quotas(&self) -> Vec<(AccountKey, QuotaState)> {
-        let entries = self.entries.lock().expect("account health lock poisoned");
-        entries
-            .iter()
-            .filter(|(_, health)| health.observed && health.quota.has_signal())
-            .map(|(key, health)| (key.clone(), health.quota.clone()))
-            .collect()
+        let (quotas, quota_expired) = {
+            let mut entries = self.entries.lock().expect("account health lock poisoned");
+            let now = unix_now();
+            let mut quota_expired = false;
+            let quotas = entries
+                .iter_mut()
+                .filter_map(|(key, health)| {
+                    quota_expired |= expire_stale_quota(&mut health.quota, now);
+                    (health.observed && health.quota.has_signal())
+                        .then(|| (key.clone(), health.quota.clone()))
+                })
+                .collect();
+            (quotas, quota_expired)
+        };
+        if quota_expired {
+            self.mark_dirty();
+        }
+        quotas
     }
 
     /// Seed the pool with quotas restored from disk at boot. Returns whether
@@ -947,15 +981,16 @@ impl AccountPool {
         upstream: &str,
         entries: &mut HashMap<AccountKey, AccountHealth>,
         now: u64,
-    ) -> [Option<f64>; 3] {
+    ) -> ([Option<f64>; 3], bool) {
         let memberships = self
             .memberships
             .lock()
             .expect("account membership lock poisoned");
         let Some(members) = memberships.get(upstream) else {
-            return [None; 3];
+            return ([None; 3], false);
         };
         let mut minimums = [None::<f64>; 3];
+        let mut quota_expired = false;
         for (key, enabled) in members {
             if !enabled {
                 continue;
@@ -963,7 +998,7 @@ impl AccountPool {
             let Some(health) = entries.get_mut(key) else {
                 continue;
             };
-            expire_stale_quota(&mut health.quota, now);
+            quota_expired |= expire_stale_quota(&mut health.quota, now);
             for (minimum, value) in minimums.iter_mut().zip([
                 health.quota.utilization_5h,
                 health.quota.utilization_7d,
@@ -976,7 +1011,7 @@ impl AccountPool {
                 *minimum = Some(minimum.map_or(value, |current| current.min(value)));
             }
         }
-        minimums
+        (minimums, quota_expired)
     }
 
     /// Get the async mutex that serializes token refreshes for one account.
@@ -1369,36 +1404,50 @@ fn record_pool_utilization(provider: &str, utilization: [Option<f64>; 3]) {
 /// `window_headroom`) — the window's last observation is older than the
 /// window's own length. A mark can never outlive the longest span it could
 /// plausibly still describe.
-fn expire_stale_quota(quota: &mut QuotaState, now: u64) {
+fn expire_stale_quota(quota: &mut QuotaState, now: u64) -> bool {
     let stale = |reset: Option<u64>, observed: Option<u64>, len: u64| match reset {
         Some(reset) => reset <= now,
         None => observed.is_some_and(|at| at.saturating_add(len) <= now),
     };
     let mut expired = false;
     if stale(quota.reset_5h, quota.observed_at_5h, WINDOW_5H_SECS) {
+        let had_signal = quota.utilization_5h.is_some()
+            || quota.reset_5h.is_some()
+            || quota.status_5h.is_some()
+            || quota.observed_at_5h.is_some();
         quota.utilization_5h = None;
         quota.reset_5h = None;
         quota.status_5h = None;
         quota.observed_at_5h = None;
-        expired = true;
+        expired |= had_signal;
     }
     if stale(quota.reset_7d, quota.observed_at_7d, WINDOW_7D_SECS) {
+        let had_signal = quota.utilization_7d.is_some()
+            || quota.reset_7d.is_some()
+            || quota.status_7d.is_some()
+            || quota.observed_at_7d.is_some();
         quota.utilization_7d = None;
         quota.reset_7d = None;
         quota.status_7d = None;
         quota.observed_at_7d = None;
-        expired = true;
+        expired |= had_signal;
     }
     if stale(quota.reset_7d_oi, quota.observed_at_7d_oi, WINDOW_7D_SECS) {
+        let had_signal = quota.utilization_7d_oi.is_some()
+            || quota.reset_7d_oi.is_some()
+            || quota.status_7d_oi.is_some()
+            || quota.observed_at_7d_oi.is_some();
         quota.utilization_7d_oi = None;
         quota.reset_7d_oi = None;
         quota.status_7d_oi = None;
         quota.observed_at_7d_oi = None;
-        expired = true;
+        expired |= had_signal;
     }
     if expired {
+        let had_signal = quota.status.is_some() || quota.observed_at_status.is_some();
         quota.status = None;
         quota.observed_at_status = None;
+        expired |= had_signal;
     }
     // Unconditional aggregate cap, independent of the per-window sweep above.
     // `assess_quota`'s `has_window_status` fallback reads the aggregate
@@ -1413,9 +1462,12 @@ fn expire_stale_quota(quota: &mut QuotaState, now: u64) {
         .observed_at_status
         .is_some_and(|at| at.saturating_add(WINDOW_7D_SECS) <= now)
     {
+        let had_signal = quota.status.is_some() || quota.observed_at_status.is_some();
         quota.status = None;
         quota.observed_at_status = None;
+        expired |= had_signal;
     }
+    expired
 }
 
 /// Stamps a restored legacy mark's observation time. See
@@ -1750,10 +1802,9 @@ mod tests {
             ]),
         );
         let mut entries = pool.entries.lock().expect("account health lock poisoned");
-        assert_eq!(
-            pool.pool_utilization_for("anthropic", &mut entries, now),
-            [Some(0.2), Some(0.6), Some(0.4)]
-        );
+        let (utilization, expired) = pool.pool_utilization_for("anthropic", &mut entries, now);
+        assert_eq!(utilization, [Some(0.2), Some(0.6), Some(0.4)]);
+        assert!(!expired, "the non-stale control must not report an expiry");
     }
 
     #[test]
@@ -2270,6 +2321,211 @@ mod tests {
             quota.observed_at_7d.is_some_and(|at| at >= before),
             "the 7d bucket stamps observed_at even without a reset header"
         );
+    }
+
+    #[test]
+    fn generic_fresh_resetless_utilization_replaces_expired_reset() {
+        let pool = AccountPool::new();
+        let account = account("anthropic-account");
+        let before = unix_now();
+        pool.import_quotas([(
+            account_key("anthropic", &account),
+            QuotaState {
+                utilization_5h: Some(0.91),
+                reset_5h: Some(before.saturating_sub(1)),
+                observed_at_5h: Some(before),
+                ..Default::default()
+            },
+        )]);
+
+        pool.note_quota(
+            "anthropic",
+            &account,
+            &quota_headers(&[(
+                "anthropic-ratelimit-unified-5h-utilization",
+                "0.42".to_string(),
+            )]),
+        );
+        let order = pool.select_order(
+            "anthropic",
+            std::slice::from_ref(&account),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(order, [0]);
+
+        let entries = pool.entries.lock().unwrap();
+        let quota = &entries
+            .get(&account_key("anthropic", &account))
+            .unwrap()
+            .quota;
+        assert_eq!(quota.utilization_5h, Some(0.42));
+        assert_eq!(quota.reset_5h, None);
+        assert!(quota.observed_at_5h.is_some_and(|at| at >= before));
+    }
+
+    #[test]
+    fn codex_fresh_resetless_utilization_replaces_expired_reset() {
+        let pool = AccountPool::new();
+        let account = account("codex-account");
+        let before = unix_now();
+        pool.import_quotas([(
+            account_key("codex", &account),
+            QuotaState {
+                utilization_5h: Some(0.91),
+                reset_5h: Some(before.saturating_sub(1)),
+                observed_at_5h: Some(before),
+                ..Default::default()
+            },
+        )]);
+
+        pool.note_codex_quota(
+            "codex",
+            &account,
+            &quota_headers(&[
+                ("x-codex-primary-used-percent", "42".to_string()),
+                ("x-codex-primary-window-minutes", "300".to_string()),
+            ]),
+        );
+        let order = pool.select_order("codex", std::slice::from_ref(&account), None, None, None);
+        assert_eq!(order, [0]);
+
+        let entries = pool.entries.lock().unwrap();
+        let quota = &entries.get(&account_key("codex", &account)).unwrap().quota;
+        assert_eq!(quota.utilization_5h, Some(0.42));
+        assert_eq!(quota.reset_5h, None);
+        assert!(quota.observed_at_5h.is_some_and(|at| at >= before));
+    }
+
+    #[test]
+    fn generic_status_only_observation_replaces_expired_reset() {
+        let pool = AccountPool::new();
+        let account = account("status-account");
+        let before = unix_now();
+        pool.import_quotas([(
+            account_key("anthropic", &account),
+            QuotaState {
+                reset_5h: Some(before.saturating_sub(1)),
+                status_5h: Some("allowed".to_string()),
+                observed_at_5h: Some(before),
+                ..Default::default()
+            },
+        )]);
+
+        pool.note_quota(
+            "anthropic",
+            &account,
+            &quota_headers(&[(QUOTA_STATUS_HEADERS[0], "rejected".to_string())]),
+        );
+        let order = pool.select_order(
+            "anthropic",
+            std::slice::from_ref(&account),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(order, [0]);
+
+        let entries = pool.entries.lock().unwrap();
+        let quota = &entries
+            .get(&account_key("anthropic", &account))
+            .unwrap()
+            .quota;
+        assert_eq!(quota.status_5h.as_deref(), Some("rejected"));
+        assert_eq!(quota.reset_5h, None);
+        assert!(quota.observed_at_5h.is_some_and(|at| at >= before));
+    }
+
+    #[test]
+    fn generic_fresh_resetless_utilization_preserves_future_reset() {
+        let pool = AccountPool::new();
+        let account = account("future-reset-account");
+        let before = unix_now();
+        let reset = before + 3_600;
+        pool.import_quotas([(
+            account_key("anthropic", &account),
+            QuotaState {
+                utilization_5h: Some(0.2),
+                reset_5h: Some(reset),
+                observed_at_5h: Some(before),
+                ..Default::default()
+            },
+        )]);
+
+        pool.note_quota(
+            "anthropic",
+            &account,
+            &quota_headers(&[(
+                "anthropic-ratelimit-unified-5h-utilization",
+                "0.42".to_string(),
+            )]),
+        );
+        pool.select_order(
+            "anthropic",
+            std::slice::from_ref(&account),
+            None,
+            None,
+            None,
+        );
+
+        let entries = pool.entries.lock().unwrap();
+        let quota = &entries
+            .get(&account_key("anthropic", &account))
+            .unwrap()
+            .quota;
+        assert_eq!(quota.utilization_5h, Some(0.42));
+        assert_eq!(quota.reset_5h, Some(reset));
+    }
+
+    #[test]
+    fn generic_reset_only_header_updates_metadata_without_observation() {
+        let pool = AccountPool::new();
+        let account = account("metadata-account");
+        let reset = unix_now() + 3_600;
+        pool.note_quota(
+            "anthropic",
+            &account,
+            &quota_headers(&[("anthropic-ratelimit-unified-5h-reset", reset.to_string())]),
+        );
+        pool.select_order(
+            "anthropic",
+            std::slice::from_ref(&account),
+            None,
+            None,
+            None,
+        );
+
+        let entries = pool.entries.lock().unwrap();
+        let quota = &entries
+            .get(&account_key("anthropic", &account))
+            .unwrap()
+            .quota;
+        assert_eq!(quota.reset_5h, Some(reset));
+        assert_eq!(quota.utilization_5h, None);
+        assert_eq!(quota.observed_at_5h, None);
+    }
+
+    #[test]
+    fn codex_reset_only_header_updates_metadata_without_observation() {
+        let pool = AccountPool::new();
+        let account = account("codex-metadata-account");
+        let reset = unix_now() + 3_600;
+        pool.note_codex_quota(
+            "codex",
+            &account,
+            &quota_headers(&[
+                ("x-codex-primary-window-minutes", "300".to_string()),
+                ("x-codex-primary-reset-at", reset.to_string()),
+            ]),
+        );
+        pool.select_order("codex", std::slice::from_ref(&account), None, None, None);
+
+        let entries = pool.entries.lock().unwrap();
+        let quota = &entries.get(&account_key("codex", &account)).unwrap().quota;
+        assert_eq!(quota.reset_5h, Some(reset));
+        assert_eq!(quota.utilization_5h, None);
+        assert_eq!(quota.observed_at_5h, None);
     }
 
     #[test]
