@@ -125,7 +125,9 @@ fn parse_usage(value: &serde_json::Value) -> anyhow::Result<UsageSnapshot> {
         match bucket {
             CodexWindow::FiveHour if five_hour.is_none() => five_hour = Some(parsed),
             CodexWindow::Weekly if seven_day.is_none() => seven_day = Some(parsed),
-            CodexWindow::FiveHour | CodexWindow::Weekly => {}
+            CodexWindow::FiveHour | CodexWindow::Weekly => {
+                tracing::debug!(?bucket, "dropping duplicate wham usage window bucket");
+            }
         }
     }
 

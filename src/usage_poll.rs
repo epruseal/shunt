@@ -858,12 +858,16 @@ mod tests {
     }
 
     /// Build a fake ChatGPT access token carrying the `chatgpt_account_id`
-    /// claim `codex::auth::jwt_account_id` reads. Mirrors the same-named
-    /// helper in `auth::mod::tests`.
+    /// claim `codex::auth::jwt_account_id` reads. Its runtime-derived expiry
+    /// keeps this fixture out of the refresh path as wall time advances.
     fn chatgpt_access_token(account_id: &str) -> String {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let expires_at = (std::time::SystemTime::now() + Duration::from_secs(3_600))
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs();
         let payload = serde_json::json!({
-            "exp": 2_000_000_000,
+            "exp": expires_at,
             "https://api.openai.com/auth": {"chatgpt_account_id": account_id}
         });
         format!(
