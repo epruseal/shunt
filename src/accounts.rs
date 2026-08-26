@@ -53,12 +53,15 @@ const WINDOW_7D_SECS: u64 = 7 * 24 * 60 * 60;
 /// Default opportunistic-reprobe interval when `[server.pool]` is configured
 /// but `reprobe_seconds` is unset. See [`reprobe_interval`].
 const REPROBE_DEFAULT_SECS: u64 = 900;
+/// Minimum positive opportunistic-reprobe interval.
+pub(crate) const REPROBE_FLOOR_SECS: u64 = 60;
 
 /// The effective opportunistic-reprobe interval, or `None` when re-probing is
 /// disabled. Disabled when `[server.pool]` itself is absent (preserves the
 /// documented pre-#135 behavior: no pool config, no probing), or when
 /// `reprobe_seconds` is explicitly `0`. Unset with a pool present defaults to
-/// [`REPROBE_DEFAULT_SECS`].
+/// [`REPROBE_DEFAULT_SECS`]. The outbound Responses pool separately suppresses
+/// re-probing when WebSocket transport is enabled for the provider.
 fn reprobe_interval(pool: Option<&PoolConfig>) -> Option<Duration> {
     match pool?.reprobe_seconds {
         Some(0) => None,
@@ -68,7 +71,7 @@ fn reprobe_interval(pool: Option<&PoolConfig>) -> Option<Duration> {
         // so the clamp lives only here; the operator-facing warning about it
         // lives in `Config::validate` instead, which runs once at load, not
         // once per request.
-        Some(seconds) => Some(Duration::from_secs(seconds.max(60))),
+        Some(seconds) => Some(Duration::from_secs(seconds.max(REPROBE_FLOOR_SECS))),
         None => Some(Duration::from_secs(REPROBE_DEFAULT_SECS)),
     }
 }
@@ -353,7 +356,42 @@ impl AccountPool {
         model: Option<&str>,
         pool: Option<&PoolConfig>,
     ) -> Vec<usize> {
-        self.select_order_inner(provider, accounts, session_id, model, pool)
+        self.select_order_inner(provider, accounts, session_id, model, pool, true)
+    }
+
+    /// Return account indices without opportunistic re-probing.
+    ///
+    /// Responses pools use this entry point when WebSocket transport is
+    /// enabled. An in-stream rate-limit error arrives as a normal event, so
+    /// the pool does not rotate; the streaming path then calls `mark_healthy`,
+    /// which clears the cooldown and, when the turn is treated as successful
+    /// and the account already has a positive ramp allowance, doubles that
+    /// allowance. That contamination predates re-probing, and this entry point
+    /// only removes re-probing as its new trigger while the deeper fix remains
+    /// deferred. The provider-labelled re-probe metric therefore counts only
+    /// inbound probes for providers with WebSocket enabled.
+    pub(crate) fn select_order_without_reprobe(
+        &self,
+        provider: &str,
+        accounts: &[AccountConfig],
+        session_id: Option<&str>,
+        model: Option<&str>,
+        pool: Option<&PoolConfig>,
+    ) -> Vec<usize> {
+        self.select_order_inner(provider, accounts, session_id, model, pool, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_probe_at_for_test(
+        &self,
+        provider: &str,
+        account: &AccountConfig,
+    ) -> Option<Instant> {
+        self.entries
+            .lock()
+            .expect("account health lock poisoned")
+            .get(&account_key(provider, account))
+            .and_then(|health| health.last_probe_at)
     }
 
     fn select_order_inner(
@@ -363,6 +401,7 @@ impl AccountPool {
         session_id: Option<&str>,
         model: Option<&str>,
         pool: Option<&PoolConfig>,
+        allow_reprobe: bool,
     ) -> Vec<usize> {
         if accounts.is_empty() {
             return Vec::new();
@@ -401,7 +440,7 @@ impl AccountPool {
             .unwrap_or_default()
             .as_secs();
         let is_fable = is_fable_model(model);
-        let reprobe = reprobe_interval(pool);
+        let reprobe = allow_reprobe.then(|| reprobe_interval(pool)).flatten();
         let (snapshots, probe_selection, quota_expired) = {
             let mut entries = self.entries.lock().expect("account health lock poisoned");
             let mut snapshots = Vec::with_capacity(accounts.len());
@@ -6217,6 +6256,31 @@ mod tests {
         let health = entries.entry(account_key(provider, account)).or_default();
         health.quota.utilization_5h = Some(0.9);
         health.quota.observed_at_5h = Some(observed_at);
+    }
+
+    #[test]
+    fn reprobe_interval_boundaries() {
+        let cases = [
+            ("pool absent", None, None),
+            ("zero", Some(Some(0)), None),
+            ("unset", Some(None), Some(REPROBE_DEFAULT_SECS)),
+            ("one", Some(Some(1)), Some(REPROBE_FLOOR_SECS)),
+            ("below floor", Some(Some(59)), Some(REPROBE_FLOOR_SECS)),
+            ("at floor", Some(Some(60)), Some(REPROBE_FLOOR_SECS)),
+            ("above floor", Some(Some(61)), Some(61)),
+        ];
+
+        for (label, configured, expected_seconds) in cases {
+            let pool = configured.map(|reprobe_seconds| PoolConfig {
+                reprobe_seconds,
+                ..Default::default()
+            });
+            assert_eq!(
+                reprobe_interval(pool.as_ref()),
+                expected_seconds.map(Duration::from_secs),
+                "{label}"
+            );
+        }
     }
 
     #[test]
