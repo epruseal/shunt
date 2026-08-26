@@ -907,9 +907,9 @@ mod tests {
         config
     }
 
-    /// Test 24: `poll_codex_account` applies both windows from a `wham/usage`
-    /// response and sends the ChatGPT bearer, the three CLI identity headers,
-    /// and `chatgpt-account-id` on the request.
+    /// Test 24: a live-shaped weekly-only `wham/usage` response applies the
+    /// reported weekly window, leaves the absent five-hour window absent, and
+    /// sends the ChatGPT bearer plus the CLI identity headers.
     #[tokio::test]
     async fn codex_poll_applies_wham_snapshot() {
         use wiremock::matchers::{header, method, path};
@@ -938,8 +938,11 @@ mod tests {
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "rate_limit": {
-                    "primary_window": { "used_percent": 18.0 },
-                    "secondary_window": { "used_percent": 64.0 }
+                    "primary_window": {
+                        "used_percent": 18.0,
+                        "limit_window_seconds": 604_800
+                    },
+                    "secondary_window": null
                 }
             })))
             .expect(1)
@@ -961,14 +964,15 @@ mod tests {
 
         let snap = pool.snapshot("codex", std::slice::from_ref(&account), None, None);
         assert!(snap[0].has_state);
-        assert_eq!(snap[0].utilization_5h, Some(0.18));
-        assert_eq!(snap[0].utilization_7d, Some(0.64));
+        assert_eq!(snap[0].utilization_5h, None);
+        assert_eq!(snap[0].utilization_7d, Some(0.18));
 
         let _ = std::fs::remove_file(creds);
     }
 
     /// Test 25: alternate window key names (`five_hour_limit`/`weekly_limit`
-    /// under the plural `rate_limits` container) are tolerated.
+    /// under the plural `rate_limits` container) are tolerated, and both
+    /// reported durations populate their corresponding lanes.
     #[tokio::test]
     async fn codex_poll_tolerates_alternate_field_names() {
         use wiremock::matchers::{method, path};
@@ -986,8 +990,14 @@ mod tests {
             .and(path("/wham/usage"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "rate_limits": {
-                    "five_hour_limit": { "used_percent": 22.0 },
-                    "weekly_limit": { "used_percent": 91.0 }
+                    "five_hour_limit": {
+                        "used_percent": 22.0,
+                        "limit_window_seconds": 18_000
+                    },
+                    "weekly_limit": {
+                        "used_percent": 91.0,
+                        "limit_window_seconds": 604_800
+                    }
                 }
             })))
             .expect(1)
@@ -1008,22 +1018,17 @@ mod tests {
         assert!(applied);
 
         let snap = pool.snapshot("codex", std::slice::from_ref(&account), None, None);
+        assert!(snap[0].has_state);
         assert_eq!(snap[0].utilization_5h, Some(0.22));
         assert_eq!(snap[0].utilization_7d, Some(0.91));
 
         let _ = std::fs::remove_file(creds);
     }
 
-    /// Test 26: `resets_at` is accepted as either a Unix epoch integer or an
-    /// RFC 3339 string, per window, in the same response. Both fixtures are
-    /// wall-clock independent: the epoch value is computed at run time (the
-    /// same idiom as `future_reset` below, since this module only imports
-    /// `time::Duration`, not `std::time::Duration`) instead of a hardcoded
-    /// literal that would itself expire and start failing this assertion,
-    /// and the RFC 3339 string uses the maximum representable four-digit
-    /// year so it never lands in the past.
+    /// Test 26: each window's absolute `reset_at` epoch is preserved. Both
+    /// future values are computed at run time so the fixture never expires.
     #[tokio::test]
-    async fn codex_poll_accepts_epoch_and_rfc3339_resets() {
+    async fn codex_poll_accepts_future_reset_at_values() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1039,21 +1044,22 @@ mod tests {
             .unwrap()
             .as_secs()
             + 3600;
+        let secondary_reset = primary_reset + 3600;
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/wham/usage"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "primary_window": { "used_percent": 5.0, "resets_at": primary_reset },
-                // 9999-12-31T23:59:59Z: the max year `parse_rfc3339_to_epoch_secs`
-                // accepts (1970..=9999), chosen so this reset is always in the
-                // future without pinning a specific date. Note `window_headroom`
-                // (accounts.rs) clamps `now` into `[reset - window_len, reset]`,
-                // so a reset this far out would otherwise read as "window just
-                // opened" and understate headroom -- safe only here because this
-                // test never exercises headroom (`pool: None` throughout, and
-                // this snapshot assertion reads `reset_7d` directly).
-                "secondary_window": { "used_percent": 9.0, "resets_at": "9999-12-31T23:59:59Z" }
+                "primary_window": {
+                    "used_percent": 5.0,
+                    "limit_window_seconds": 18_000,
+                    "reset_at": primary_reset
+                },
+                "secondary_window": {
+                    "used_percent": 9.0,
+                    "limit_window_seconds": 604_800,
+                    "reset_at": secondary_reset
+                }
             })))
             .expect(1)
             .mount(&server)
@@ -1074,13 +1080,13 @@ mod tests {
 
         let snap = pool.snapshot("codex", std::slice::from_ref(&account), None, None);
         assert_eq!(snap[0].reset_5h, Some(primary_reset));
-        assert_eq!(snap[0].reset_7d, Some(253_402_300_799));
+        assert_eq!(snap[0].reset_7d, Some(secondary_reset));
 
         let _ = std::fs::remove_file(creds);
     }
 
     /// Test 27: a `wham/usage` poll whose primary window carries no
-    /// `resets_at` must not erase a reset previously recorded from proxied
+    /// `reset_at` must not erase a reset previously recorded from proxied
     /// `x-codex-*` response headers (the near-quota persistence bug this PR
     /// stack fixes) — it must still apply the fresh utilization.
     #[tokio::test]
@@ -1122,13 +1128,16 @@ mod tests {
         let before = pool.snapshot("codex", std::slice::from_ref(&account), None, None);
         assert_eq!(before[0].reset_5h, Some(future_reset));
 
-        // Stage 2: a wham/usage poll with no `resets_at` on its primary window
+        // Stage 2: a wham/usage poll with no `reset_at` on its primary window
         // must update utilization but leave that header-derived reset alone.
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/wham/usage"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "primary_window": { "used_percent": 55.0 }
+                "primary_window": {
+                    "used_percent": 55.0,
+                    "limit_window_seconds": 18_000
+                }
             })))
             .expect(1)
             .mount(&server)
@@ -1301,8 +1310,14 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 // primary_window parses; secondary_window's used_percent is
                 // out of range (>100) so parse_window skips it alone.
-                "primary_window": { "used_percent": 12.0 },
-                "secondary_window": { "used_percent": 150.0 }
+                "primary_window": {
+                    "used_percent": 12.0,
+                    "limit_window_seconds": 18_000
+                },
+                "secondary_window": {
+                    "used_percent": 150.0,
+                    "limit_window_seconds": 604_800
+                }
             })))
             .expect(1)
             .mount(&server)
@@ -1453,7 +1468,10 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/wham/usage"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "primary_window": { "used_percent": 66.0 }
+                "primary_window": {
+                    "used_percent": 66.0,
+                    "limit_window_seconds": 18_000
+                }
             })))
             .expect(1)
             .mount(&codex_server)
