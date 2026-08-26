@@ -996,6 +996,35 @@ impl AccountPool {
     /// account observed, so the admin dashboard reports its usage even before
     /// the first proxied request.
     pub fn note_usage(&self, provider: &str, account: &AccountConfig, usage: &UsageSnapshot) {
+        self.note_usage_inner(provider, account, usage, false, false);
+    }
+
+    /// Apply one successfully parsed, non-empty Codex `wham/usage` report.
+    /// Unlike Claude's partial usage response, wham enumerates the account's
+    /// 5h/7d windows, so the Codex parser can mark a bucket as authoritatively
+    /// absent. Such a bucket is cleared completely before reported windows are
+    /// applied. The parser withholds both clear flags when any non-null window
+    /// has an unknown duration, and the poller never calls this method for an
+    /// empty snapshot or a failed fetch.
+    pub(crate) fn note_codex_usage(
+        &self,
+        provider: &str,
+        account: &AccountConfig,
+        usage: &UsageSnapshot,
+        clear_five_hour: bool,
+        clear_seven_day: bool,
+    ) {
+        self.note_usage_inner(provider, account, usage, clear_five_hour, clear_seven_day);
+    }
+
+    fn note_usage_inner(
+        &self,
+        provider: &str,
+        account: &AccountConfig,
+        usage: &UsageSnapshot,
+        clear_five_hour: bool,
+        clear_seven_day: bool,
+    ) {
         {
             let mut entries = self.entries.lock().expect("account health lock poisoned");
             let health = entries.entry(account_key(provider, account)).or_default();
@@ -1003,6 +1032,18 @@ impl AccountPool {
             let quota = &mut health.quota;
             let now = unix_now();
             expire_stale_quota(quota, now);
+            if clear_five_hour {
+                quota.utilization_5h = None;
+                quota.reset_5h = None;
+                quota.status_5h = None;
+                quota.observed_at_5h = None;
+            }
+            if clear_seven_day {
+                quota.utilization_7d = None;
+                quota.reset_7d = None;
+                quota.status_7d = None;
+                quota.observed_at_7d = None;
+            }
             if let Some(window) = &usage.five_hour {
                 quota.utilization_5h = Some(window.utilization);
                 quota.reset_5h = preserve_future_reset(quota.reset_5h, window.resets_at, now);
@@ -5481,6 +5522,60 @@ mod tests {
         assert_eq!(quota.utilization_5h, Some(0.1));
         assert_eq!(quota.utilization_7d, Some(0.2));
         assert_eq!(quota.utilization_7d_oi, Some(0.5));
+    }
+
+    #[test]
+    fn claude_usage_omitted_window_preserves_all_prior_bucket_and_aggregate_fields() {
+        let pool = AccountPool::new();
+        let account = account("a");
+        let future = unix_now() + 3_600;
+        pool.note_quota(
+            "anthropic",
+            &account,
+            &quota_headers(&[
+                (
+                    "anthropic-ratelimit-unified-7d-utilization",
+                    "0.6".to_string(),
+                ),
+                ("anthropic-ratelimit-unified-7d-reset", future.to_string()),
+                (QUOTA_STATUS_HEADERS[1], "rejected".to_string()),
+                ("anthropic-ratelimit-unified-status", "rejected".to_string()),
+            ]),
+        );
+        {
+            let mut entries = pool.entries.lock().unwrap();
+            let quota = &mut entries
+                .get_mut(&account_key("anthropic", &account))
+                .unwrap()
+                .quota;
+            quota.observed_at_7d = Some(123);
+            quota.observed_at_status = Some(456);
+        }
+
+        pool.note_usage(
+            "anthropic",
+            &account,
+            &UsageSnapshot {
+                five_hour: Some(UsageWindow {
+                    utilization: 0.2,
+                    resets_at: None,
+                }),
+                seven_day: None,
+                seven_day_oi: None,
+            },
+        );
+
+        let entries = pool.entries.lock().unwrap();
+        let quota = &entries
+            .get(&account_key("anthropic", &account))
+            .unwrap()
+            .quota;
+        assert_eq!(quota.utilization_7d, Some(0.6));
+        assert_eq!(quota.reset_7d, Some(future));
+        assert_eq!(quota.status_7d.as_deref(), Some("rejected"));
+        assert_eq!(quota.observed_at_7d, Some(123));
+        assert_eq!(quota.status.as_deref(), Some("rejected"));
+        assert_eq!(quota.observed_at_status, Some(456));
     }
 
     #[test]
