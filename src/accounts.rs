@@ -118,9 +118,11 @@ impl QuotaState {
     /// Whether any persisted quota field carries a recorded signal. Utilization,
     /// reset metadata, and aggregate or per-window status all affect selection or
     /// diagnostics, so only an entirely default quota is omitted from persistence.
-    /// The `observed_at_*` fields are deliberately not checked here: each is
-    /// always cleared alongside the window or aggregate signal it stamps (see
-    /// `expire_stale_quota`), so it can never be the sole live field.
+    /// The `observed_at_*` fields are deliberately not checked here: normally
+    /// each is cleared alongside the window or aggregate signal it stamps (see
+    /// `expire_stale_quota`). Import can briefly leave a clamped future stamp
+    /// as the sole live field on a signal-free quota; that account is
+    /// intentionally omitted from persistence.
     pub(crate) fn has_signal(&self) -> bool {
         self.utilization_5h.is_some()
             || self.reset_5h.is_some()
@@ -905,23 +907,39 @@ impl AccountPool {
             .collect()
     }
 
-    /// Seed the pool with quotas restored from disk at boot. A restored
+    /// Seed the pool with quotas restored from disk at boot. Returns whether
+    /// any observation timestamp was corrected. A restored
     /// window or aggregate signal with no `observed_at` (a legacy state file
     /// predating this field) is stamped with the boot time rather than left
     /// unstamped: `expire_stale_quota` reads `None` as "never observed," which
     /// for a reset-less mark means "expire immediately" — the opposite of the
     /// intended warm start. Backdating to boot time instead gives a restored
     /// reset-less mark the same one-window-length grace period a freshly
-    /// recorded mark would get.
-    pub(crate) fn import_quotas(&self, quotas: impl IntoIterator<Item = (AccountKey, QuotaState)>) {
+    /// recorded mark would get. Future observation timestamps are clamped to
+    /// boot time, which likewise gives the mark a fresh window-length
+    /// lifetime. This correction runs only at import, so a future timestamp
+    /// created at runtime by a backwards clock remains until the next restart.
+    pub(crate) fn import_quotas(
+        &self,
+        quotas: impl IntoIterator<Item = (AccountKey, QuotaState)>,
+    ) -> bool {
         let mut entries = self.entries.lock().expect("account health lock poisoned");
         let now = unix_now();
+        let mut corrected = false;
         for (key, mut quota) in quotas {
-            stamp_legacy_observation(&mut quota, now);
+            corrected |= stamp_legacy_observation(&mut quota, now);
+            corrected |= clamp_future_observation(&mut quota.observed_at_5h, now);
+            corrected |= clamp_future_observation(&mut quota.observed_at_7d, now);
+            corrected |= clamp_future_observation(&mut quota.observed_at_7d_oi, now);
+            corrected |= clamp_future_observation(&mut quota.observed_at_status, now);
             let health = entries.entry(key).or_default();
             health.observed = true;
             health.quota = quota;
         }
+        // A signal-free quota with a future stamp can set this flag, but
+        // `has_signal` filters that account from export; the dirty flush may
+        // still rewrite the file and any other exported accounts.
+        corrected
     }
 
     fn pool_utilization_for(
@@ -1404,25 +1422,39 @@ fn expire_stale_quota(quota: &mut QuotaState, now: u64) {
 /// [`AccountPool::import_quotas`] for why a missing `observed_at` on a
 /// restored window or aggregate signal is backdated to boot time rather than
 /// left `None`.
-fn stamp_legacy_observation(quota: &mut QuotaState, now: u64) {
+fn stamp_legacy_observation(quota: &mut QuotaState, now: u64) -> bool {
+    let mut corrected = false;
     if (quota.utilization_5h.is_some() || quota.status_5h.is_some())
         && quota.observed_at_5h.is_none()
     {
         quota.observed_at_5h = Some(now);
+        corrected = true;
     }
     if (quota.utilization_7d.is_some() || quota.status_7d.is_some())
         && quota.observed_at_7d.is_none()
     {
         quota.observed_at_7d = Some(now);
+        corrected = true;
     }
     if (quota.utilization_7d_oi.is_some() || quota.status_7d_oi.is_some())
         && quota.observed_at_7d_oi.is_none()
     {
         quota.observed_at_7d_oi = Some(now);
+        corrected = true;
     }
     if quota.status.is_some() && quota.observed_at_status.is_none() {
         quota.observed_at_status = Some(now);
+        corrected = true;
     }
+    corrected
+}
+
+fn clamp_future_observation(observed_at: &mut Option<u64>, now: u64) -> bool {
+    if observed_at.is_some_and(|at| at > now) {
+        *observed_at = Some(now);
+        return true;
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

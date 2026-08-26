@@ -69,12 +69,15 @@ pub async fn restore(state: &AppState) {
     match result {
         Ok(Ok(Some(persisted))) => {
             let count = persisted.accounts.len();
-            state.accounts.import_quotas(
+            let corrected = state.accounts.import_quotas(
                 persisted
                     .accounts
                     .into_iter()
                     .map(|account| (account.key, account.quota)),
             );
+            if corrected {
+                state.accounts.mark_dirty();
+            }
             tracing::info!(
                 path = %path.display(),
                 accounts = count,
@@ -453,27 +456,87 @@ mod tests {
         // `expire_stale_quota` treats that as expired immediately, defeating
         // the warm start this persistence feature exists for.
         let path = temp_file("legacy-reset-less");
+        let legacy_key = crate::accounts::account_key("anthropic", &account("acct-a"));
+        let future_key = crate::accounts::account_key("anthropic", &account("acct-b"));
+        let before = unix_now();
+        let future = before + 86_400;
         let legacy = PersistedPool {
             version: STATE_VERSION,
-            accounts: vec![PersistedAccount {
-                key: crate::accounts::account_key("anthropic", &account("acct-a")),
-                quota: QuotaState {
-                    utilization_7d: Some(0.9),
-                    ..Default::default()
+            accounts: vec![
+                PersistedAccount {
+                    key: legacy_key.clone(),
+                    quota: QuotaState {
+                        utilization_7d: Some(0.9),
+                        ..Default::default()
+                    },
                 },
-            }],
+                PersistedAccount {
+                    key: future_key.clone(),
+                    quota: QuotaState {
+                        utilization_5h: Some(0.1),
+                        utilization_7d: Some(0.2),
+                        utilization_7d_oi: Some(0.3),
+                        status: Some("allowed".to_string()),
+                        observed_at_5h: Some(future),
+                        observed_at_7d: Some(future),
+                        observed_at_7d_oi: Some(future),
+                        observed_at_status: Some(future),
+                        ..Default::default()
+                    },
+                },
+            ],
         };
         save(&path, &legacy).expect("save succeeds");
-        let before = unix_now();
         let state = state_with_path(path.clone());
 
         restore(&state).await;
+        // Flush immediately: snapshot/select_order can expire a reset-less
+        // fixture and erase its observation stamp, causing a spurious failure.
+        flush(&state).await;
 
-        let exported = state.accounts.export_quotas();
-        assert_eq!(exported.len(), 1);
+        let persisted = load(&path)
+            .expect("load succeeds")
+            .expect("corrected state remains loadable");
+        let legacy_quota = &persisted
+            .accounts
+            .iter()
+            .find(|account| account.key == legacy_key)
+            .expect("legacy account persisted")
+            .quota;
+        let migration_time = legacy_quota
+            .observed_at_7d
+            .expect("legacy observation time persisted");
         assert!(
-            exported[0].1.observed_at_7d.is_some_and(|at| at >= before),
+            migration_time >= before && migration_time <= unix_now(),
             "a restored legacy window is backdated to boot time, not left unstamped"
+        );
+        let future_quota = &persisted
+            .accounts
+            .iter()
+            .find(|account| account.key == future_key)
+            .expect("future-stamped account persisted")
+            .quota;
+        for observed_at in [
+            future_quota.observed_at_5h,
+            future_quota.observed_at_7d,
+            future_quota.observed_at_7d_oi,
+            future_quota.observed_at_status,
+        ] {
+            assert_eq!(observed_at, Some(migration_time));
+        }
+
+        let restored_again = state_with_path(path.clone());
+        restore(&restored_again).await;
+        let exported = restored_again.accounts.export_quotas();
+        let legacy_quota = &exported
+            .iter()
+            .find(|(key, _)| key == &legacy_key)
+            .expect("legacy account restored again")
+            .1;
+        assert_eq!(legacy_quota.observed_at_7d, Some(migration_time));
+        assert!(
+            !restored_again.accounts.take_dirty(),
+            "a second restore must keep the original migration time"
         );
         remove_test_dir(&path);
     }
