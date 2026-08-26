@@ -23,6 +23,13 @@
 //! failure. Losing this signal degrades the pool back to header-only
 //! tracking; it must never take a proxied request down with it.
 //!
+//! The parser buckets windows by their reported duration, never by a key's
+//! position. An unrecognized duration is skipped. The upstream policy
+//! currently observed in real accounts can return only a weekly window in
+//! primary_window with secondary_window: null, but that is an observed state
+//! rather than an API contract. If a 5-hour window returns in either key, the
+//! duration-based parser handles it without a code change.
+//!
 //! The endpoint authenticates with the same ChatGPT OAuth bearer and CLI
 //! identity headers as the Responses API's ChatGPT backend, plus the
 //! `chatgpt-account-id` header — see [`fetch_usage`]. Like the Claude usage
@@ -33,7 +40,6 @@ use serde_json::Value;
 
 use crate::accounts::{codex_window_bucket, CodexWindow, UsageSnapshot, UsageWindow};
 use crate::adapters::responses::request::{CODEX_CLIENT_VERSION, CODEX_USER_AGENT};
-use crate::auth::claude::usage::parse_rfc3339_to_epoch_secs;
 
 /// Path appended to a provider's base URL to reach the usage endpoint.
 pub const USAGE_PATH: &str = "/wham/usage";
@@ -74,16 +80,18 @@ pub async fn fetch_usage(
     parse_usage(&value)
 }
 
-/// Parse the wham usage JSON into a [`UsageSnapshot`]. Lenient about the
-/// container and the window key names (private-API schema drift, see the
-/// module doc), but returns `Err` when the response carries no recognizable
-/// window at all rather than silently reporting an all-empty snapshot — that
-/// distinguishes "the account genuinely has no data for this window right
-/// now" (a per-window `None`, still `Ok`) from "this response doesn't look
-/// like a wham/usage payload" (the whole poll should not be trusted). A
-/// window that *is* structurally present but fails to parse (bad percent, for
-/// instance) is skipped on its own and does not fail the response — the
-/// counterpart window can still apply.
+/// Parse the wham usage JSON into a UsageSnapshot. Every non-null value in
+/// primary_window, secondary_window, five_hour_limit, and weekly_limit is
+/// considered independently. A window is bucketed only from its reported
+/// duration, using limit_window_seconds first, then window_minutes, then
+/// limit_window_minutes; an unknown or malformed duration skips that window
+/// without a positional fallback. A returned 5-hour window therefore works in
+/// either key without code changes, while the currently observed upstream
+/// policy may return only a weekly primary window with a null secondary value.
+/// The latter is an observation, not an API contract. A structurally
+/// recognizable response with no usable window still returns an empty snapshot;
+/// a response with no recognized window keys at all returns Err so an
+/// unrelated payload is not trusted.
 fn parse_usage(value: &serde_json::Value) -> anyhow::Result<UsageSnapshot> {
     let container = value
         .get("rate_limit")
@@ -92,38 +100,32 @@ fn parse_usage(value: &serde_json::Value) -> anyhow::Result<UsageSnapshot> {
     if !container.is_object() {
         anyhow::bail!("wham usage response is not a JSON object");
     }
-    let primary = container
-        .get("primary_window")
-        .or_else(|| container.get("five_hour_limit"));
-    let secondary = container
-        .get("secondary_window")
-        .or_else(|| container.get("weekly_limit"));
-    if primary.is_none() && secondary.is_none() {
+    let windows = [
+        container.get("primary_window"),
+        container.get("secondary_window"),
+        container.get("five_hour_limit"),
+        container.get("weekly_limit"),
+    ];
+    if windows.iter().all(Option::is_none) {
         anyhow::bail!("wham usage response carries no recognizable rate-limit window");
     }
 
     let mut five_hour = None;
     let mut seven_day = None;
-    for (window, fallback) in [
-        (primary, CodexWindow::FiveHour),
-        (secondary, CodexWindow::Weekly),
-    ] {
-        let Some(window) = window else { continue };
+    for window in windows.into_iter().flatten() {
+        if window.is_null() {
+            continue;
+        }
+        let Some(bucket) = window_bucket(window) else {
+            continue;
+        };
         let Some(parsed) = parse_window(window) else {
             continue;
         };
-        // `window_minutes`, when present, decides the bucket by duration —
-        // mirrors `note_codex_quota`'s header parser, which does not trust the
-        // primary/secondary position either. Absent or unrecognized, the
-        // window keeps the lane it was found under.
-        let bucket = window
-            .get("window_minutes")
-            .and_then(Value::as_i64)
-            .and_then(codex_window_bucket)
-            .unwrap_or(fallback);
         match bucket {
-            CodexWindow::FiveHour => five_hour = Some(parsed),
-            CodexWindow::Weekly => seven_day = Some(parsed),
+            CodexWindow::FiveHour if five_hour.is_none() => five_hour = Some(parsed),
+            CodexWindow::Weekly if seven_day.is_none() => seven_day = Some(parsed),
+            CodexWindow::FiveHour | CodexWindow::Weekly => {}
         }
     }
 
@@ -138,10 +140,10 @@ fn parse_usage(value: &serde_json::Value) -> anyhow::Result<UsageSnapshot> {
     })
 }
 
-/// Parse one window object: `{ "used_percent": <0-100>, "resets_at": ...,
-/// "window_minutes": ... }`. `None` on any problem with this window alone
-/// (missing/non-finite/out-of-range percent) — the caller skips it and still
-/// applies whatever else the response reported.
+/// Parse one window object: `{ "used_percent": <0-100>, "reset_at": ... }`.
+/// Only an unsigned epoch `reset_at` is accepted. `None` on any problem with
+/// this window alone (missing/non-finite/out-of-range percent) means the caller
+/// skips it and still applies whatever else the response reported.
 fn parse_window(value: &serde_json::Value) -> Option<UsageWindow> {
     let percent = value.get("used_percent").and_then(Value::as_f64)?;
     if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
@@ -149,91 +151,360 @@ fn parse_window(value: &serde_json::Value) -> Option<UsageWindow> {
     }
     Some(UsageWindow {
         utilization: percent / 100.0,
-        resets_at: parse_resets_at(value.get("resets_at")),
+        resets_at: value.get("reset_at").and_then(Value::as_u64),
     })
 }
 
-/// `resets_at` on this endpoint has been observed as either a Unix epoch
-/// integer or an RFC 3339 string; accept both rather than assuming one shape.
-fn parse_resets_at(value: Option<&serde_json::Value>) -> Option<u64> {
-    let value = value?;
-    if let Some(epoch) = value.as_u64() {
-        return Some(epoch);
-    }
-    value.as_str().and_then(parse_rfc3339_to_epoch_secs)
+/// Classify a window from its reported duration. Field presence is strict:
+/// when a higher-priority duration field exists but is malformed, negative, or
+/// outside a known bucket, lower-priority fields are not consulted.
+fn window_bucket(value: &serde_json::Value) -> Option<CodexWindow> {
+    let minutes = if let Some(seconds) = value.get("limit_window_seconds") {
+        let seconds = seconds.as_i64()?;
+        if seconds < 0 {
+            return None;
+        }
+        seconds / 60
+    } else if let Some(minutes) = value.get("window_minutes") {
+        let minutes = minutes.as_i64()?;
+        if minutes < 0 {
+            return None;
+        }
+        minutes
+    } else if let Some(minutes) = value.get("limit_window_minutes") {
+        let minutes = minutes.as_i64()?;
+        if minutes < 0 {
+            return None;
+        }
+        minutes
+    } else {
+        return None;
+    };
+    codex_window_bucket(minutes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Test 32 (parser unit, part 1): `window_minutes` decides the bucket by
-    /// duration even when it disagrees with the key the window was found
-    /// under — mirrors `note_codex_quota`'s header parser, which the wham
-    /// parser must not drift from.
     #[test]
-    fn window_minutes_decides_the_bucket_over_key_position() {
-        // `primary_window` (the 5h lane's key), but `window_minutes` says
-        // weekly — the bucket follows the duration, landing in `seven_day`.
+    fn parses_current_weekly_primary_shape() {
         let value = serde_json::json!({
-            "primary_window": { "used_percent": 40.0, "window_minutes": 10_080 },
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 100,
+                    "limit_window_seconds": 604_800,
+                    "reset_after_seconds": 493_436,
+                    "reset_at": 1_788_142_293u64
+                },
+                "secondary_window": null
+            }
         });
-        let snapshot = parse_usage(&value).expect("recognizable window");
+        let snapshot = parse_usage(&value).expect("live-shaped response is recognizable");
         assert!(snapshot.five_hour.is_none());
-        let seven_day = snapshot.seven_day.expect("window_minutes routed to weekly");
-        assert!((seven_day.utilization - 0.40).abs() < 1e-9);
-    }
-
-    /// Test 32 (parser unit, part 2): a `window_minutes` value that matches
-    /// neither known duration falls back to the key's own lane rather than
-    /// being dropped.
-    #[test]
-    fn unrecognized_window_minutes_falls_back_to_key_lane() {
-        let value = serde_json::json!({
-            "secondary_window": { "used_percent": 12.0, "window_minutes": 42 },
-        });
-        let snapshot = parse_usage(&value).expect("recognizable window");
-        assert!(snapshot.five_hour.is_none());
-        let seven_day = snapshot
+        let weekly = snapshot
             .seven_day
-            .expect("falls back to the secondary lane");
-        assert!((seven_day.utilization - 0.12).abs() < 1e-9);
+            .as_ref()
+            .expect("weekly duration is classified");
+        assert_eq!(weekly.utilization, 1.0);
+        assert_eq!(weekly.resets_at, Some(1_788_142_293));
+        assert!(!snapshot.is_empty());
     }
 
-    /// Test 32 (parser unit, part 3): a percent outside `0..=100` (and a
-    /// non-finite one) is rejected, skipping just that window.
     #[test]
-    fn out_of_range_or_non_finite_percent_is_rejected() {
+    fn skips_window_without_recognized_duration() {
+        let value = serde_json::json!({
+            "primary_window": {
+                "used_percent": 42,
+                "reset_at": 1_788_142_293u64
+            },
+            "secondary_window": null
+        });
+        let snapshot = parse_usage(&value).expect("window keys are recognizable");
+        assert!(snapshot.is_empty());
+    }
+
+    #[test]
+    fn classifies_five_hour_primary_and_weekly_secondary_by_duration() {
+        let value = serde_json::json!({
+            "primary_window": {
+                "used_percent": 20,
+                "limit_window_seconds": 18_000,
+                "reset_at": 1_700_000_001u64
+            },
+            "secondary_window": {
+                "used_percent": 80,
+                "limit_window_seconds": 604_800,
+                "reset_at": 1_700_000_002u64
+            }
+        });
+        let snapshot = parse_usage(&value).expect("both windows are recognizable");
+        assert_eq!(snapshot.five_hour.unwrap().utilization, 0.2);
+        assert_eq!(snapshot.seven_day.unwrap().utilization, 0.8);
+    }
+
+    #[test]
+    fn classifies_weekly_primary_and_five_hour_secondary_by_duration() {
+        let value = serde_json::json!({
+            "primary_window": {
+                "used_percent": 80,
+                "limit_window_seconds": 604_800,
+                "reset_at": 1_700_000_003u64
+            },
+            "secondary_window": {
+                "used_percent": 20,
+                "limit_window_seconds": 18_000,
+                "reset_at": 1_700_000_004u64
+            }
+        });
+        let snapshot = parse_usage(&value).expect("both windows are recognizable");
+        assert_eq!(snapshot.five_hour.unwrap().utilization, 0.2);
+        assert_eq!(snapshot.seven_day.unwrap().utilization, 0.8);
+    }
+
+    #[test]
+    fn accepts_plausible_duration_drift() {
+        let value = serde_json::json!({
+            "primary_window": {
+                "used_percent": 20,
+                "limit_window_seconds": 18_360
+            },
+            "secondary_window": {
+                "used_percent": 80,
+                "limit_window_seconds": 630_000
+            }
+        });
+        let snapshot = parse_usage(&value).expect("drifted durations remain recognizable");
+        assert!(snapshot.five_hour.is_some());
+        assert!(snapshot.seven_day.is_some());
+    }
+
+    #[test]
+    fn duration_field_precedence_is_strict() {
+        let cases = [
+            (
+                serde_json::json!({
+                    "primary_window": {
+                        "used_percent": 10,
+                        "limit_window_seconds": 18_000,
+                        "window_minutes": 10_080,
+                        "limit_window_minutes": 10_080
+                    }
+                }),
+                true,
+                false,
+            ),
+            (
+                serde_json::json!({
+                    "primary_window": {
+                        "used_percent": 10,
+                        "limit_window_seconds": "18_000",
+                        "window_minutes": 300
+                    }
+                }),
+                false,
+                false,
+            ),
+            (
+                serde_json::json!({
+                    "primary_window": {
+                        "used_percent": 10,
+                        "limit_window_seconds": 18_000.5,
+                        "window_minutes": 300
+                    }
+                }),
+                false,
+                false,
+            ),
+            (
+                serde_json::json!({
+                    "primary_window": {
+                        "used_percent": 10,
+                        "limit_window_seconds": -18_000,
+                        "window_minutes": 300
+                    }
+                }),
+                false,
+                false,
+            ),
+            (
+                serde_json::json!({
+                    "primary_window": {
+                        "used_percent": 10,
+                        "limit_window_seconds": 42,
+                        "window_minutes": 300
+                    }
+                }),
+                false,
+                false,
+            ),
+            (
+                serde_json::json!({
+                    "primary_window": {
+                        "used_percent": 10,
+                        "window_minutes": "300",
+                        "limit_window_minutes": 10_080
+                    }
+                }),
+                false,
+                false,
+            ),
+            (
+                serde_json::json!({
+                    "primary_window": {
+                        "used_percent": 10,
+                        "window_minutes": -300,
+                        "limit_window_minutes": 300
+                    }
+                }),
+                false,
+                false,
+            ),
+            (
+                serde_json::json!({
+                    "primary_window": {
+                        "used_percent": 10,
+                        "limit_window_minutes": -300
+                    }
+                }),
+                false,
+                false,
+            ),
+        ];
+
+        for (value, expect_five_hour, expect_weekly) in cases {
+            let snapshot = parse_usage(&value).expect("window key is recognizable");
+            assert_eq!(snapshot.five_hour.is_some(), expect_five_hour);
+            assert_eq!(snapshot.seven_day.is_some(), expect_weekly);
+        }
+    }
+
+    #[test]
+    fn supports_all_duration_field_names() {
+        let cases = [
+            ("limit_window_seconds", serde_json::json!(18_000), true),
+            ("window_minutes", serde_json::json!(10_080), false),
+            ("limit_window_minutes", serde_json::json!(300), true),
+        ];
+        for (field, duration, expect_five_hour) in cases {
+            let mut window = serde_json::Map::new();
+            window.insert("used_percent".to_owned(), serde_json::json!(25));
+            window.insert(field.to_owned(), duration);
+            let value = serde_json::json!({ "primary_window": window });
+            let snapshot = parse_usage(&value).expect("duration field is recognized");
+            assert_eq!(snapshot.five_hour.is_some(), expect_five_hour);
+            assert_eq!(snapshot.seven_day.is_some(), !expect_five_hour);
+        }
+    }
+
+    #[test]
+    fn applies_valid_alias_after_invalid_primary() {
+        let value = serde_json::json!({
+            "primary_window": {
+                "used_percent": 10,
+                "limit_window_seconds": "invalid"
+            },
+            "five_hour_limit": {
+                "used_percent": 60,
+                "window_minutes": 300
+            }
+        });
+        let snapshot = parse_usage(&value).expect("recognized window keys");
+        assert_eq!(snapshot.five_hour.unwrap().utilization, 0.6);
+    }
+
+    #[test]
+    fn retains_first_valid_window_per_bucket() {
+        let value = serde_json::json!({
+            "primary_window": {
+                "used_percent": 10,
+                "window_minutes": 300
+            },
+            "secondary_window": {
+                "used_percent": 90,
+                "window_minutes": 300
+            },
+            "weekly_limit": {
+                "used_percent": 70,
+                "limit_window_minutes": 10_080
+            }
+        });
+        let snapshot = parse_usage(&value).expect("recognized window keys");
+        assert_eq!(snapshot.five_hour.unwrap().utilization, 0.1);
+        assert_eq!(snapshot.seven_day.unwrap().utilization, 0.7);
+    }
+
+    #[test]
+    fn uses_only_unsigned_reset_at_epoch() {
+        let cases = [
+            serde_json::json!({
+                "used_percent": 10,
+                "window_minutes": 300,
+                "resets_at": 1_700_000_000u64
+            }),
+            serde_json::json!({
+                "used_percent": 20,
+                "window_minutes": 300,
+                "resets_at": "2026-07-14T17:30:00Z"
+            }),
+            serde_json::json!({
+                "used_percent": 30,
+                "window_minutes": 300,
+                "reset_at": "1_700_000_000"
+            }),
+            serde_json::json!({
+                "used_percent": 40,
+                "window_minutes": 300,
+                "reset_at": -1
+            }),
+            serde_json::json!({
+                "used_percent": 50,
+                "window_minutes": 300,
+                "reset_after_seconds": 493_436
+            }),
+        ];
+
+        for window in cases {
+            let value = serde_json::json!({ "primary_window": window });
+            let snapshot = parse_usage(&value).expect("window is recognizable");
+            let parsed = snapshot.five_hour.expect("duration and utilization remain");
+            assert!(parsed.resets_at.is_none());
+        }
+    }
+
+    #[test]
+    fn rejects_out_of_range_or_non_finite_percent() {
         for bad in [-1.0, 100.5, f64::NAN, f64::INFINITY] {
             let value = serde_json::json!({
-                "primary_window": { "used_percent": bad },
+                "primary_window": {
+                    "used_percent": bad,
+                    "window_minutes": 300
+                }
             });
-            let snapshot = parse_usage(&value).expect("primary_window key is recognized");
+            let snapshot = parse_usage(&value).expect("primary window key is recognized");
             assert!(
                 snapshot.five_hour.is_none(),
-                "percent {bad} should have been rejected"
+                "percent {bad} should be rejected"
             );
         }
     }
 
-    /// Test 32 (parser unit, part 4): `additional_rate_limits` is ignored —
-    /// present or absent changes nothing about the parsed windows.
     #[test]
-    fn additional_rate_limits_is_ignored() {
+    fn ignores_additional_rate_limits() {
         let value = serde_json::json!({
-            "primary_window": { "used_percent": 5.0 },
+            "primary_window": {
+                "used_percent": 5.0,
+                "window_minutes": 300
+            },
             "additional_rate_limits": [
-                { "kind": "something-shunt-does-not-model", "used_percent": 99.0 }
-            ],
+                { "kind": "unmodeled", "used_percent": 99.0, "window_minutes": 10_080 }
+            ]
         });
         let snapshot = parse_usage(&value).expect("recognizable window");
-        let five_hour = snapshot.five_hour.expect("primary_window present");
-        assert!((five_hour.utilization - 0.05).abs() < 1e-9);
+        assert_eq!(snapshot.five_hour.unwrap().utilization, 0.05);
+        assert!(snapshot.seven_day.is_none());
     }
 
-    /// Test 32 (parser unit, part 5): a response with no recognizable
-    /// container or window at all is "unreadable" — `Err`, not an
-    /// all-`None` `Ok` snapshot.
     #[test]
     fn unrecognizable_response_shape_is_an_error() {
         for value in [
@@ -250,33 +521,24 @@ mod tests {
     }
 
     #[test]
-    fn parses_epoch_and_rfc3339_resets() {
-        let value = serde_json::json!({
-            "primary_window": { "used_percent": 10.0, "resets_at": 1_700_000_000u64 },
-            "secondary_window": {
-                "used_percent": 20.0,
-                "resets_at": "2026-07-14T17:30:00Z"
-            },
-        });
-        let snapshot = parse_usage(&value).expect("recognizable windows");
-        assert_eq!(snapshot.five_hour.unwrap().resets_at, Some(1_700_000_000));
-        assert!(snapshot.seven_day.unwrap().resets_at.is_some());
-    }
-
-    #[test]
     fn tolerates_alternate_field_names() {
-        // `five_hour_limit`/`weekly_limit` instead of
-        // `primary_window`/`secondary_window`, nested under `rate_limits`
-        // (the plural alternate container name).
         let value = serde_json::json!({
             "rate_limits": {
-                "five_hour_limit": { "used_percent": 25.0 },
-                "weekly_limit": { "used_percent": 75.0 },
+                "five_hour_limit": {
+                    "used_percent": 25.0,
+                    "limit_window_minutes": 300,
+                    "reset_at": 1_700_000_005u64
+                },
+                "weekly_limit": {
+                    "used_percent": 75.0,
+                    "limit_window_seconds": 604_800,
+                    "reset_at": 1_700_000_006u64
+                }
             }
         });
         let snapshot = parse_usage(&value).expect("alternate names recognized");
-        assert!((snapshot.five_hour.unwrap().utilization - 0.25).abs() < 1e-9);
-        assert!((snapshot.seven_day.unwrap().utilization - 0.75).abs() < 1e-9);
+        assert_eq!(snapshot.five_hour.unwrap().utilization, 0.25);
+        assert_eq!(snapshot.seven_day.unwrap().utilization, 0.75);
     }
 
     #[tokio::test]
@@ -284,8 +546,6 @@ mod tests {
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        // Split the scheme from the token so the matcher carries no contiguous
-        // `Bearer <token>` literal (a credential-scanner false positive).
         let token = "imported-chatgpt-token";
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -299,12 +559,13 @@ mod tests {
                 "rate_limit": {
                     "primary_window": {
                         "used_percent": 33.0,
-                        "window_minutes": 300,
-                        "resets_at": "2026-07-14T17:30:00+00:00"
+                        "limit_window_seconds": 18_000,
+                        "reset_at": 1_700_000_007u64
                     },
                     "secondary_window": {
                         "used_percent": 88.0,
-                        "window_minutes": 10_080
+                        "limit_window_seconds": 604_800,
+                        "reset_at": 1_700_000_008u64
                     }
                 }
             })))
@@ -316,10 +577,11 @@ mod tests {
             .await
             .expect("usage fetch succeeds");
         let five_hour = snapshot.five_hour.expect("primary_window applied");
-        assert!((five_hour.utilization - 0.33).abs() < 1e-9);
-        assert!(five_hour.resets_at.is_some());
+        assert_eq!(five_hour.utilization, 0.33);
+        assert_eq!(five_hour.resets_at, Some(1_700_000_007));
         let seven_day = snapshot.seven_day.expect("secondary_window applied");
-        assert!((seven_day.utilization - 0.88).abs() < 1e-9);
+        assert_eq!(seven_day.utilization, 0.88);
+        assert_eq!(seven_day.resets_at, Some(1_700_000_008));
         assert!(snapshot.seven_day_oi.is_none());
     }
 
