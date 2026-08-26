@@ -2809,6 +2809,10 @@ impl Config {
         }
         config.backfill_antigravity_cli_migration_auth(&effective_provider_figment);
         let config = config.validate()?;
+        // This diagnostic belongs to the successful load boundary. Runtime
+        // defensive validation and `shunt check` also call `validate`, so
+        // keeping it there would repeat the same warning on every validation.
+        config.warn_reprobe_seconds_below_floor();
         // One aggregated warning per load naming every `Secret` field whose
         // value was written literally in the config file — never the value
         // itself. A `Secret` populated from an env override, a `${...}`
@@ -3001,12 +3005,10 @@ impl Config {
 
     /// Warns once at load when `[server.pool] reprobe_seconds` is a positive
     /// value below the 60-second floor `reprobe_interval` (accounts.rs)
-    /// silently clamps up to. That function is the single read site for
-    /// `reprobe_seconds` and is called on every `select_order` request, so a
-    /// warning there would spam one line per request; surfacing it here
-    /// instead means it fires exactly once, at config load, mirroring how
-    /// `usage_refresh_seconds`'s own clamp is instead surfaced once per boot
-    /// (at poller spawn, since that value has no per-request read site).
+    /// silently clamps up to. The effective interval is read on each HTTP
+    /// pool selection, so a warning there would spam one line per request;
+    /// surfacing it at the successful load boundary means it fires exactly
+    /// once, while repeated runtime validation stays side-effect free.
     fn warn_reprobe_seconds_below_floor(&self) {
         let Some(pool) = &self.server.pool else {
             return;
@@ -3202,7 +3204,6 @@ impl Config {
                 }
             }
         }
-        self.warn_reprobe_seconds_below_floor();
         // Fail closed at boot: [server.status] sources are polled unattended in
         // the background, so a malformed URL or a duplicate provider label
         // would otherwise surface only as a silent, permanently-failing poller

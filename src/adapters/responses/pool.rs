@@ -7,7 +7,7 @@ use std::{path::PathBuf, time::Duration};
 use axum::http::{HeaderValue, StatusCode};
 
 use crate::{
-    accounts::{self, FailoverAction},
+    accounts::{self, FailoverAction, ReprobeReservation},
     adapters::AdapterError,
     auth::{self, codex::auth::CodexAuthStore, resolve_chatgpt_account, Credential},
     config::{AccountConfig, AuthMode},
@@ -29,22 +29,44 @@ fn select_pool_order(
     upstream_model: &str,
     ws_enabled: bool,
 ) -> Vec<usize> {
-    if ws_enabled {
-        state.accounts.select_order_without_reprobe(
-            provider,
-            accounts,
-            session_id,
-            Some(upstream_model),
-            state.config.server.pool.as_ref(),
-        )
-    } else {
-        state.accounts.select_order(
-            provider,
-            accounts,
-            session_id,
-            Some(upstream_model),
-            state.config.server.pool.as_ref(),
-        )
+    debug_assert!(
+        ws_enabled,
+        "non-WebSocket selection uses deferred reservation"
+    );
+    state.accounts.select_order_without_reprobe(
+        provider,
+        accounts,
+        session_id,
+        Some(upstream_model),
+        state.config.server.pool.as_ref(),
+    )
+}
+
+pub(super) fn cancel_reprobe_for_account(
+    reservation: &mut Option<ReprobeReservation>,
+    selected_index: usize,
+) {
+    if reservation
+        .as_ref()
+        .is_some_and(|reservation| reservation.selected_index() == selected_index)
+    {
+        if let Some(reservation) = reservation.as_mut() {
+            reservation.cancel();
+        }
+    }
+}
+
+pub(super) fn commit_reprobe_for_account(
+    reservation: &mut Option<ReprobeReservation>,
+    selected_index: usize,
+) {
+    if reservation
+        .as_ref()
+        .is_some_and(|reservation| reservation.selected_index() == selected_index)
+    {
+        if let Some(reservation) = reservation.as_mut() {
+            reservation.commit();
+        }
     }
 }
 
@@ -92,14 +114,27 @@ pub(super) async fn forward_chatgpt_oauth(
     // Codex has no fable-scoped window, so the model only picks the shared
     // weekly bucket.
     let ws_enabled = state.config.codex_websocket_enabled(&route.provider);
-    let order = select_pool_order(
-        &state,
-        &route.provider,
-        &accounts_config,
-        session_id.as_deref(),
-        &route.upstream_model,
-        ws_enabled,
-    );
+    let (order, mut reprobe_reservation) = if ws_enabled {
+        (
+            select_pool_order(
+                &state,
+                &route.provider,
+                &accounts_config,
+                session_id.as_deref(),
+                &route.upstream_model,
+                true,
+            ),
+            None,
+        )
+    } else {
+        state.accounts.select_order_deferred(
+            &route.provider,
+            &accounts_config,
+            session_id.as_deref(),
+            Some(route.upstream_model.as_str()),
+            state.config.server.pool.as_ref(),
+        )
+    };
     let auth = AuthMode::ChatgptOauth;
     let ramp_initial = state.config.storm_ramp_initial();
     let candidates = order.len();
@@ -132,6 +167,7 @@ pub(super) async fn forward_chatgpt_oauth(
         let Some((admission, credential)) =
             admit_and_resolve(&state, &route, account, ramp_initial, position, candidates).await
         else {
+            cancel_reprobe_for_account(&mut reprobe_reservation, index);
             continue;
         };
 
@@ -207,6 +243,11 @@ pub(super) async fn forward_chatgpt_oauth(
                 }));
             }
         }
+        // Commit at the dispatch boundary, after all admission, credential,
+        // body-preparation, and estimate setup has succeeded. A reservation
+        // that never reaches this call is cancelled instead of consuming the
+        // reprobe interval.
+        commit_reprobe_for_account(&mut reprobe_reservation, index);
         let upstream = match http_send(
             &state,
             &route,
@@ -738,13 +779,12 @@ mod tests {
         b.store_family = Some(StoreFamily::Chatgpt);
         let accounts = vec![a, b];
         let session = "websocket-reprobe-gate";
-        let initial = select_pool_order(
-            &state,
+        let initial = state.accounts.select_order(
             "codex",
             &accounts,
             Some(session),
-            "test-model",
-            false,
+            Some("test-model"),
+            state.config.server.pool.as_ref(),
         );
         let stale = initial[0];
         let other = initial[1];
@@ -783,13 +823,12 @@ mod tests {
             "WebSocket-enabled selection must not consume the shared probe interval"
         );
 
-        let http_order = select_pool_order(
-            &state,
+        let (http_order, mut reservation) = state.accounts.select_order_deferred(
             "codex",
             &accounts,
             Some(session),
-            "test-model",
-            false,
+            Some("test-model"),
+            state.config.server.pool.as_ref(),
         );
         assert_eq!(
             http_order,
@@ -797,12 +836,21 @@ mod tests {
             "HTTP selection must retain stale-account re-probing"
         );
         assert!(
+            reservation.is_some(),
+            "HTTP selection must carry a reservation"
+        );
+        assert_eq!(
             state
                 .accounts
-                .last_probe_at_for_test("codex", &accounts[stale])
-                .is_some(),
-            "HTTP selection must stamp the shared probe interval"
+                .last_probe_at_for_test("codex", &accounts[stale]),
+            None,
+            "HTTP selection must defer the shared probe stamp until dispatch"
         );
+        reservation.as_mut().unwrap().commit();
+        assert!(state
+            .accounts
+            .last_probe_at_for_test("codex", &accounts[stale])
+            .is_some());
     }
 
     #[tokio::test]

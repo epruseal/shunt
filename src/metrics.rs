@@ -287,12 +287,40 @@ pub fn record_pool_rotation(provider: &str, reason: &'static str) {
 /// with WebSocket enabled, outbound Responses selection does not probe, so
 /// this provider-labelled counter records inbound HTTP probes only.
 pub fn record_pool_reprobe(provider: &str) {
+    #[cfg(test)]
+    {
+        *test_pool_reprobe_counts()
+            .lock()
+            .expect("test pool reprobe counter lock poisoned")
+            .entry(provider.to_owned())
+            .or_insert(0) += 1;
+    }
+
     sentry::metrics::counter("shunt.pool.reprobes", 1)
         .attribute("provider", provider.to_owned())
         .capture();
 
     let attributes = [KeyValue::new("provider", provider.to_owned())];
     otel_instruments().pool_reprobes.add(1, &attributes);
+}
+
+/// Test-only observation point for [`record_pool_reprobe`]. The production
+/// sinks are intentionally opaque, so tests use a provider-keyed in-process
+/// counter to assert that dispatch, rather than selection, accounted for the
+/// probe.
+#[cfg(test)]
+pub fn pool_reprobe_count_for_tests(provider: &str) -> u64 {
+    *test_pool_reprobe_counts()
+        .lock()
+        .expect("test pool reprobe counter lock poisoned")
+        .get(provider)
+        .unwrap_or(&0)
+}
+
+#[cfg(test)]
+fn test_pool_reprobe_counts() -> &'static Mutex<HashMap<String, u64>> {
+    static COUNTS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Replace the current `shunt.upstream.status` severity for one provider

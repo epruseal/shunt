@@ -209,7 +209,7 @@ headers = { "x-api-key" = "..." }
 
 正的 `ramp_initial_concurrency` 会在每个账户池上启用**风暴控制(storm control)**:一次故障转移切换之后,在途的并发请求本会全部同时落到刚选中的账户上。开启该门控后,刚开始承接流量的身份(全新、刚从冷却回来,或空闲 60 秒)最多准入所配置数量的并发请求;每次成功响应把额度翻倍(slow start),一次达到故障转移条件的失败会重启该 ramp,被拒绝的请求则顺延到选择顺序中的下一个账户。无论门控如何,最后一个候选始终会被尝试,因此门控只能推迟、而绝不会失败一个未门控的池本会服务的请求。这也意味着,若池中所有账户都解析到同一个上游身份,则该池实际上不受门控:唯一的候选同时也是最后一个候选,因此该设置仅在存在两个及以上不同账户身份时才生效。
 
-`reprobe_seconds` 是为没有带外 usage 轮询器的 Codex/ChatGPT 池准备的安全网:当某个 rotation 代表账户属于 Codex/ChatGPT 家族、处于近配额、不在冷却中,且其最新观测(三个配额窗口与 aggregate status 中的最大值)早于该间隔时,每个间隔内会被提升到选择顺序的最前面一次,这样下一次实际请求就会刷新该账户的配额,避免账户一直被排除到遥远的未来周重置为止。仅 Codex/ChatGPT 账户符合条件 —— Claude 与 Kimi 在遇到通用 429 拒绝时采用更慢的冷却恢复(`PauseSame`,最长 5 分钟),机会性探测在那里有拖慢真实请求的风险,Claude 账户改由上面的 `usage_refresh_seconds` 负责。与带外元数据轮询的 `usage_refresh_seconds` 不同,重新探测每次提升都要花费一次真实上游请求的流量成本。为提供方启用 WebSocket 传输时,outbound Responses 池会抑制重新探测。可选的 inbound Codex HTTP 端点仍会探测,该提供方的 `shunt.pool.reprobes` 只统计 inbound 探测。没有 Codex usage 轮询器时,被排除的 outbound 标记会一直保留到基于观测时间的窗口寿命上限到期。
+`reprobe_seconds` 是为没有带外 usage 轮询器的 Codex/ChatGPT 池准备的安全网:当某个 rotation 代表账户属于 Codex/ChatGPT 家族、处于近配额、不在冷却中,且 5h、共享 7d、Fable 7d_oi 与 aggregate status 四个观测时间戳中的最新值早于该间隔时,每个间隔内会被提升到选择顺序的最前面并预留。admission 或凭据解析失败会取消预留,首次实际 HTTP 发送开始时才提交探测时间并增加 `shunt.pool.reprobes`;这样下一次实际请求就会刷新该账户的配额,避免账户一直被排除到遥远的未来周重置为止。仅 Codex/ChatGPT 账户符合条件。Claude 与 Kimi 在遇到通用 429 拒绝时采用更慢的冷却恢复(`PauseSame`,最长 5 分钟),机会性探测在那里有拖慢真实请求的风险,Claude 账户改由上面的 `usage_refresh_seconds` 负责。与带外元数据轮询的 `usage_refresh_seconds` 不同,重新探测每次提升都要花费一次真实上游请求的流量成本。为提供方启用 WebSocket 传输时,outbound Responses 池不会创建预留并会抑制重新探测。可选的 inbound Codex HTTP 端点仍会探测,该提供方的 `shunt.pool.reprobes` 只统计 inbound 探测。没有 Codex usage 轮询器时,被排除的 outbound 标记会一直保留到基于观测时间的窗口寿命上限到期。
 
 ## `[[upstreams]]`（有序故障转移）
 
