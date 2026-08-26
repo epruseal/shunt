@@ -237,8 +237,10 @@ pub struct PoolConfig {
     /// 900 seconds when `[server.pool]` is configured; `0` disables
     /// re-probing; a positive value below 60 is clamped up to a 60-second
     /// floor. When `[server.pool]` itself is absent, re-probing is disabled
-    /// regardless of this value (pre-#135 behavior). Claude and Kimi accounts
-    /// are never probed (see `reprobe_interval`).
+    /// regardless of this value (pre-#135 behavior). The outbound Responses
+    /// pool also suppresses re-probing for providers with WebSocket enabled;
+    /// inbound HTTP selection continues to probe. Claude and Kimi accounts are
+    /// never probed (see `reprobe_interval`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reprobe_seconds: Option<u64>,
 }
@@ -3010,11 +3012,11 @@ impl Config {
             return;
         };
         if let Some(configured) = pool.reprobe_seconds {
-            if configured > 0 && configured < 60 {
+            if configured > 0 && configured < crate::accounts::REPROBE_FLOOR_SECS {
                 tracing::warn!(
                     configured_seconds = configured,
-                    effective_seconds = 60,
-                    "reprobe_seconds is below the 60s floor; using 60"
+                    effective_seconds = crate::accounts::REPROBE_FLOOR_SECS,
+                    "reprobe_seconds is below the floor; using the floor"
                 );
             }
         }

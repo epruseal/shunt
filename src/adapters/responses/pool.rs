@@ -21,6 +21,33 @@ use super::error::{mapped_upstream_error, own_error, transport_error};
 use super::http::{http_send, json_response, stream_response};
 use super::websocket::forward_websocket;
 
+fn select_pool_order(
+    state: &AppState,
+    provider: &str,
+    accounts: &[AccountConfig],
+    session_id: Option<&str>,
+    upstream_model: &str,
+    ws_enabled: bool,
+) -> Vec<usize> {
+    if ws_enabled {
+        state.accounts.select_order_without_reprobe(
+            provider,
+            accounts,
+            session_id,
+            Some(upstream_model),
+            state.config.server.pool.as_ref(),
+        )
+    } else {
+        state.accounts.select_order(
+            provider,
+            accounts,
+            session_id,
+            Some(upstream_model),
+            state.config.server.pool.as_ref(),
+        )
+    }
+}
+
 /// Drive a Responses turn over the Codex/ChatGPT OAuth account pool (M10),
 /// mirroring the Anthropic adapter's `forward_claude_oauth` as closely as this
 /// adapter's structure allows. Each account in `order` is tried in turn:
@@ -64,14 +91,15 @@ pub(super) async fn forward_chatgpt_oauth(
     // orders by burn-rate headroom, exactly like the Claude pool (issue #195).
     // Codex has no fable-scoped window, so the model only picks the shared
     // weekly bucket.
-    let order = state.accounts.select_order(
+    let ws_enabled = state.config.codex_websocket_enabled(&route.provider);
+    let order = select_pool_order(
+        &state,
         &route.provider,
         &accounts_config,
         session_id.as_deref(),
-        Some(route.upstream_model.as_str()),
-        state.config.server.pool.as_ref(),
+        &route.upstream_model,
+        ws_enabled,
     );
-    let ws_enabled = state.config.codex_websocket_enabled(&route.provider);
     let auth = AuthMode::ChatgptOauth;
     let ramp_initial = state.config.storm_ramp_initial();
     let candidates = order.len();
@@ -684,9 +712,98 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::Config,
+        accounts::{account_key, QuotaState, StoreFamily},
+        config::{Config, PoolConfig},
         routing::{AdapterKind, Route},
     };
+
+    #[test]
+    fn websocket_gate_controls_reprobe_selection_and_stamp() {
+        let mut config = Config::default();
+        config.server.pool = Some(PoolConfig {
+            default_threshold: Some(0.5),
+            reprobe_seconds: Some(60),
+            ..Default::default()
+        });
+        let state = AppState::new(config, reqwest::Client::new()).unwrap();
+        let mut a = AccountConfig {
+            name: "codex-a".to_string(),
+            ..Default::default()
+        };
+        a.store_family = Some(StoreFamily::Chatgpt);
+        let mut b = AccountConfig {
+            name: "codex-b".to_string(),
+            ..Default::default()
+        };
+        b.store_family = Some(StoreFamily::Chatgpt);
+        let accounts = vec![a, b];
+        let session = "websocket-reprobe-gate";
+        let initial = select_pool_order(
+            &state,
+            "codex",
+            &accounts,
+            Some(session),
+            "test-model",
+            false,
+        );
+        let stale = initial[0];
+        let other = initial[1];
+        let observed_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 61;
+        state.accounts.import_quotas([(
+            account_key("codex", &accounts[stale]),
+            QuotaState {
+                utilization_5h: Some(0.9),
+                observed_at_5h: Some(observed_at),
+                ..Default::default()
+            },
+        )]);
+
+        let ws_order = select_pool_order(
+            &state,
+            "codex",
+            &accounts,
+            Some(session),
+            "test-model",
+            true,
+        );
+        assert_eq!(
+            ws_order,
+            vec![other, stale],
+            "WebSocket-enabled selection must not promote a stale account"
+        );
+        assert_eq!(
+            state
+                .accounts
+                .last_probe_at_for_test("codex", &accounts[stale]),
+            None,
+            "WebSocket-enabled selection must not consume the shared probe interval"
+        );
+
+        let http_order = select_pool_order(
+            &state,
+            "codex",
+            &accounts,
+            Some(session),
+            "test-model",
+            false,
+        );
+        assert_eq!(
+            http_order,
+            vec![stale, other],
+            "HTTP selection must retain stale-account re-probing"
+        );
+        assert!(
+            state
+                .accounts
+                .last_probe_at_for_test("codex", &accounts[stale])
+                .is_some(),
+            "HTTP selection must stamp the shared probe interval"
+        );
+    }
 
     #[tokio::test]
     async fn valid_token_resolution_does_not_wait_for_account_refresh_lock() {

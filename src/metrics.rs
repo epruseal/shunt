@@ -159,7 +159,7 @@ fn otel_instruments() -> &'static OtelInstruments {
             pool_reprobes: meter
                 .u64_counter("shunt.pool.reprobes")
                 .with_description(
-                    "Opportunistic re-probes of a stale near-quota Codex/ChatGPT account",
+                    "Opportunistic re-probes of a stale near-quota Codex/ChatGPT account; WebSocket-enabled providers count inbound HTTP probes only",
                 )
                 .build(),
             codex_ws_overflow: meter
@@ -283,7 +283,9 @@ pub fn record_pool_rotation(provider: &str, reason: &'static str) {
 /// account promoted to the front of selection so it takes live traffic and
 /// refreshes its observed quota. Provider-only and account-free, like
 /// [`record_pool_rotation`] — the probe-selection log line carries the
-/// account name for anything that needs finer granularity.
+/// account name for anything that needs finer granularity. For a provider
+/// with WebSocket enabled, outbound Responses selection does not probe, so
+/// this provider-labelled counter records inbound HTTP probes only.
 pub fn record_pool_reprobe(provider: &str) {
     sentry::metrics::counter("shunt.pool.reprobes", 1)
         .attribute("provider", provider.to_owned())
