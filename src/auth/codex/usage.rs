@@ -56,6 +56,21 @@ pub async fn fetch_usage(
     access_token: &str,
     account_id: &str,
 ) -> anyhow::Result<UsageSnapshot> {
+    Ok(
+        fetch_usage_report(client, base_url, access_token, account_id)
+            .await?
+            .usage,
+    )
+}
+
+/// Fetch the wham usage snapshot together with Codex-only authoritative
+/// absence decisions for the account-pool poller.
+pub(crate) async fn fetch_usage_report(
+    client: &reqwest::Client,
+    base_url: &str,
+    access_token: &str,
+    account_id: &str,
+) -> anyhow::Result<WhamUsageReport> {
     let url = format!("{}{USAGE_PATH}", base_url.trim_end_matches('/'));
     let response = client
         .get(&url)
@@ -80,7 +95,19 @@ pub async fn fetch_usage(
     parse_usage(&value)
 }
 
-/// Parse the wham usage JSON into a UsageSnapshot. Every non-null value in
+/// A parsed wham report plus the buckets that the response authoritatively
+/// omitted. Unlike Claude's usage API, wham enumerates the account's 5h/7d
+/// windows, so a missing bucket can clear stale header-derived state. An
+/// unknown-duration window suppresses both clear decisions because its bucket
+/// cannot be inferred safely.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct WhamUsageReport {
+    pub(crate) usage: UsageSnapshot,
+    pub(crate) clear_five_hour: bool,
+    pub(crate) clear_seven_day: bool,
+}
+
+/// Parse the wham usage JSON into a [`WhamUsageReport`]. Every non-null value in
 /// primary_window, secondary_window, five_hour_limit, and weekly_limit is
 /// considered independently. A window is bucketed only from its reported
 /// duration, using limit_window_seconds first, then window_minutes, then
@@ -92,7 +119,7 @@ pub async fn fetch_usage(
 /// recognizable response with no usable window still returns an empty snapshot;
 /// a response with no recognized window keys at all returns Err so an
 /// unrelated payload is not trusted.
-fn parse_usage(value: &serde_json::Value) -> anyhow::Result<UsageSnapshot> {
+fn parse_usage(value: &serde_json::Value) -> anyhow::Result<WhamUsageReport> {
     let container = value
         .get("rate_limit")
         .or_else(|| value.get("rate_limits"))
@@ -112,13 +139,21 @@ fn parse_usage(value: &serde_json::Value) -> anyhow::Result<UsageSnapshot> {
 
     let mut five_hour = None;
     let mut seven_day = None;
+    let mut has_five_hour_candidate = false;
+    let mut has_seven_day_candidate = false;
+    let mut has_unknown_duration_candidate = false;
     for window in windows.into_iter().flatten() {
         if window.is_null() {
             continue;
         }
         let Some(bucket) = window_bucket(window) else {
+            has_unknown_duration_candidate = true;
             continue;
         };
+        match bucket {
+            CodexWindow::FiveHour => has_five_hour_candidate = true,
+            CodexWindow::Weekly => has_seven_day_candidate = true,
+        }
         let Some(parsed) = parse_window(window) else {
             continue;
         };
@@ -133,12 +168,15 @@ fn parse_usage(value: &serde_json::Value) -> anyhow::Result<UsageSnapshot> {
 
     // The Fable-scoped weekly bucket (`7d_oi`) has no wham/usage equivalent:
     // that limit is an Anthropic/Claude concept the ChatGPT backend does not
-    // report. Always `None` here, same as every other window this snapshot's
-    // consumer (`AccountPool::note_usage`) leaves untouched when omitted.
-    Ok(UsageSnapshot {
-        five_hour,
-        seven_day,
-        seven_day_oi: None,
+    // report. Always `None` here; the Codex-only consumer never clears it.
+    Ok(WhamUsageReport {
+        usage: UsageSnapshot {
+            five_hour,
+            seven_day,
+            seven_day_oi: None,
+        },
+        clear_five_hour: !has_unknown_duration_candidate && !has_five_hour_candidate,
+        clear_seven_day: !has_unknown_duration_candidate && !has_seven_day_candidate,
     })
 }
 
@@ -202,7 +240,9 @@ mod tests {
                 "secondary_window": null
             }
         });
-        let snapshot = parse_usage(&value).expect("live-shaped response is recognizable");
+        let snapshot = parse_usage(&value)
+            .expect("live-shaped response is recognizable")
+            .usage;
         assert!(snapshot.five_hour.is_none());
         let weekly = snapshot
             .seven_day
@@ -222,7 +262,9 @@ mod tests {
             },
             "secondary_window": null
         });
-        let snapshot = parse_usage(&value).expect("window keys are recognizable");
+        let snapshot = parse_usage(&value)
+            .expect("window keys are recognizable")
+            .usage;
         assert!(snapshot.is_empty());
     }
 
@@ -240,7 +282,9 @@ mod tests {
                 "reset_at": 1_700_000_002u64
             }
         });
-        let snapshot = parse_usage(&value).expect("both windows are recognizable");
+        let snapshot = parse_usage(&value)
+            .expect("both windows are recognizable")
+            .usage;
         assert_eq!(snapshot.five_hour.unwrap().utilization, 0.2);
         assert_eq!(snapshot.seven_day.unwrap().utilization, 0.8);
     }
@@ -259,7 +303,9 @@ mod tests {
                 "reset_at": 1_700_000_004u64
             }
         });
-        let snapshot = parse_usage(&value).expect("both windows are recognizable");
+        let snapshot = parse_usage(&value)
+            .expect("both windows are recognizable")
+            .usage;
         assert_eq!(snapshot.five_hour.unwrap().utilization, 0.2);
         assert_eq!(snapshot.seven_day.unwrap().utilization, 0.8);
     }
@@ -276,7 +322,9 @@ mod tests {
                 "limit_window_seconds": 630_000
             }
         });
-        let snapshot = parse_usage(&value).expect("drifted durations remain recognizable");
+        let snapshot = parse_usage(&value)
+            .expect("drifted durations remain recognizable")
+            .usage;
         assert!(snapshot.five_hour.is_some());
         assert!(snapshot.seven_day.is_some());
     }
@@ -375,7 +423,9 @@ mod tests {
         ];
 
         for (value, expect_five_hour, expect_weekly) in cases {
-            let snapshot = parse_usage(&value).expect("window key is recognizable");
+            let snapshot = parse_usage(&value)
+                .expect("window key is recognizable")
+                .usage;
             assert_eq!(snapshot.five_hour.is_some(), expect_five_hour);
             assert_eq!(snapshot.seven_day.is_some(), expect_weekly);
         }
@@ -393,7 +443,9 @@ mod tests {
             window.insert("used_percent".to_owned(), serde_json::json!(25));
             window.insert(field.to_owned(), duration);
             let value = serde_json::json!({ "primary_window": window });
-            let snapshot = parse_usage(&value).expect("duration field is recognized");
+            let snapshot = parse_usage(&value)
+                .expect("duration field is recognized")
+                .usage;
             assert_eq!(snapshot.five_hour.is_some(), expect_five_hour);
             assert_eq!(snapshot.seven_day.is_some(), !expect_five_hour);
         }
@@ -411,7 +463,7 @@ mod tests {
                 "window_minutes": 300
             }
         });
-        let snapshot = parse_usage(&value).expect("recognized window keys");
+        let snapshot = parse_usage(&value).expect("recognized window keys").usage;
         assert_eq!(snapshot.five_hour.unwrap().utilization, 0.6);
     }
 
@@ -431,7 +483,7 @@ mod tests {
                 "limit_window_minutes": 10_080
             }
         });
-        let snapshot = parse_usage(&value).expect("recognized window keys");
+        let snapshot = parse_usage(&value).expect("recognized window keys").usage;
         assert_eq!(snapshot.five_hour.unwrap().utilization, 0.1);
         assert_eq!(snapshot.seven_day.unwrap().utilization, 0.7);
     }
@@ -468,7 +520,7 @@ mod tests {
 
         for window in cases {
             let value = serde_json::json!({ "primary_window": window });
-            let snapshot = parse_usage(&value).expect("window is recognizable");
+            let snapshot = parse_usage(&value).expect("window is recognizable").usage;
             let parsed = snapshot.five_hour.expect("duration and utilization remain");
             assert!(parsed.resets_at.is_none());
         }
@@ -483,7 +535,9 @@ mod tests {
                     "window_minutes": 300
                 }
             });
-            let snapshot = parse_usage(&value).expect("primary window key is recognized");
+            let snapshot = parse_usage(&value)
+                .expect("primary window key is recognized")
+                .usage;
             assert!(
                 snapshot.five_hour.is_none(),
                 "percent {bad} should be rejected"
@@ -502,7 +556,7 @@ mod tests {
                 { "kind": "unmodeled", "used_percent": 99.0, "window_minutes": 10_080 }
             ]
         });
-        let snapshot = parse_usage(&value).expect("recognizable window");
+        let snapshot = parse_usage(&value).expect("recognizable window").usage;
         assert_eq!(snapshot.five_hour.unwrap().utilization, 0.05);
         assert!(snapshot.seven_day.is_none());
     }
@@ -538,7 +592,9 @@ mod tests {
                 }
             }
         });
-        let snapshot = parse_usage(&value).expect("alternate names recognized");
+        let snapshot = parse_usage(&value)
+            .expect("alternate names recognized")
+            .usage;
         assert_eq!(snapshot.five_hour.unwrap().utilization, 0.25);
         assert_eq!(snapshot.seven_day.unwrap().utilization, 0.75);
     }

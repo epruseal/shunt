@@ -6,7 +6,8 @@
 //! `GET /api/oauth/usage` across all `claude_oauth` providers, and the private
 //! `GET /wham/usage` (see [`crate::auth::codex::usage`]) across all ChatGPT
 //! backend `chatgpt_oauth` providers — applying the returned utilization to the
-//! account pool via [`AccountPool::note_usage`].
+//! account pool via [`AccountPool::note_usage`] for Claude and the Codex-only
+//! [`AccountPool::note_codex_usage`] reconciliation path for wham.
 //!
 //! Why: the pool's primary quota signal is the response headers on proxied
 //! traffic (`anthropic-ratelimit-unified-*` for Claude, `x-codex-*` for Codex),
@@ -265,19 +266,25 @@ async fn poll_codex_account(
     else {
         return false;
     };
-    match codex::usage::fetch_usage(client, base_url, &access_token, &account_id).await {
-        Ok(snapshot) => {
+    match codex::usage::fetch_usage_report(client, base_url, &access_token, &account_id).await {
+        Ok(report) => {
             // A recognizable-but-empty response (e.g. `{"primary_window":{}}`
             // for a brand-new account with no consumption yet) parses as `Ok`
             // with every window `None` -- see the parser's own doc comment.
             // Applying that to the pool would mark the account observed and
             // let `poll_all`'s physical-account dedup skip every other alias,
             // permanently starving this account of a real observation.
-            if snapshot.is_empty() {
+            if report.usage.is_empty() {
                 tracing::debug!(provider, account = %account.name, "usage poller: codex wham usage snapshot reported no windows, skipping");
                 return false;
             }
-            pool.note_usage(provider, account, &snapshot);
+            pool.note_codex_usage(
+                provider,
+                account,
+                &report.usage,
+                report.clear_five_hour,
+                report.clear_seven_day,
+            );
             tracing::debug!(provider, account = %account.name, "usage poller: applied codex wham usage snapshot");
             true
         }
@@ -911,6 +918,50 @@ mod tests {
         config
     }
 
+    fn seed_full_codex_quota(pool: &AccountPool, account: &AccountConfig) {
+        use reqwest::header::{HeaderMap, HeaderValue};
+
+        let future = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 7_200;
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            (
+                "anthropic-ratelimit-unified-5h-utilization",
+                "0.11".to_string(),
+            ),
+            ("anthropic-ratelimit-unified-5h-reset", future.to_string()),
+            (
+                "anthropic-ratelimit-unified-5h-status",
+                "rejected".to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-7d-utilization",
+                "0.22".to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-7d-reset",
+                (future + 3_600).to_string(),
+            ),
+            (
+                "anthropic-ratelimit-unified-7d-status",
+                "allowed".to_string(),
+            ),
+            ("anthropic-ratelimit-unified-status", "rejected".to_string()),
+        ] {
+            headers.insert(name, HeaderValue::from_str(&value).unwrap());
+        }
+        pool.note_quota("codex", account, &headers);
+    }
+
+    fn only_exported_quota(pool: &AccountPool) -> crate::accounts::QuotaState {
+        let quotas = pool.export_quotas();
+        assert_eq!(quotas.len(), 1, "test pool must carry one quota entry");
+        quotas.into_iter().next().unwrap().1
+    }
+
     /// Test 24: a live-shaped weekly-only `wham/usage` response applies the
     /// reported weekly window, leaves the absent five-hour window absent, and
     /// sends the ChatGPT bearer plus the CLI identity headers.
@@ -954,6 +1005,8 @@ mod tests {
             .await;
 
         let pool = AccountPool::new();
+        seed_full_codex_quota(&pool, &account);
+        let before = only_exported_quota(&pool);
         let config = codex_backend_config(&server.uri(), account.clone());
         let applied = poll_codex_account(
             &reqwest::Client::new(),
@@ -970,6 +1023,100 @@ mod tests {
         assert!(snap[0].has_state);
         assert_eq!(snap[0].utilization_5h, None);
         assert_eq!(snap[0].utilization_7d, Some(0.18));
+
+        let quota = only_exported_quota(&pool);
+        assert_eq!(quota.utilization_5h, None);
+        assert_eq!(quota.reset_5h, None);
+        assert_eq!(quota.status_5h, None);
+        assert_eq!(quota.observed_at_5h, None);
+        assert_eq!(quota.status_7d.as_deref(), Some("allowed"));
+        assert_eq!(quota.status, before.status);
+        assert_eq!(quota.observed_at_status, before.observed_at_status);
+
+        let recovery_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/wham/usage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "primary_window": {
+                    "used_percent": 35.0,
+                    "limit_window_seconds": 18_000
+                },
+                "secondary_window": {
+                    "used_percent": 18.0,
+                    "limit_window_seconds": 604_800
+                }
+            })))
+            .expect(1)
+            .mount(&recovery_server)
+            .await;
+        let recovery_config = codex_backend_config(&recovery_server.uri(), account.clone());
+        assert!(
+            poll_codex_account(
+                &reqwest::Client::new(),
+                &pool,
+                &recovery_config,
+                "codex",
+                &recovery_server.uri(),
+                &account,
+            )
+            .await
+        );
+        let recovered = pool.snapshot("codex", std::slice::from_ref(&account), None, None);
+        assert_eq!(recovered[0].utilization_5h, Some(0.35));
+
+        let _ = std::fs::remove_file(creds);
+    }
+
+    #[tokio::test]
+    async fn codex_poll_clears_authoritatively_absent_weekly_window() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let access_token = chatgpt_access_token("acct-five-only");
+        let creds = write_temp(
+            "codex-five-only",
+            &codex_credential_json(&access_token, Some("refresh"), "acct-five-only"),
+        );
+        let account = codex_account_with_credentials(&creds);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/wham/usage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "primary_window": {
+                    "used_percent": 42.0,
+                    "limit_window_seconds": 18_000
+                },
+                "secondary_window": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let pool = AccountPool::new();
+        seed_full_codex_quota(&pool, &account);
+        let before = only_exported_quota(&pool);
+        let config = codex_backend_config(&server.uri(), account.clone());
+        assert!(
+            poll_codex_account(
+                &reqwest::Client::new(),
+                &pool,
+                &config,
+                "codex",
+                &server.uri(),
+                &account,
+            )
+            .await
+        );
+
+        let quota = only_exported_quota(&pool);
+        assert_eq!(quota.utilization_5h, Some(0.42));
+        assert_eq!(quota.status_5h.as_deref(), Some("rejected"));
+        assert_eq!(quota.utilization_7d, None);
+        assert_eq!(quota.reset_7d, None);
+        assert_eq!(quota.status_7d, None);
+        assert_eq!(quota.observed_at_7d, None);
+        assert_eq!(quota.status, before.status);
+        assert_eq!(quota.observed_at_status, before.observed_at_status);
 
         let _ = std::fs::remove_file(creds);
     }
@@ -1009,6 +1156,8 @@ mod tests {
             .await;
 
         let pool = AccountPool::new();
+        seed_full_codex_quota(&pool, &account);
+        let before = only_exported_quota(&pool);
         let config = codex_backend_config(&server.uri(), account.clone());
         let applied = poll_codex_account(
             &reqwest::Client::new(),
@@ -1025,6 +1174,67 @@ mod tests {
         assert!(snap[0].has_state);
         assert_eq!(snap[0].utilization_5h, Some(0.22));
         assert_eq!(snap[0].utilization_7d, Some(0.91));
+        let quota = only_exported_quota(&pool);
+        assert_eq!(quota.reset_5h, before.reset_5h);
+        assert_eq!(quota.reset_7d, before.reset_7d);
+        assert_eq!(quota.status_5h, before.status_5h);
+        assert_eq!(quota.status_7d, before.status_7d);
+        assert_eq!(quota.status, before.status);
+        assert_eq!(quota.observed_at_status, before.observed_at_status);
+
+        let _ = std::fs::remove_file(creds);
+    }
+
+    #[tokio::test]
+    async fn unknown_duration_candidate_suppresses_authoritative_clearing() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let access_token = chatgpt_access_token("acct-unknown-duration");
+        let creds = write_temp(
+            "codex-unknown-duration",
+            &codex_credential_json(&access_token, Some("refresh"), "acct-unknown-duration"),
+        );
+        let account = codex_account_with_credentials(&creds);
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/wham/usage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "primary_window": {
+                    "used_percent": 44.0,
+                    "limit_window_seconds": 604_800
+                },
+                "secondary_window": {
+                    "used_percent": 55.0,
+                    "limit_window_seconds": 42
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let pool = AccountPool::new();
+        seed_full_codex_quota(&pool, &account);
+        let before = only_exported_quota(&pool);
+        let config = codex_backend_config(&server.uri(), account.clone());
+        assert!(
+            poll_codex_account(
+                &reqwest::Client::new(),
+                &pool,
+                &config,
+                "codex",
+                &server.uri(),
+                &account,
+            )
+            .await
+        );
+
+        let quota = only_exported_quota(&pool);
+        assert_eq!(quota.utilization_5h, before.utilization_5h);
+        assert_eq!(quota.reset_5h, before.reset_5h);
+        assert_eq!(quota.status_5h, before.status_5h);
+        assert_eq!(quota.observed_at_5h, before.observed_at_5h);
+        assert_eq!(quota.utilization_7d, Some(0.44));
 
         let _ = std::fs::remove_file(creds);
     }
@@ -1293,11 +1503,71 @@ mod tests {
         let _ = std::fs::remove_file(creds);
     }
 
+    #[tokio::test]
+    async fn codex_failed_or_empty_poll_preserves_existing_quota() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let access_token = chatgpt_access_token("acct-no-change");
+        let creds = write_temp(
+            "codex-no-change",
+            &codex_credential_json(&access_token, Some("refresh"), "acct-no-change"),
+        );
+        let account = codex_account_with_credentials(&creds);
+        let pool = AccountPool::new();
+        seed_full_codex_quota(&pool, &account);
+        let before = only_exported_quota(&pool);
+
+        let failure_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("temporary failure"))
+            .expect(1)
+            .mount(&failure_server)
+            .await;
+        let failure_config = codex_backend_config(&failure_server.uri(), account.clone());
+        assert!(
+            !poll_codex_account(
+                &reqwest::Client::new(),
+                &pool,
+                &failure_config,
+                "codex",
+                &failure_server.uri(),
+                &account,
+            )
+            .await
+        );
+        assert_eq!(only_exported_quota(&pool), before);
+
+        let empty_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "primary_window": {} })),
+            )
+            .expect(1)
+            .mount(&empty_server)
+            .await;
+        let empty_config = codex_backend_config(&empty_server.uri(), account.clone());
+        assert!(
+            !poll_codex_account(
+                &reqwest::Client::new(),
+                &pool,
+                &empty_config,
+                "codex",
+                &empty_server.uri(),
+                &account,
+            )
+            .await
+        );
+        assert_eq!(only_exported_quota(&pool), before);
+
+        let _ = std::fs::remove_file(creds);
+    }
+
     /// X1/N5 boundary: a response where one window parses and the other is
     /// structurally malformed is *not* empty — it must still apply and
-    /// report `true`. This is the boundary the whole is_empty() guard rests
-    /// on: it must trigger only when *every* window is `None`, never when
-    /// just one is.
+    /// report `true`. A classified weekly candidate whose value is malformed
+    /// is unknown, not absent, so its prior state must survive as well.
     #[tokio::test]
     async fn codex_poll_applies_partial_snapshot_when_one_window_is_malformed() {
         use wiremock::matchers::method;
@@ -1327,6 +1597,8 @@ mod tests {
             .mount(&server)
             .await;
         let pool = AccountPool::new();
+        seed_full_codex_quota(&pool, &account);
+        let before = only_exported_quota(&pool);
         let config = codex_backend_config(&server.uri(), account.clone());
         let applied = poll_codex_account(
             &reqwest::Client::new(),
@@ -1344,7 +1616,11 @@ mod tests {
         let snap = pool.snapshot("codex", std::slice::from_ref(&account), None, None);
         assert!(snap[0].has_state);
         assert_eq!(snap[0].utilization_5h, Some(0.12));
-        assert_eq!(snap[0].utilization_7d, None);
+        assert_eq!(snap[0].utilization_7d, before.utilization_7d);
+        let quota = only_exported_quota(&pool);
+        assert_eq!(quota.reset_7d, before.reset_7d);
+        assert_eq!(quota.status_7d, before.status_7d);
+        assert_eq!(quota.observed_at_7d, before.observed_at_7d);
 
         let _ = std::fs::remove_file(creds);
     }
