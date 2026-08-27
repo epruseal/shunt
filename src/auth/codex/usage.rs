@@ -227,14 +227,12 @@ fn window_bucket(value: &serde_json::Value) -> Option<CodexWindow> {
             return None;
         }
         minutes
-    } else if let Some(minutes) = value.get("limit_window_minutes") {
-        let minutes = minutes.as_i64()?;
+    } else {
+        let minutes = value.get("limit_window_minutes")?.as_i64()?;
         if minutes < 0 {
             return None;
         }
         minutes
-    } else {
-        return None;
     };
     codex_window_bucket(minutes)
 }
