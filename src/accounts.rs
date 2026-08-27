@@ -1001,11 +1001,13 @@ impl AccountPool {
 
     /// Apply one successfully parsed, non-empty Codex `wham/usage` report.
     /// Unlike Claude's partial usage response, wham enumerates the account's
-    /// 5h/7d windows, so the Codex parser can mark a bucket as authoritatively
-    /// absent. Such a bucket is cleared completely before reported windows are
-    /// applied. The parser withholds both clear flags when any non-null window
-    /// has an unknown duration, and the poller never calls this method for an
-    /// empty snapshot or a failed fetch.
+    /// 5h/7d windows, so the Codex parser can mark a bucket's utilization as
+    /// authoritatively absent. Such a bucket's utilization and observation
+    /// timestamp are cleared before reported windows are applied; reset and
+    /// status metadata remain owned by response headers. The parser withholds
+    /// both clear flags when any non-null window has an unknown duration, and
+    /// the poller never calls this method for an empty snapshot or a failed
+    /// fetch.
     pub(crate) fn note_codex_usage(
         &self,
         provider: &str,
@@ -1014,7 +1016,44 @@ impl AccountPool {
         clear_five_hour: bool,
         clear_seven_day: bool,
     ) {
-        self.note_usage_inner(provider, account, usage, clear_five_hour, clear_seven_day);
+        {
+            let mut entries = self.entries.lock().expect("account health lock poisoned");
+            let health = entries.entry(account_key(provider, account)).or_default();
+            health.observed = true;
+            let now = unix_now();
+            {
+                let quota = &mut health.quota;
+                // wham/usage reports only reconcile Codex utilization. Keep
+                // reset and status metadata header-derived, including when a
+                // recognized window is absent from the report. This also
+                // prevents a stale signal in one bucket from expiring or
+                // rewriting unrelated fields during another bucket's poll.
+                if clear_five_hour {
+                    quota.utilization_5h = None;
+                    quota.observed_at_5h = None;
+                }
+                if clear_seven_day {
+                    quota.utilization_7d = None;
+                    quota.observed_at_7d = None;
+                }
+                if let Some(window) = &usage.five_hour {
+                    quota.utilization_5h = Some(window.utilization);
+                    quota.observed_at_5h = Some(now);
+                }
+                if let Some(window) = &usage.seven_day {
+                    quota.utilization_7d = Some(window.utilization);
+                    quota.observed_at_7d = Some(now);
+                }
+            }
+
+            // Usage polling must not let the metric sweep mutate any other
+            // QuotaState field. The read-only helper expires cloned quotas so
+            // stale values do not feed the aggregate metric while the live
+            // header-derived state remains intact for the next normal sweep.
+            let utilization = self.pool_utilization_for_readonly(provider, &entries, now);
+            record_pool_utilization(provider, utilization);
+        }
+        self.mark_dirty();
     }
 
     fn note_usage_inner(
@@ -1476,6 +1515,44 @@ impl AccountPool {
             }
         }
         (minimums, quota_expired)
+    }
+
+    fn pool_utilization_for_readonly(
+        &self,
+        upstream: &str,
+        entries: &HashMap<AccountKey, AccountHealth>,
+        now: u64,
+    ) -> [Option<f64>; 3] {
+        let memberships = self
+            .memberships
+            .lock()
+            .expect("account membership lock poisoned");
+        let Some(members) = memberships.get(upstream) else {
+            return [None; 3];
+        };
+        let mut minimums = [None::<f64>; 3];
+        for (key, enabled) in members {
+            if !enabled {
+                continue;
+            }
+            let Some(health) = entries.get(key) else {
+                continue;
+            };
+            let mut quota = health.quota.clone();
+            expire_stale_quota(&mut quota, now);
+            for (minimum, value) in minimums.iter_mut().zip([
+                quota.utilization_5h,
+                quota.utilization_7d,
+                quota.utilization_7d_oi,
+            ]) {
+                let Some(value) = value.filter(|value| value.is_finite()) else {
+                    continue;
+                };
+                let value = value.clamp(0.0, 1.0);
+                *minimum = Some(minimum.map_or(value, |current| current.min(value)));
+            }
+        }
+        minimums
     }
 
     fn cancel_reprobe_token(&self, key: &AccountKey, token: u64) {
@@ -5542,14 +5619,15 @@ mod tests {
                 ("anthropic-ratelimit-unified-status", "rejected".to_string()),
             ]),
         );
+        let observed_at = unix_now();
         {
             let mut entries = pool.entries.lock().unwrap();
             let quota = &mut entries
                 .get_mut(&account_key("anthropic", &account))
                 .unwrap()
                 .quota;
-            quota.observed_at_7d = Some(123);
-            quota.observed_at_status = Some(456);
+            quota.observed_at_7d = Some(observed_at);
+            quota.observed_at_status = Some(observed_at);
         }
 
         pool.note_usage(
@@ -5573,9 +5651,9 @@ mod tests {
         assert_eq!(quota.utilization_7d, Some(0.6));
         assert_eq!(quota.reset_7d, Some(future));
         assert_eq!(quota.status_7d.as_deref(), Some("rejected"));
-        assert_eq!(quota.observed_at_7d, Some(123));
+        assert_eq!(quota.observed_at_7d, Some(observed_at));
         assert_eq!(quota.status.as_deref(), Some("rejected"));
-        assert_eq!(quota.observed_at_status, Some(456));
+        assert_eq!(quota.observed_at_status, Some(observed_at));
     }
 
     #[test]
@@ -5649,6 +5727,103 @@ mod tests {
         assert!(quota
             .observed_at_5h
             .is_some_and(|at| at >= status_observed_at));
+    }
+
+    #[test]
+    fn codex_usage_only_reconciles_utilization_and_observation_fields() {
+        let pool = AccountPool::new();
+        let provider = "codex-usage-field-preservation";
+        let target = account("codex-target");
+        let sibling = account("codex-sibling");
+        pool.sync_enabled_accounts(provider, &[target.clone(), sibling.clone()]);
+
+        let now = unix_now();
+        let future = now + 3_600;
+        let target_quota = QuotaState {
+            utilization_5h: Some(0.11),
+            reset_5h: Some(future),
+            utilization_7d: Some(0.22),
+            reset_7d: Some(future + 3_600),
+            utilization_7d_oi: Some(0.33),
+            reset_7d_oi: Some(future + 7_200),
+            status: Some("aggregate".to_string()),
+            status_5h: Some("rejected".to_string()),
+            status_7d: Some("allowed".to_string()),
+            status_7d_oi: Some("rejected".to_string()),
+            observed_at_5h: Some(now),
+            observed_at_7d: Some(now),
+            observed_at_7d_oi: Some(now),
+            observed_at_status_5h: Some(now),
+            observed_at_status_7d: Some(now),
+            observed_at_status_7d_oi: Some(now),
+            reset_at_status_5h: Some(future),
+            reset_at_status_7d: Some(future + 3_600),
+            reset_at_status_7d_oi: Some(future + 7_200),
+            observed_at_status: Some(now),
+        };
+        let sibling_quota = QuotaState {
+            utilization_5h: Some(0.44),
+            reset_5h: Some(now.saturating_sub(1)),
+            status_5h: Some("stale".to_string()),
+            observed_at_5h: Some(now.saturating_sub(WINDOW_5H_SECS)),
+            observed_at_status_5h: Some(now.saturating_sub(WINDOW_5H_SECS)),
+            reset_at_status_5h: Some(now.saturating_sub(1)),
+            status: Some("stale-aggregate".to_string()),
+            observed_at_status: Some(now),
+            ..Default::default()
+        };
+        {
+            let mut entries = pool.entries.lock().unwrap();
+            let target_health = entries.entry(account_key(provider, &target)).or_default();
+            target_health.observed = true;
+            target_health.quota = target_quota.clone();
+            let sibling_health = entries.entry(account_key(provider, &sibling)).or_default();
+            sibling_health.observed = true;
+            sibling_health.quota = sibling_quota.clone();
+        }
+
+        pool.note_codex_usage(
+            provider,
+            &target,
+            &UsageSnapshot {
+                five_hour: Some(UsageWindow {
+                    utilization: 0.44,
+                    resets_at: Some(future + 9_000),
+                }),
+                seven_day: None,
+                seven_day_oi: None,
+            },
+            false,
+            true,
+        );
+
+        let target_after = pool
+            .raw_quota_for_test(&account_key(provider, &target))
+            .unwrap()
+            .1;
+        let sibling_after = pool
+            .raw_quota_for_test(&account_key(provider, &sibling))
+            .unwrap()
+            .1;
+        let mut expected_target = target_quota;
+        expected_target.utilization_5h = Some(0.44);
+        expected_target.observed_at_5h = target_after.observed_at_5h;
+        expected_target.utilization_7d = None;
+        expected_target.observed_at_7d = None;
+        assert_eq!(target_after, expected_target);
+        assert_eq!(sibling_after, sibling_quota);
+        assert_eq!(
+            crate::metrics::pool_utilization_value_for_tests(provider, "5h"),
+            Some(0.44)
+        );
+        assert_eq!(
+            crate::metrics::pool_utilization_value_for_tests(provider, "7d"),
+            None
+        );
+        assert_eq!(
+            crate::metrics::pool_utilization_value_for_tests(provider, "7d_oi"),
+            Some(0.33)
+        );
     }
 
     #[test]

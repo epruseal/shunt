@@ -99,9 +99,10 @@ pub(crate) async fn fetch_usage_report(
     parse_usage(&value)
 }
 
-/// A parsed wham report plus the buckets that the response authoritatively
-/// omitted. Unlike Claude's usage API, wham enumerates the account's 5h/7d
-/// windows, so a missing bucket can clear stale header-derived state. An
+/// A parsed wham report plus the buckets whose utilization the response
+/// authoritatively omitted. Unlike Claude's usage API, wham enumerates the
+/// account's 5h/7d windows, so a missing bucket can clear stale header-derived
+/// utilization. Reset and status metadata remain header-derived. An
 /// unknown-duration window suppresses both clear decisions because its bucket
 /// cannot be inferred safely.
 #[derive(Debug, Clone, PartialEq)]

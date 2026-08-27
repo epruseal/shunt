@@ -1258,6 +1258,7 @@ mod tests {
 
         let state = AppState::new(config, reqwest::Client::new()).unwrap();
         seed_full_codex_quota(&state.accounts, &refreshable);
+        let before = only_exported_quota(&state.accounts);
         poll_all(&state).await;
 
         let requests = server.received_requests().await.unwrap();
@@ -1284,8 +1285,8 @@ mod tests {
         }
         let quota = only_exported_quota(&state.accounts);
         assert_eq!(quota.utilization_7d, None);
-        assert_eq!(quota.reset_7d, None);
-        assert_eq!(quota.status_7d, None);
+        assert_eq!(quota.reset_7d, before.reset_7d);
+        assert_eq!(quota.status_7d, before.status_7d);
         assert_eq!(quota.observed_at_7d, None);
 
         let _ = std::fs::remove_file(creds);
@@ -1443,6 +1444,7 @@ mod tests {
             .insert("same-codex-provider".to_string(), provider);
         let state = AppState::new(config, reqwest::Client::new()).unwrap();
         seed_full_codex_quota(&state.accounts, &first);
+        let before = only_exported_quota(&state.accounts);
 
         poll_all(&state).await;
 
@@ -1485,8 +1487,8 @@ mod tests {
         );
         let quota = only_exported_quota(&state.accounts);
         assert_eq!(quota.utilization_7d, None);
-        assert_eq!(quota.reset_7d, None);
-        assert_eq!(quota.status_7d, None);
+        assert_eq!(quota.reset_7d, before.reset_7d);
+        assert_eq!(quota.status_7d, before.status_7d);
         assert_eq!(quota.observed_at_7d, None);
 
         for path in [first_creds, second_creds, third_creds] {
@@ -1856,8 +1858,8 @@ mod tests {
 
         let quota = only_exported_quota(&pool);
         assert_eq!(quota.utilization_5h, None);
-        assert_eq!(quota.reset_5h, None);
-        assert_eq!(quota.status_5h, None);
+        assert_eq!(quota.reset_5h, before.reset_5h);
+        assert_eq!(quota.status_5h, before.status_5h);
         assert_eq!(quota.observed_at_5h, None);
         assert_eq!(quota.status_7d.as_deref(), Some("allowed"));
         assert_eq!(quota.status, before.status);
@@ -1942,8 +1944,8 @@ mod tests {
         assert_eq!(quota.utilization_5h, Some(0.42));
         assert_eq!(quota.status_5h.as_deref(), Some("rejected"));
         assert_eq!(quota.utilization_7d, None);
-        assert_eq!(quota.reset_7d, None);
-        assert_eq!(quota.status_7d, None);
+        assert_eq!(quota.reset_7d, before.reset_7d);
+        assert_eq!(quota.status_7d, before.status_7d);
         assert_eq!(quota.observed_at_7d, None);
         assert_eq!(quota.status, before.status);
         assert_eq!(quota.observed_at_status, before.observed_at_status);
@@ -2069,8 +2071,9 @@ mod tests {
         let _ = std::fs::remove_file(creds);
     }
 
-    /// Test 26: each window's absolute `reset_at` epoch is preserved. Both
-    /// future values are computed at run time so the fixture never expires.
+    /// Test 26: Codex usage only reconciles utilization and observation time.
+    /// Reset metadata remains owned by the response headers even when the
+    /// private endpoint reports absolute `reset_at` epochs.
     #[tokio::test]
     async fn codex_poll_accepts_future_reset_at_values() {
         use wiremock::matchers::{method, path};
@@ -2110,6 +2113,8 @@ mod tests {
             .await;
 
         let pool = AccountPool::new();
+        seed_full_codex_quota(&pool, &account);
+        let before = only_exported_quota(&pool);
         let config = codex_backend_config(&server.uri(), account.clone());
         let applied = poll_codex_account(
             &reqwest::Client::new(),
@@ -2123,8 +2128,8 @@ mod tests {
         assert!(applied);
 
         let snap = pool.snapshot("codex", std::slice::from_ref(&account), None, None);
-        assert_eq!(snap[0].reset_5h, Some(primary_reset));
-        assert_eq!(snap[0].reset_7d, Some(secondary_reset));
+        assert_eq!(snap[0].reset_5h, before.reset_5h);
+        assert_eq!(snap[0].reset_7d, before.reset_7d);
 
         let _ = std::fs::remove_file(creds);
     }
