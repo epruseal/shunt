@@ -942,17 +942,20 @@ impl AccountPool {
     }
 
     /// Seed the pool with quotas restored from disk at boot. Returns whether
-    /// any observation timestamp was corrected. A restored
-    /// window or aggregate signal with no `observed_at` (a legacy state file
-    /// predating this field) is stamped with the boot time rather than left
-    /// unstamped: `expire_stale_quota` reads `None` as "never observed," which
-    /// for a reset-less mark means "expire immediately" — the opposite of the
-    /// intended warm start. Backdating to boot time instead gives a restored
-    /// reset-less mark the same one-window-length grace period a freshly
-    /// recorded mark would get. Future observation timestamps are clamped to
-    /// boot time, which likewise gives the mark a fresh window-length
-    /// lifetime. This correction runs only at import, so a future timestamp
-    /// created at runtime by a backwards clock remains until the next restart.
+    /// any quota or observation timestamp was corrected. Expired quota is
+    /// swept before a legacy observation timestamp can be backfilled, so an
+    /// old aggregate attached to a past-reset window cannot be made to look
+    /// fresh during migration. A restored window or aggregate signal with no
+    /// `observed_at` (a legacy state file predating this field) is stamped with
+    /// the boot time rather than left unstamped: `expire_stale_quota` reads
+    /// `None` as "never observed," which for a reset-less mark means "expire
+    /// immediately" — the opposite of the intended warm start. Backdating to
+    /// boot time instead gives a restored reset-less mark the same
+    /// one-window-length grace period a freshly recorded mark would get.
+    /// Future observation timestamps are clamped to boot time, which likewise
+    /// gives the mark a fresh window-length lifetime. This correction runs only
+    /// at import, so a future timestamp created at runtime by a backwards clock
+    /// remains until the next restart.
     pub(crate) fn import_quotas(
         &self,
         quotas: impl IntoIterator<Item = (AccountKey, QuotaState)>,
@@ -961,6 +964,7 @@ impl AccountPool {
         let now = unix_now();
         let mut corrected = false;
         for (key, mut quota) in quotas {
+            corrected |= expire_stale_quota(&mut quota, now);
             corrected |= stamp_legacy_observation(&mut quota, now);
             corrected |= clamp_future_observation(&mut quota.observed_at_5h, now);
             corrected |= clamp_future_observation(&mut quota.observed_at_7d, now);
@@ -1395,14 +1399,15 @@ fn record_pool_utilization(provider: &str, utilization: [Option<f64>; 3]) {
     }
 }
 
-/// Clears a window (and aggregate `status`, if any window expired) once it is
-/// no longer trustworthy, plus an unconditional cap on the aggregate status
-/// alone. Window expiry: the upstream reset has passed, or — for a window
-/// that has never carried a reset instant (a deployed multi-account codex
-/// pool has been observed sending blank `x-codex-*-reset-at` groups; a
-/// synthesized reset was rejected during design because it corrupts
-/// `window_headroom`) — the window's last observation is older than the
-/// window's own length. A mark can never outlive the longest span it could
+/// Clears each window once it is no longer trustworthy, plus the aggregate
+/// status when a legacy aggregate has no observation timestamp. A stamped
+/// aggregate has its own unconditional cap and is cleared only when that cap
+/// expires. Window expiry means that the upstream reset has passed. For a
+/// window that has never carried a reset instant (a deployed multi-account
+/// codex pool has been observed sending blank `x-codex-*-reset-at` groups),
+/// the window's last observation must instead be older than the window's own
+/// length. A synthesized reset was rejected during design because it corrupts
+/// `window_headroom`. A mark can never outlive the longest span it could
 /// plausibly still describe.
 fn expire_stale_quota(quota: &mut QuotaState, now: u64) -> bool {
     let stale = |reset: Option<u64>, observed: Option<u64>, len: u64| match reset {
@@ -1443,7 +1448,11 @@ fn expire_stale_quota(quota: &mut QuotaState, now: u64) -> bool {
         quota.observed_at_7d_oi = None;
         expired |= had_signal;
     }
-    if expired {
+    // Legacy aggregate statuses have no independent observation time, so an
+    // expired window is their only expiry signal. Stamped aggregates are
+    // governed solely by the unconditional cap below and must survive a
+    // window expiring first.
+    if expired && quota.observed_at_status.is_none() {
         let had_signal = quota.status.is_some() || quota.observed_at_status.is_some();
         quota.status = None;
         quota.observed_at_status = None;
@@ -2321,6 +2330,110 @@ mod tests {
             quota.observed_at_7d.is_some_and(|at| at >= before),
             "the 7d bucket stamps observed_at even without a reset header"
         );
+    }
+
+    #[test]
+    fn anthropic_aggregate_status_survives_stale_restored_reset() {
+        let pool = AccountPool::new();
+        let accounts = vec![account("a"), account("b")];
+        let session = "anthropic-aggregate-after-restore";
+        let initial = pool.select_order("anthropic", &accounts, Some(session), None, None);
+        let sticky = initial[0];
+        let future_reset = unix_now() + 3_600;
+        pool.import_quotas([(
+            account_key("anthropic", &accounts[sticky]),
+            QuotaState {
+                utilization_5h: Some(0.1),
+                reset_5h: Some(future_reset),
+                observed_at_5h: Some(unix_now()),
+                ..Default::default()
+            },
+        )]);
+
+        // Model the restored window reaching its reset after import. The
+        // aggregate status below is then captured through the public header
+        // path while the old per-window reset remains in the health entry.
+        {
+            let mut entries = pool.entries.lock().expect("account health lock poisoned");
+            entries
+                .get_mut(&account_key("anthropic", &accounts[sticky]))
+                .expect("restored account exists")
+                .quota
+                .reset_5h = Some(unix_now().saturating_sub(1));
+        }
+        let before_status = unix_now();
+        pool.note_quota(
+            "anthropic",
+            &accounts[sticky],
+            &quota_headers(&[("anthropic-ratelimit-unified-status", "rejected".to_string())]),
+        );
+
+        let order = pool.select_order("anthropic", &accounts, Some(session), None, None);
+        assert_ne!(
+            order[0], sticky,
+            "a fresh aggregate rejection remains selection-relevant after restore"
+        );
+        let entries = pool.entries.lock().unwrap();
+        let quota = &entries
+            .get(&account_key("anthropic", &accounts[sticky]))
+            .unwrap()
+            .quota;
+        assert_eq!(quota.utilization_5h, None);
+        assert_eq!(quota.reset_5h, None);
+        assert_eq!(quota.status.as_deref(), Some("rejected"));
+        assert!(quota
+            .observed_at_status
+            .is_some_and(|at| at >= before_status));
+    }
+
+    #[test]
+    fn codex_aggregate_status_survives_stale_restored_reset() {
+        let pool = AccountPool::new();
+        let accounts = vec![account("a"), account("b")];
+        let session = "codex-aggregate-after-restore";
+        let initial = pool.select_order("codex", &accounts, Some(session), None, None);
+        let sticky = initial[0];
+        let future_reset = unix_now() + 3_600;
+        pool.import_quotas([(
+            account_key("codex", &accounts[sticky]),
+            QuotaState {
+                utilization_5h: Some(0.1),
+                reset_5h: Some(future_reset),
+                observed_at_5h: Some(unix_now()),
+                ..Default::default()
+            },
+        )]);
+
+        // Model the restored window reaching its reset after import, then
+        // record Codex's aggregate reached-type status through its public path.
+        {
+            let mut entries = pool.entries.lock().expect("account health lock poisoned");
+            entries
+                .get_mut(&account_key("codex", &accounts[sticky]))
+                .expect("restored account exists")
+                .quota
+                .reset_5h = Some(unix_now().saturating_sub(1));
+        }
+        let before_status = unix_now();
+        pool.note_codex_quota(
+            "codex",
+            &accounts[sticky],
+            &quota_headers(&[("x-codex-rate-limit-reached-type", "weekly".to_string())]),
+        );
+
+        let order = pool.select_order("codex", &accounts, Some(session), None, None);
+        assert_eq!(order.len(), accounts.len());
+        let entries = pool.entries.lock().unwrap();
+        let quota = &entries
+            .get(&account_key("codex", &accounts[sticky]))
+            .unwrap()
+            .quota;
+        assert_eq!(quota.utilization_5h, None);
+        assert_eq!(quota.reset_5h, None);
+        assert_eq!(quota.status.as_deref(), Some("weekly"));
+        assert!(quota
+            .observed_at_status
+            .is_some_and(|at| at >= before_status));
     }
 
     #[test]
@@ -3291,13 +3404,79 @@ mod tests {
         assert_eq!(quota.utilization_7d, Some(0.9));
         assert_eq!(quota.observed_at_7d, Some(now - WINDOW_7D_SECS + 1));
 
-        // At the boundary (observed_at + window_len == now): the window and the
-        // legacy aggregate it drags down with it are both cleared.
+        // At the boundary (observed_at + window_len == now), only the stale
+        // window is cleared. A stamped aggregate has its own independent cap.
         quota.observed_at_7d = Some(now - WINDOW_7D_SECS);
         expire_stale_quota(&mut quota, now);
         assert_eq!(quota.utilization_7d, None);
         assert_eq!(quota.observed_at_7d, None);
-        assert_eq!(quota.status, None);
+        assert_eq!(quota.status.as_deref(), Some("rejected"));
+        assert_eq!(quota.observed_at_status, Some(now));
+    }
+
+    #[test]
+    fn stale_window_preserves_fresh_stamped_aggregate() {
+        let now = unix_now();
+        let cases = [
+            (
+                "5h",
+                QuotaState {
+                    utilization_5h: Some(0.9),
+                    reset_5h: Some(now),
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "7d",
+                QuotaState {
+                    utilization_7d: Some(0.9),
+                    reset_7d: Some(now),
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                "7d_oi",
+                QuotaState {
+                    utilization_7d_oi: Some(0.9),
+                    reset_7d_oi: Some(now),
+                    ..Default::default()
+                },
+                true,
+            ),
+        ];
+
+        for (window, mut quota, is_fable) in cases {
+            quota.status = Some("rejected".to_string());
+            quota.observed_at_status = Some(now);
+            expire_stale_quota(&mut quota, now);
+
+            assert!(
+                quota.utilization_5h.is_none()
+                    && quota.utilization_7d.is_none()
+                    && quota.utilization_7d_oi.is_none(),
+                "stale {window} utilization must be cleared"
+            );
+            assert!(
+                quota.reset_5h.is_none() && quota.reset_7d.is_none() && quota.reset_7d_oi.is_none(),
+                "stale {window} reset must be cleared"
+            );
+            assert_eq!(
+                quota.status.as_deref(),
+                Some("rejected"),
+                "fresh aggregate status must survive stale {window}"
+            );
+            assert_eq!(
+                quota.observed_at_status,
+                Some(now),
+                "fresh aggregate timestamp must survive stale {window}"
+            );
+            assert!(
+                assess_quota(&quota, &account("a"), is_fable, None, now).near,
+                "aggregate rejection must remain near after stale {window} cleanup"
+            );
+        }
     }
 
     #[test]
@@ -3419,7 +3598,10 @@ mod tests {
         );
 
         let selected = pool.select_order("anthropic", &accounts, Some(session), None, None);
-        assert_eq!(selected[0], sticky);
+        assert_ne!(
+            selected[0], sticky,
+            "a fresh aggregate rejection remains near after the 5h window expires"
+        );
         let entries = pool.entries.lock().unwrap();
         let quota = &entries
             .get(&account_key("anthropic", &accounts[sticky]))
@@ -3429,7 +3611,8 @@ mod tests {
         assert_eq!(quota.reset_5h, None);
         assert_eq!(quota.utilization_7d, Some(0.42));
         assert_eq!(quota.reset_7d, None);
-        assert_eq!(quota.status, None);
+        assert_eq!(quota.status.as_deref(), Some("rejected"));
+        assert!(quota.observed_at_status.is_some());
     }
 
     #[test]
@@ -4416,6 +4599,29 @@ mod tests {
             .quota;
         assert!(quota.observed_at_7d.is_some_and(|at| at >= before));
         assert!(quota.observed_at_status.is_some_and(|at| at >= before));
+    }
+
+    #[test]
+    fn import_sweeps_expired_legacy_aggregate_before_stamping() {
+        let account = account("expired-legacy");
+        let pool = AccountPool::new();
+        let corrected = pool.import_quotas([(
+            account_key("anthropic", &account),
+            QuotaState {
+                utilization_5h: Some(0.9),
+                reset_5h: Some(unix_now().saturating_sub(1)),
+                status: Some("rejected".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        assert!(corrected, "import reports the expired quota mutation");
+        let entries = pool.entries.lock().unwrap();
+        let health = entries
+            .get(&account_key("anthropic", &account))
+            .expect("restored account exists");
+        assert!(health.observed);
+        assert_eq!(health.quota, QuotaState::default());
     }
 
     #[test]

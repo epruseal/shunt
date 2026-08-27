@@ -10,12 +10,15 @@
 //! The file is a best-effort cache, not a source of truth: quota is re-derived
 //! from upstream responses (and the usage API) regardless, so a missing, stale,
 //! or corrupt file only costs a cold start — never a boot failure. Restored
-//! windows whose reset has already passed are dropped lazily by the next
-//! `select_order`/`snapshot`, exactly as live ones are. A window that never
-//! carried a reset instant is bounded instead by its persisted observation
-//! time (`QuotaState::observed_at_5h`/`observed_at_7d`/`observed_at_7d_oi`):
-//! it expires one window length after that timestamp, whether restored from
-//! disk or recorded live, so a reset-less mark can never persist indefinitely.
+//! windows whose reset has already passed are dropped during import, before
+//! the first `select_order`/`snapshot`, exactly as live ones are. A legacy
+//! aggregate status attached to such a window is dropped at the same import
+//! boundary when it has no independent observation timestamp. A window that
+//! never carried a reset instant is bounded instead by its persisted
+//! observation time (`QuotaState::observed_at_5h`/`observed_at_7d`/
+//! `QuotaState::observed_at_7d_oi`): it expires one window length after that
+//! timestamp, whether restored from disk or recorded live, so a reset-less
+//! mark can never persist indefinitely.
 //!
 //! Only quota is persisted. Cooldowns are a monotonic [`std::time::Instant`]
 //! (not portable across a restart) and short-lived, so they are intentionally
@@ -416,7 +419,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_snapshot_expires_stale_restored_quota() {
+    async fn restore_expires_stale_legacy_quota_before_first_snapshot() {
         let path = temp_file("expired");
         let expired = PersistedPool {
             version: STATE_VERSION,
@@ -434,6 +437,12 @@ mod tests {
         let state = state_with_path(path.clone());
         restore(&state).await;
 
+        // Import must remove the past-reset window and its unstamped legacy
+        // aggregate before any selection, snapshot, or export sweep runs.
+        assert!(
+            state.accounts.export_quotas().is_empty(),
+            "expired quota is absent immediately after restore"
+        );
         let snapshots = state
             .accounts
             .snapshot("anthropic", &[account("acct-a")], None, None);
@@ -444,6 +453,22 @@ mod tests {
         assert_eq!(snapshots[0].utilization_5h, None);
         assert_eq!(snapshots[0].reset_5h, None);
         assert_eq!(snapshots[0].status, None);
+
+        // The import correction marks persistence dirty. The next flush must
+        // rewrite the file without the stale account, and a fresh restore must
+        // observe the cleaned disk state.
+        flush(&state).await;
+        let persisted = load(&path)
+            .expect("load succeeds")
+            .expect("corrected state remains loadable");
+        assert!(
+            persisted.accounts.is_empty(),
+            "dirty flush removes the expired quota record"
+        );
+
+        let restored_again = state_with_path(path.clone());
+        restore(&restored_again).await;
+        assert!(restored_again.accounts.export_quotas().is_empty());
         remove_test_dir(&path);
     }
 
