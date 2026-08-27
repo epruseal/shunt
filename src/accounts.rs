@@ -919,6 +919,17 @@ impl AccountPool {
         self.dirty.swap(false, Ordering::Relaxed)
     }
 
+    /// Return an account's raw quota without running any expiry or persistence
+    /// path. This is test-only so restore tests can inspect state before a
+    /// later selection, snapshot, or export sweep.
+    #[cfg(test)]
+    pub(crate) fn raw_quota_for_test(&self, key: &AccountKey) -> Option<(bool, QuotaState)> {
+        let entries = self.entries.lock().expect("account health lock poisoned");
+        entries
+            .get(key)
+            .map(|health| (health.observed, health.quota.clone()))
+    }
+
     /// Snapshot every observed physical account's quota for on-disk persistence.
     pub(crate) fn export_quotas(&self) -> Vec<(AccountKey, QuotaState)> {
         let (quotas, quota_expired) = {
@@ -2422,7 +2433,16 @@ mod tests {
         );
 
         let order = pool.select_order("codex", &accounts, Some(session), None, None);
-        assert_eq!(order.len(), accounts.len());
+        assert_eq!(
+            order[0], sticky,
+            "Codex's display-only weekly status does not rotate the sticky account"
+        );
+        let snapshots = pool.snapshot("codex", &accounts, None, None);
+        let sticky_snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot.name == accounts[sticky].name)
+            .expect("sticky account snapshot exists");
+        assert!(!sticky_snapshot.near_quota);
         let entries = pool.entries.lock().unwrap();
         let quota = &entries
             .get(&account_key("codex", &accounts[sticky]))

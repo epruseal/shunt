@@ -439,6 +439,20 @@ mod tests {
 
         // Import must remove the past-reset window and its unstamped legacy
         // aggregate before any selection, snapshot, or export sweep runs.
+        let key = crate::accounts::account_key("anthropic", &account("acct-a"));
+        let (observed, raw_quota) = state
+            .accounts
+            .raw_quota_for_test(&key)
+            .expect("restored account entry exists");
+        assert!(observed, "restored account is marked observed");
+        assert_eq!(raw_quota, QuotaState::default());
+        assert!(
+            state.accounts.take_dirty(),
+            "import correction marks persistence dirty"
+        );
+        // The assertion above consumes the flag so this test can prove the
+        // flush path with the same dirty marker the restore normally leaves.
+        state.accounts.mark_dirty();
         assert!(
             state.accounts.export_quotas().is_empty(),
             "expired quota is absent immediately after restore"
