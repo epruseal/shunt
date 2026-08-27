@@ -2628,6 +2628,52 @@ mod tests {
     }
 
     #[test]
+    fn codex_write_sweeps_a_passed_reset_before_replacing_utilization() {
+        let pool = AccountPool::new();
+        let account = account("codex-sweep");
+        let now = unix_now();
+        pool.note_codex_quota(
+            "codex",
+            &account,
+            &quota_headers(&[
+                ("x-codex-primary-used-percent", "40".to_string()),
+                ("x-codex-primary-window-minutes", "300".to_string()),
+                ("x-codex-primary-reset-at", (now + 3_600).to_string()),
+                ("x-codex-rate-limit-reached-type", "rejected".to_string()),
+            ]),
+        );
+        {
+            let mut entries = pool.entries.lock().unwrap();
+            let quota = &mut entries
+                .get_mut(&account_key("codex", &account))
+                .unwrap()
+                .quota;
+            // Model an old, unstamped aggregate from before independent
+            // aggregate freshness existed, then pass the shared reset before
+            // the next Codex response replaces the utilization.
+            quota.observed_at_status = None;
+            quota.reset_5h = Some(now.saturating_sub(1));
+        }
+
+        pool.note_codex_quota(
+            "codex",
+            &account,
+            &quota_headers(&[
+                ("x-codex-primary-used-percent", "20".to_string()),
+                ("x-codex-primary-window-minutes", "300".to_string()),
+            ]),
+        );
+
+        let quota = pool
+            .raw_quota_for_test(&account_key("codex", &account))
+            .unwrap()
+            .1;
+        assert_eq!(quota.status, None);
+        assert_eq!(quota.utilization_5h, Some(0.2));
+        assert_eq!(quota.reset_5h, None);
+    }
+
+    #[test]
     fn generic_fresh_resetless_utilization_replaces_expired_reset() {
         let pool = AccountPool::new();
         let account = account("anthropic-account");
@@ -3757,9 +3803,21 @@ mod tests {
                 ..Default::default()
             },
             QuotaState {
+                status_5h: Some("rejected".to_string()),
+                observed_at_status_5h: Some(now - WINDOW_5H_SECS),
+                reset_at_status_5h: Some(now + 3_600),
+                ..Default::default()
+            },
+            QuotaState {
                 status_7d: Some("rejected".to_string()),
                 observed_at_status_7d: Some(now - WINDOW_7D_SECS),
                 reset_at_status_7d: Some(now + 3_600),
+                ..Default::default()
+            },
+            QuotaState {
+                status_7d: Some("rejected".to_string()),
+                observed_at_status_7d: Some(now - WINDOW_7D_SECS + 1),
+                reset_at_status_7d: Some(now - 1),
                 ..Default::default()
             },
             QuotaState {
@@ -3768,22 +3826,26 @@ mod tests {
                 reset_at_status_7d_oi: Some(now + 3_600),
                 ..Default::default()
             },
+            QuotaState {
+                status_7d_oi: Some("rejected".to_string()),
+                observed_at_status_7d_oi: Some(now - WINDOW_7D_SECS + 1),
+                reset_at_status_7d_oi: Some(now - 1),
+                ..Default::default()
+            },
         ];
 
-        expire_stale_quota(&mut cases[0], now);
-        assert_eq!(cases[0].status_5h, None);
-        assert_eq!(cases[0].observed_at_status_5h, None);
-        assert_eq!(cases[0].reset_at_status_5h, None);
-
-        expire_stale_quota(&mut cases[1], now);
-        assert_eq!(cases[1].status_7d, None);
-        assert_eq!(cases[1].observed_at_status_7d, None);
-        assert_eq!(cases[1].reset_at_status_7d, None);
-
-        expire_stale_quota(&mut cases[2], now);
-        assert_eq!(cases[2].status_7d_oi, None);
-        assert_eq!(cases[2].observed_at_status_7d_oi, None);
-        assert_eq!(cases[2].reset_at_status_7d_oi, None);
+        for quota in &mut cases {
+            expire_stale_quota(quota, now);
+            assert!(quota.status_5h.is_none());
+            assert!(quota.status_7d.is_none());
+            assert!(quota.status_7d_oi.is_none());
+            assert!(quota.observed_at_status_5h.is_none());
+            assert!(quota.observed_at_status_7d.is_none());
+            assert!(quota.observed_at_status_7d_oi.is_none());
+            assert!(quota.reset_at_status_5h.is_none());
+            assert!(quota.reset_at_status_7d.is_none());
+            assert!(quota.reset_at_status_7d_oi.is_none());
+        }
     }
 
     #[test]
@@ -3854,6 +3916,108 @@ mod tests {
         assert_eq!(utilization_stale.reset_7d_oi, Some(now + 3_600));
         assert_eq!(utilization_stale.status_7d_oi.as_deref(), Some("allowed"));
         assert_eq!(utilization_stale.reset_at_status_7d_oi, Some(now + 3_600));
+    }
+
+    #[test]
+    fn stale_status_and_utilization_are_independent_for_each_window() {
+        let now = unix_now();
+        let future = now + 3_600;
+        let mut cases = [
+            (
+                QuotaState {
+                    utilization_5h: Some(0.1),
+                    reset_5h: Some(future),
+                    observed_at_5h: Some(now),
+                    status_5h: Some("rejected".to_string()),
+                    observed_at_status_5h: Some(now - WINDOW_5H_SECS),
+                    reset_at_status_5h: Some(future),
+                    ..Default::default()
+                },
+                true,
+                false,
+            ),
+            (
+                QuotaState {
+                    utilization_5h: Some(0.1),
+                    reset_5h: Some(future),
+                    observed_at_5h: Some(now - WINDOW_5H_SECS),
+                    status_5h: Some("allowed".to_string()),
+                    observed_at_status_5h: Some(now),
+                    reset_at_status_5h: Some(future),
+                    ..Default::default()
+                },
+                false,
+                true,
+            ),
+            (
+                QuotaState {
+                    utilization_7d: Some(0.2),
+                    reset_7d: Some(future),
+                    observed_at_7d: Some(now),
+                    status_7d: Some("rejected".to_string()),
+                    observed_at_status_7d: Some(now - WINDOW_7D_SECS),
+                    reset_at_status_7d: Some(future),
+                    ..Default::default()
+                },
+                true,
+                false,
+            ),
+            (
+                QuotaState {
+                    utilization_7d: Some(0.2),
+                    reset_7d: Some(future),
+                    observed_at_7d: Some(now - WINDOW_7D_SECS),
+                    status_7d: Some("allowed".to_string()),
+                    observed_at_status_7d: Some(now),
+                    reset_at_status_7d: Some(future),
+                    ..Default::default()
+                },
+                false,
+                true,
+            ),
+            (
+                QuotaState {
+                    utilization_7d_oi: Some(0.3),
+                    reset_7d_oi: Some(future),
+                    observed_at_7d_oi: Some(now),
+                    status_7d_oi: Some("rejected".to_string()),
+                    observed_at_status_7d_oi: Some(now - WINDOW_7D_SECS),
+                    reset_at_status_7d_oi: Some(future),
+                    ..Default::default()
+                },
+                true,
+                false,
+            ),
+            (
+                QuotaState {
+                    utilization_7d_oi: Some(0.3),
+                    reset_7d_oi: Some(future),
+                    observed_at_7d_oi: Some(now - WINDOW_7D_SECS),
+                    status_7d_oi: Some("allowed".to_string()),
+                    observed_at_status_7d_oi: Some(now),
+                    reset_at_status_7d_oi: Some(future),
+                    ..Default::default()
+                },
+                false,
+                true,
+            ),
+        ];
+
+        for (quota, utilization_live, status_live) in &mut cases {
+            expire_stale_quota(quota, now);
+            assert_eq!(
+                quota.utilization_5h.is_some()
+                    || quota.utilization_7d.is_some()
+                    || quota.utilization_7d_oi.is_some(),
+                *utilization_live
+            );
+            assert_eq!(
+                quota.status_5h.is_some()
+                    || quota.status_7d.is_some()
+                    || quota.status_7d_oi.is_some(),
+                *status_live
+            );
+        }
     }
 
     #[test]

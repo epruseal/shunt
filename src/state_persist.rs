@@ -617,10 +617,16 @@ mod tests {
                         utilization_5h: Some(0.1),
                         utilization_7d: Some(0.2),
                         utilization_7d_oi: Some(0.3),
+                        status_5h: Some("allowed".to_string()),
+                        status_7d: Some("allowed".to_string()),
+                        status_7d_oi: Some("allowed".to_string()),
                         status: Some("allowed".to_string()),
                         observed_at_5h: Some(future),
                         observed_at_7d: Some(future),
                         observed_at_7d_oi: Some(future),
+                        observed_at_status_5h: Some(future),
+                        observed_at_status_7d: Some(future),
+                        observed_at_status_7d_oi: Some(future),
                         observed_at_status: Some(future),
                         ..Default::default()
                     },
@@ -661,6 +667,9 @@ mod tests {
             future_quota.observed_at_5h,
             future_quota.observed_at_7d,
             future_quota.observed_at_7d_oi,
+            future_quota.observed_at_status_5h,
+            future_quota.observed_at_status_7d,
+            future_quota.observed_at_status_7d_oi,
             future_quota.observed_at_status,
         ] {
             assert_eq!(observed_at, Some(migration_time));
