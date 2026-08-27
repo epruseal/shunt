@@ -1003,11 +1003,14 @@ impl AccountPool {
     /// Unlike Claude's partial usage response, wham enumerates the account's
     /// 5h/7d windows, so the Codex parser can mark a bucket's utilization as
     /// authoritatively absent. Such a bucket's utilization and observation
-    /// timestamp are cleared before reported windows are applied; reset and
-    /// status metadata remain owned by response headers. The parser withholds
-    /// both clear flags when any non-null window has an unknown duration, and
-    /// the poller never calls this method for an empty snapshot or a failed
-    /// fetch.
+    /// timestamp are cleared before reported windows are applied. For a
+    /// reported bucket, reset metadata remains header-derived: a future stored
+    /// reset survives, while an elapsed stored reset is dropped so it cannot
+    /// immediately expire the fresh utilization. The parser's `resets_at` is
+    /// ignored, and status metadata remains owned by response headers. The
+    /// parser withholds both clear flags when any non-null window has an unknown
+    /// duration, and the poller never calls this method for an empty snapshot or
+    /// a failed fetch.
     pub(crate) fn note_codex_usage(
         &self,
         provider: &str,
@@ -1037,10 +1040,12 @@ impl AccountPool {
                     quota.observed_at_7d = None;
                 }
                 if let Some(window) = &usage.five_hour {
+                    quota.reset_5h = preserve_future_reset(quota.reset_5h, None, now);
                     quota.utilization_5h = Some(window.utilization);
                     quota.observed_at_5h = Some(now);
                 }
                 if let Some(window) = &usage.seven_day {
+                    quota.reset_7d = preserve_future_reset(quota.reset_7d, None, now);
                     quota.utilization_7d = Some(window.utilization);
                     quota.observed_at_7d = Some(now);
                 }
@@ -5823,6 +5828,148 @@ mod tests {
         assert_eq!(
             crate::metrics::pool_utilization_value_for_tests(provider, "7d_oi"),
             Some(0.33)
+        );
+    }
+
+    #[test]
+    fn codex_usage_drops_elapsed_resets_before_fresh_utilization() {
+        let pool = AccountPool::new();
+        let provider = "codex-usage-expired-reset-regression";
+        let mut target = account("codex-expired-target");
+        target.priority = 100;
+        let mut sibling = account("codex-fable-sibling");
+        sibling.priority = 1;
+        let accounts = [target.clone(), sibling.clone()];
+        pool.sync_enabled_accounts(provider, &accounts);
+
+        let now = unix_now();
+        let past = now.saturating_sub(1);
+        let future = now + 3_600;
+        let target_quota = QuotaState {
+            utilization_5h: Some(0.11),
+            reset_5h: Some(past),
+            utilization_7d: Some(0.22),
+            reset_7d: Some(past),
+            utilization_7d_oi: Some(0.72),
+            reset_7d_oi: Some(future + 7_200),
+            status: Some("aggregate".to_string()),
+            status_5h: Some("allowed".to_string()),
+            status_7d: Some("allowed".to_string()),
+            status_7d_oi: Some("rejected".to_string()),
+            observed_at_5h: Some(now.saturating_sub(30)),
+            observed_at_7d: Some(now.saturating_sub(30)),
+            observed_at_7d_oi: Some(now.saturating_sub(30)),
+            observed_at_status_5h: Some(now.saturating_sub(30)),
+            observed_at_status_7d: Some(now.saturating_sub(30)),
+            observed_at_status_7d_oi: Some(now.saturating_sub(30)),
+            reset_at_status_5h: Some(future),
+            reset_at_status_7d: Some(future + 3_600),
+            reset_at_status_7d_oi: Some(future + 7_200),
+            observed_at_status: Some(now.saturating_sub(30)),
+        };
+        let sibling_quota = QuotaState {
+            utilization_7d_oi: Some(0.55),
+            reset_7d_oi: Some(future + 7_200),
+            observed_at_7d_oi: Some(now),
+            ..Default::default()
+        };
+        {
+            let mut entries = pool.entries.lock().unwrap();
+            let target_health = entries.entry(account_key(provider, &target)).or_default();
+            target_health.observed = true;
+            target_health.quota = target_quota.clone();
+            let sibling_health = entries.entry(account_key(provider, &sibling)).or_default();
+            sibling_health.observed = true;
+            sibling_health.quota = sibling_quota.clone();
+        }
+
+        pool.note_codex_usage(
+            provider,
+            &target,
+            &UsageSnapshot {
+                five_hour: Some(UsageWindow {
+                    utilization: 0.995,
+                    resets_at: Some(future + 12_345),
+                }),
+                seven_day: Some(UsageWindow {
+                    utilization: 0.99,
+                    resets_at: Some(future + 16_789),
+                }),
+                seven_day_oi: None,
+            },
+            false,
+            false,
+        );
+
+        let target_after = pool
+            .raw_quota_for_test(&account_key(provider, &target))
+            .unwrap()
+            .1;
+        let sibling_after = pool
+            .raw_quota_for_test(&account_key(provider, &sibling))
+            .unwrap()
+            .1;
+        let mut expected_target = target_quota.clone();
+        expected_target.utilization_5h = Some(0.995);
+        expected_target.reset_5h = None;
+        expected_target.observed_at_5h = target_after.observed_at_5h;
+        expected_target.utilization_7d = Some(0.99);
+        expected_target.reset_7d = None;
+        expected_target.observed_at_7d = target_after.observed_at_7d;
+        assert!(target_after.observed_at_5h.is_some_and(|at| at >= now));
+        assert!(target_after.observed_at_7d.is_some_and(|at| at >= now));
+        assert_eq!(target_after, expected_target);
+        assert_eq!(sibling_after, sibling_quota);
+        assert_eq!(
+            crate::metrics::pool_utilization_value_for_tests(provider, "5h"),
+            Some(0.995)
+        );
+        assert_eq!(
+            crate::metrics::pool_utilization_value_for_tests(provider, "7d"),
+            Some(0.99)
+        );
+        assert_eq!(
+            crate::metrics::pool_utilization_value_for_tests(provider, "7d_oi"),
+            Some(0.55)
+        );
+
+        let snapshots = pool.snapshot(provider, &accounts, None, None);
+        let target_snapshot = &snapshots[0];
+        assert!(target_snapshot.has_state);
+        assert!(target_snapshot.near_quota);
+        assert!(!target_snapshot.available);
+        assert_eq!(target_snapshot.utilization_5h, Some(0.995));
+        assert_eq!(target_snapshot.reset_5h, None);
+        assert_eq!(target_snapshot.utilization_7d, Some(0.99));
+        assert_eq!(target_snapshot.reset_7d, None);
+        let sibling_snapshot = &snapshots[1];
+        assert!(sibling_snapshot.has_state);
+        assert!(sibling_snapshot.available);
+        assert!(!sibling_snapshot.near_quota);
+
+        let order = pool.select_order(provider, &accounts, None, None, None);
+        assert_eq!(order, vec![1, 0]);
+
+        let target_final = pool
+            .raw_quota_for_test(&account_key(provider, &target))
+            .unwrap()
+            .1;
+        assert_eq!(target_final, expected_target);
+        let exported = pool.export_quotas();
+        assert_eq!(exported.len(), 2);
+        assert_eq!(
+            exported
+                .iter()
+                .find(|(key, _)| *key == account_key(provider, &target))
+                .map(|(_, quota)| quota),
+            Some(&expected_target)
+        );
+        assert_eq!(
+            exported
+                .iter()
+                .find(|(key, _)| *key == account_key(provider, &sibling))
+                .map(|(_, quota)| quota),
+            Some(&sibling_quota)
         );
     }
 
