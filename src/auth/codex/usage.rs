@@ -36,6 +36,7 @@
 //! API, only a refreshable imported login can call it; the poller restricts
 //! itself to imported Codex accounts.
 
+use anyhow::Context;
 use serde_json::Value;
 
 use crate::accounts::{codex_window_bucket, CodexWindow, UsageSnapshot, UsageWindow};
@@ -85,7 +86,10 @@ pub(crate) async fn fetch_usage_report(
         .send()
         .await?;
     let status = response.status();
-    let text = response.text().await.unwrap_or_default();
+    let text = response
+        .text()
+        .await
+        .context("Codex wham usage response body read failed")?;
     if !status.is_success() {
         let detail: String = text.chars().take(200).collect();
         anyhow::bail!("wham usage request failed ({status}): {detail}");
@@ -181,9 +185,10 @@ fn parse_usage(value: &serde_json::Value) -> anyhow::Result<WhamUsageReport> {
 }
 
 /// Parse one window object: `{ "used_percent": <0-100>, "reset_at": ... }`.
-/// Only an unsigned epoch `reset_at` is accepted. `None` on any problem with
-/// this window alone (missing/non-finite/out-of-range percent) means the caller
-/// skips it and still applies whatever else the response reported.
+/// `reset_at` accepts an unsigned epoch or RFC3339 timestamp. `None` on any
+/// problem with this window alone (missing/non-finite/out-of-range percent)
+/// means the caller skips it and still applies whatever else the response
+/// reported.
 fn parse_window(value: &serde_json::Value) -> Option<UsageWindow> {
     let percent = value.get("used_percent").and_then(Value::as_f64)?;
     if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
@@ -191,7 +196,18 @@ fn parse_window(value: &serde_json::Value) -> Option<UsageWindow> {
     }
     Some(UsageWindow {
         utilization: percent / 100.0,
-        resets_at: value.get("reset_at").and_then(Value::as_u64),
+        resets_at: value.get("reset_at").and_then(parse_reset_at),
+    })
+}
+
+/// Parse the private endpoint's reset instant without inferring unsupported
+/// encodings. JSON integers are accepted only as non-negative epochs; numeric
+/// strings, floats, negative values, and other values remain absent signals.
+fn parse_reset_at(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_str()
+            .and_then(crate::auth::claude::usage::parse_rfc3339_to_epoch_secs)
     })
 }
 
@@ -489,40 +505,55 @@ mod tests {
     }
 
     #[test]
-    fn uses_only_unsigned_reset_at_epoch() {
+    fn accepts_unsigned_or_rfc3339_reset_at() {
         let cases = [
-            serde_json::json!({
-                "used_percent": 10,
-                "window_minutes": 300,
-                "resets_at": 1_700_000_000u64
-            }),
-            serde_json::json!({
-                "used_percent": 20,
-                "window_minutes": 300,
-                "resets_at": "2026-07-14T17:30:00Z"
-            }),
-            serde_json::json!({
-                "used_percent": 30,
-                "window_minutes": 300,
-                "reset_at": "1_700_000_000"
-            }),
-            serde_json::json!({
-                "used_percent": 40,
-                "window_minutes": 300,
-                "reset_at": -1
-            }),
-            serde_json::json!({
-                "used_percent": 50,
-                "window_minutes": 300,
-                "reset_after_seconds": 493_436
-            }),
+            (serde_json::json!(1_700_000_000u64), Some(1_700_000_000)),
+            (
+                serde_json::json!("2021-01-01T00:00:00Z"),
+                Some(1_609_459_200),
+            ),
+            (
+                serde_json::json!("2021-01-01T09:00:00+09:00"),
+                Some(1_609_459_200),
+            ),
         ];
 
-        for window in cases {
-            let value = serde_json::json!({ "primary_window": window });
+        for (reset_at, expected) in cases {
+            let value = serde_json::json!({
+                "primary_window": {
+                    "used_percent": 10,
+                    "window_minutes": 300,
+                    "reset_at": reset_at
+                }
+            });
             let snapshot = parse_usage(&value).expect("window is recognizable").usage;
             let parsed = snapshot.five_hour.expect("duration and utilization remain");
-            assert!(parsed.resets_at.is_none());
+            assert_eq!(parsed.resets_at, expected);
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_reset_at_encodings() {
+        let cases = [
+            serde_json::json!("1700000000"),
+            serde_json::json!(1_700_000_000.5),
+            serde_json::json!(-1),
+            serde_json::json!("not-a-timestamp"),
+            serde_json::json!(true),
+            serde_json::json!(null),
+        ];
+
+        for reset_at in cases {
+            let value = serde_json::json!({
+                "primary_window": {
+                    "used_percent": 10,
+                    "window_minutes": 300,
+                    "reset_at": reset_at
+                }
+            });
+            let snapshot = parse_usage(&value).expect("window is recognizable").usage;
+            let parsed = snapshot.five_hour.expect("duration and utilization remain");
+            assert!(parsed.resets_at.is_none(), "accepted {reset_at:?}");
         }
     }
 

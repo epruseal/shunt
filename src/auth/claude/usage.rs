@@ -13,6 +13,8 @@
 //! *refreshable* login token; a long-lived `claude setup-token` is rejected, so
 //! the poller restricts itself to imported accounts.
 
+use anyhow::Context;
+
 use crate::accounts::{UsageSnapshot, UsageWindow};
 
 /// Path appended to a provider's base URL to reach the usage endpoint.
@@ -46,7 +48,10 @@ pub async fn fetch_usage(
         .send()
         .await?;
     let status = response.status();
-    let text = response.text().await.unwrap_or_default();
+    let text = response
+        .text()
+        .await
+        .context("Claude usage response body read failed")?;
     if !status.is_success() {
         let detail: String = text.chars().take(200).collect();
         anyhow::bail!("usage request failed ({status}): {detail}");

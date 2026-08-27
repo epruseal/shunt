@@ -27,7 +27,7 @@
 //! — a `chatgpt_oauth` provider pointed at some other base is never polled.
 
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -35,11 +35,14 @@ use std::{
 use serde_json::Value;
 
 use crate::{
-    accounts::AccountPool,
+    accounts::{account_key, AccountKey, UsageSnapshot},
     auth::{self, claude, codex, resolve_chatgpt_account, resolve_claude_account, Credential},
-    config::{AccountConfig, AuthMode, Config},
+    config::{AccountConfig, AuthMode},
     server::AppState,
 };
+
+#[cfg(test)]
+use crate::{accounts::AccountPool, config::Config};
 
 /// Spawn the usage poller if `[server.pool] usage_refresh_seconds` enables it.
 /// A no-op otherwise, so the default deployment adds no background work. Whether
@@ -84,14 +87,14 @@ pub fn spawn_usage_poller(state: AppState) {
 
 /// Poll every imported account of every `claude_oauth` and ChatGPT-backend
 /// `chatgpt_oauth` provider once. Re-snapshots the live shared state so a
-/// reloaded provider list / account set is picked up. The physical-account
-/// dedup set (`polled`) is shared across both families: a Claude and a Codex
-/// upstream can never collide on it (they resolve from disjoint stores), but
-/// sharing it here mirrors how a single family already dedups aliases of the
-/// same account across multiple upstream names.
+/// reloaded provider list / account set is picked up. Successful observations
+/// are cached by their full physical account key for this tick. The key keeps
+/// Claude and ChatGPT store families separate while allowing every provider
+/// alias to receive the same observation.
 async fn poll_all(state: &AppState) {
     let state = state.refreshed();
-    let mut polled = HashSet::new();
+    let mut cached = HashMap::<AccountKey, CachedUsage>::new();
+    let mut pending = HashMap::<AccountKey, Vec<(String, AccountConfig)>>::new();
     for (name, provider) in &state.config.providers {
         match provider.auth {
             AuthMode::ClaudeOauth => {
@@ -113,27 +116,36 @@ async fn poll_all(state: &AppState) {
                 };
                 state.accounts.sync_enabled_accounts(name, &accounts);
                 for account in &accounts {
+                    let key = account_key(name, account);
+                    if let Some(CachedUsage::Claude(snapshot)) = cached.get(&key) {
+                        state.accounts.note_usage(name, account, snapshot);
+                        continue;
+                    }
+                    if cached.contains_key(&key) {
+                        tracing::debug!(
+                            provider = %name,
+                            account = %account.name,
+                            "usage poller: cached usage family does not match Claude account"
+                        );
+                        continue;
+                    }
+                    let aliases = pending.entry(key.clone()).or_default();
+                    if aliases.iter().any(|(provider, _)| provider == name) {
+                        continue;
+                    }
+                    aliases.push((name.clone(), account.clone()));
                     if !account_is_refreshable(account).await {
                         continue;
                     }
-                    let key = crate::accounts::account_key(name, account);
-                    if polled.contains(&key) {
+                    let Some(snapshot) =
+                        fetch_claude_usage(&state.http_client, &provider.base_url, account).await
+                    else {
                         continue;
+                    };
+                    for (provider, account) in pending.remove(&key).unwrap_or_default() {
+                        state.accounts.note_usage(&provider, &account, &snapshot);
                     }
-                    // Mark the physical identity polled only after a snapshot is applied,
-                    // so a later valid alias for the same account still reconciles when an
-                    // earlier alias fails to resolve its credential or fetch usage.
-                    if poll_account(
-                        &state.http_client,
-                        &state.accounts,
-                        name,
-                        &provider.base_url,
-                        account,
-                    )
-                    .await
-                    {
-                        polled.insert(key);
-                    }
+                    cached.insert(key, CachedUsage::Claude(snapshot));
                 }
             }
             AuthMode::ChatgptOauth if state.config.is_chatgpt_backend(name) => {
@@ -155,28 +167,127 @@ async fn poll_all(state: &AppState) {
                 };
                 state.accounts.sync_enabled_accounts(name, &accounts);
                 for account in &accounts {
+                    let key = account_key(name, account);
+                    if let Some(CachedUsage::Codex(report)) = cached.get(&key) {
+                        state.accounts.note_codex_usage(
+                            name,
+                            account,
+                            &report.usage,
+                            report.clear_five_hour,
+                            report.clear_seven_day,
+                        );
+                        continue;
+                    }
+                    if cached.contains_key(&key) {
+                        tracing::debug!(
+                            provider = %name,
+                            account = %account.name,
+                            "usage poller: cached usage family does not match Codex account"
+                        );
+                        continue;
+                    }
+                    let aliases = pending.entry(key.clone()).or_default();
+                    if aliases.iter().any(|(provider, _)| provider == name) {
+                        continue;
+                    }
+                    aliases.push((name.clone(), account.clone()));
                     if !codex_account_is_refreshable(account).await {
                         continue;
                     }
-                    let key = crate::accounts::account_key(name, account);
-                    if polled.contains(&key) {
+                    let Some(report) =
+                        fetch_codex_usage(&state.http_client, name, &provider.base_url, account)
+                            .await
+                    else {
                         continue;
+                    };
+                    for (provider, account) in pending.remove(&key).unwrap_or_default() {
+                        state.accounts.note_codex_usage(
+                            &provider,
+                            &account,
+                            &report.usage,
+                            report.clear_five_hour,
+                            report.clear_seven_day,
+                        );
                     }
-                    if poll_codex_account(
-                        &state.http_client,
-                        &state.accounts,
-                        &state.config,
-                        name,
-                        &provider.base_url,
-                        account,
-                    )
-                    .await
-                    {
-                        polled.insert(key);
-                    }
+                    cached.insert(key, CachedUsage::Codex(report));
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// A successful, non-empty usage observation that can be applied to aliases
+/// of the same physical account without resolving credentials or making a
+/// second network request. The account key includes the credential store
+/// family, so the two parser variants cannot cross-apply.
+#[derive(Clone)]
+enum CachedUsage {
+    Claude(UsageSnapshot),
+    Codex(codex::usage::WhamUsageReport),
+}
+
+/// Fetch and parse one Claude account's usage without mutating pool state.
+/// Empty snapshots and every failure stay uncached so a later alias can retry.
+async fn fetch_claude_usage(
+    client: &reqwest::Client,
+    base_url: &str,
+    account: &AccountConfig,
+) -> Option<UsageSnapshot> {
+    let credential = match resolve_claude_account(account, client).await {
+        Ok(credential) => credential,
+        Err(error) => {
+            tracing::debug!(account = %account.name, error = %error.message, "usage poller: failed to resolve account credential");
+            return None;
+        }
+    };
+    let Credential::ClaudeOauth { access_token, .. } = credential else {
+        return None;
+    };
+    match claude::usage::fetch_usage(client, base_url, &access_token).await {
+        Ok(snapshot) if !snapshot.is_empty() => Some(snapshot),
+        Ok(_) => {
+            tracing::debug!(account = %account.name, "usage poller: claude usage snapshot reported no windows, skipping");
+            None
+        }
+        Err(error) => {
+            tracing::debug!(account = %account.name, %error, "usage poller: usage fetch failed");
+            None
+        }
+    }
+}
+
+/// Fetch and parse one Codex account's wham report without mutating pool state.
+/// Empty reports and every failure stay uncached so a later alias can retry.
+async fn fetch_codex_usage(
+    client: &reqwest::Client,
+    provider: &str,
+    base_url: &str,
+    account: &AccountConfig,
+) -> Option<codex::usage::WhamUsageReport> {
+    let credential = match resolve_chatgpt_account(account, client).await {
+        Ok(credential) => credential,
+        Err(error) => {
+            tracing::debug!(provider, account = %account.name, error = %error.message, "usage poller: failed to resolve codex account credential");
+            return None;
+        }
+    };
+    let Credential::ChatGptOAuth {
+        access_token,
+        account_id,
+    } = credential
+    else {
+        return None;
+    };
+    match codex::usage::fetch_usage_report(client, base_url, &access_token, &account_id).await {
+        Ok(report) if !report.usage.is_empty() => Some(report),
+        Ok(_) => {
+            tracing::debug!(provider, account = %account.name, "usage poller: codex wham usage snapshot reported no windows, skipping");
+            None
+        }
+        Err(error) => {
+            tracing::debug!(provider, account = %account.name, %error, "usage poller: codex wham usage fetch failed");
+            None
         }
     }
 }
@@ -188,6 +299,7 @@ async fn poll_all(state: &AppState) {
 /// a usage snapshot was applied, so the caller can leave the physical identity
 /// un-deduplicated and let a later alias retry when this one fails to resolve
 /// or fetch.
+#[cfg(test)]
 async fn poll_account(
     client: &reqwest::Client,
     pool: &AccountPool,
@@ -198,35 +310,12 @@ async fn poll_account(
     if !account_is_refreshable(account).await {
         return false;
     }
-    let credential = match resolve_claude_account(account, client).await {
-        Ok(credential) => credential,
-        Err(error) => {
-            tracing::debug!(provider, account = %account.name, error = %error.message, "usage poller: failed to resolve account credential");
-            return false;
-        }
-    };
-    let Credential::ClaudeOauth { access_token, .. } = credential else {
+    let Some(snapshot) = fetch_claude_usage(client, base_url, account).await else {
         return false;
     };
-    match claude::usage::fetch_usage(client, base_url, &access_token).await {
-        Ok(snapshot) => {
-            // The Claude parser intentionally accepts partial responses, but
-            // an entirely unrecognizable 200 body also becomes an all-None
-            // snapshot. Applying that would mark the account observed and let
-            // `poll_all` dedup every other alias without any quota signal.
-            if snapshot.is_empty() {
-                tracing::debug!(provider, account = %account.name, "usage poller: claude usage snapshot reported no windows, skipping");
-                return false;
-            }
-            pool.note_usage(provider, account, &snapshot);
-            tracing::debug!(provider, account = %account.name, "usage poller: applied usage snapshot");
-            true
-        }
-        Err(error) => {
-            tracing::debug!(provider, account = %account.name, %error, "usage poller: usage fetch failed");
-            false
-        }
-    }
+    pool.note_usage(provider, account, &snapshot);
+    tracing::debug!(provider, account = %account.name, "usage poller: applied usage snapshot");
+    true
 }
 
 /// Poll one Codex (ChatGPT) account's private `wham/usage` endpoint: skip
@@ -238,6 +327,7 @@ async fn poll_account(
 /// `/codex/responses` — so a future caller of this function directly can never
 /// leak a wham request to a `chatgpt_oauth` provider pointed at a different
 /// base. Every failure degrades quietly to a debug log.
+#[cfg(test)]
 async fn poll_codex_account(
     client: &reqwest::Client,
     pool: &AccountPool,
@@ -252,47 +342,18 @@ async fn poll_codex_account(
     if !codex_account_is_refreshable(account).await {
         return false;
     }
-    let credential = match resolve_chatgpt_account(account, client).await {
-        Ok(credential) => credential,
-        Err(error) => {
-            tracing::debug!(provider, account = %account.name, error = %error.message, "usage poller: failed to resolve codex account credential");
-            return false;
-        }
-    };
-    let Credential::ChatGptOAuth {
-        access_token,
-        account_id,
-    } = credential
-    else {
+    let Some(report) = fetch_codex_usage(client, provider, base_url, account).await else {
         return false;
     };
-    match codex::usage::fetch_usage_report(client, base_url, &access_token, &account_id).await {
-        Ok(report) => {
-            // A recognizable-but-empty response (e.g. `{"primary_window":{}}`
-            // for a brand-new account with no consumption yet) parses as `Ok`
-            // with every window `None` -- see the parser's own doc comment.
-            // Applying that to the pool would mark the account observed and
-            // let `poll_all`'s physical-account dedup skip every other alias,
-            // permanently starving this account of a real observation.
-            if report.usage.is_empty() {
-                tracing::debug!(provider, account = %account.name, "usage poller: codex wham usage snapshot reported no windows, skipping");
-                return false;
-            }
-            pool.note_codex_usage(
-                provider,
-                account,
-                &report.usage,
-                report.clear_five_hour,
-                report.clear_seven_day,
-            );
-            tracing::debug!(provider, account = %account.name, "usage poller: applied codex wham usage snapshot");
-            true
-        }
-        Err(error) => {
-            tracing::debug!(provider, account = %account.name, %error, "usage poller: codex wham usage fetch failed");
-            false
-        }
-    }
+    pool.note_codex_usage(
+        provider,
+        account,
+        &report.usage,
+        report.clear_five_hour,
+        report.clear_seven_day,
+    );
+    tracing::debug!(provider, account = %account.name, "usage poller: applied codex wham usage snapshot");
+    true
 }
 
 /// Whether an account's credential is a refreshable imported login — the only
@@ -377,6 +438,79 @@ mod tests {
         ));
         std::fs::write(&path, contents).unwrap();
         path
+    }
+
+    /// Serve one deliberately truncated HTTP response. wiremock can return a
+    /// malformed body, but it cannot close a response after advertising more
+    /// bytes than it sent, which is the body-read failure under test.
+    async fn truncated_usage_server(body: &str) -> Option<(String, tokio::task::JoinHandle<()>)> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping truncated usage server test: loopback bind denied: {error}");
+                return None;
+            }
+            Err(error) => panic!("bind truncated usage test server: {error}"),
+        };
+        let address = listener
+            .local_addr()
+            .expect("truncated usage server has a local address");
+        let body = body.as_bytes().to_vec();
+        assert!(
+            body.len() > 1,
+            "truncated test body must contain multiple bytes"
+        );
+        let partial_len = body.len() - 1;
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("truncated usage server accepts one request");
+            let mut request = [0_u8; 4096];
+            let read = socket
+                .read(&mut request)
+                .await
+                .expect("truncated usage server reads the request");
+            assert!(read > 0, "truncated usage server received an empty request");
+
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            socket
+                .write_all(headers.as_bytes())
+                .await
+                .expect("truncated usage server writes response headers");
+            socket
+                .write_all(&body[..partial_len])
+                .await
+                .expect("truncated usage server writes partial response body");
+            socket
+                .flush()
+                .await
+                .expect("truncated usage server flushes response");
+            socket
+                .shutdown()
+                .await
+                .expect("truncated usage server closes response");
+        });
+        Some((format!("http://{address}"), handle))
+    }
+
+    /// Join a one-shot test server without allowing a broken client request to
+    /// leave a task behind. A timeout aborts the task before the test fails.
+    async fn join_test_server(handle: tokio::task::JoinHandle<()>) {
+        let mut handle = handle;
+        match tokio::time::timeout(Duration::from_secs(5), &mut handle).await {
+            Ok(result) => result.expect("truncated usage server task succeeds"),
+            Err(_) => {
+                handle.abort();
+                let _ = handle.await;
+                panic!("truncated usage server did not finish within 5 seconds");
+            }
+        }
     }
 
     fn account_with_credentials(path: &Path) -> AccountConfig {
@@ -520,6 +654,42 @@ mod tests {
         assert!(
             !snap[0].has_state,
             "a failed usage fetch must not record state"
+        );
+
+        let _ = std::fs::remove_file(creds);
+    }
+
+    #[tokio::test]
+    async fn poll_account_preserves_state_on_truncated_response_body() {
+        let creds = write_temp(
+            "claude-body-read-error",
+            &refreshable_claude_credential_json(None),
+        );
+        let account = account_with_credentials(&creds);
+        let Some((base_url, server)) =
+            truncated_usage_server(r#"{"five_hour":{"utilization":20.0}}"#).await
+        else {
+            let _ = std::fs::remove_file(creds);
+            return;
+        };
+
+        let pool = AccountPool::new();
+        seed_full_anthropic_quota(&pool, "claude-body-read-error", &account);
+        let before = pool.export_quotas();
+        let applied = poll_account(
+            &reqwest::Client::new(),
+            &pool,
+            "claude-body-read-error",
+            &base_url,
+            &account,
+        )
+        .await;
+        assert!(!applied, "a truncated body must be a failed observation");
+        join_test_server(server).await;
+        assert_eq!(
+            pool.export_quotas(),
+            before,
+            "a body-read error must preserve the complete prior quota state"
         );
 
         let _ = std::fs::remove_file(creds);
@@ -810,6 +980,359 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_all_retries_after_truncated_claude_alias_body() {
+        use crate::config::Config;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let creds = write_temp(
+            "claude-truncated-alias",
+            &refreshable_claude_credential_json(Some("acct-claude-truncated-alias")),
+        );
+        let mut account = account_with_credentials(&creds);
+        account.uuid = Some("acct-claude-truncated-alias".to_string());
+        let Some((truncated_url, truncated_server)) =
+            truncated_usage_server(r#"{"five_hour":{"utilization":20.0}}"#).await
+        else {
+            let _ = std::fs::remove_file(creds);
+            return;
+        };
+
+        let success_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/oauth/usage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "five_hour": { "utilization": 37.0 }
+            })))
+            .expect(1)
+            .mount(&success_server)
+            .await;
+
+        let mut config = Config::default();
+        config.providers.remove("codex");
+        let mut provider = config
+            .providers
+            .get("anthropic")
+            .cloned()
+            .expect("default config has an anthropic provider");
+        provider.auth = AuthMode::ClaudeOauth;
+        provider.accounts = vec![account.clone()];
+        provider.base_url = truncated_url;
+        config
+            .providers
+            .insert("n1-a-claude-truncated".to_string(), provider.clone());
+        provider.base_url = success_server.uri();
+        config
+            .providers
+            .insert("n1-b-claude-valid".to_string(), provider);
+        let state = AppState::new(config, reqwest::Client::new()).unwrap();
+
+        poll_all(&state).await;
+        join_test_server(truncated_server).await;
+
+        assert_eq!(
+            success_server.received_requests().await.unwrap().len(),
+            1,
+            "the valid alias must receive exactly one retry request"
+        );
+        let failed_snapshot = state.accounts.snapshot(
+            "n1-a-claude-truncated",
+            std::slice::from_ref(&account),
+            None,
+            None,
+        );
+        let success_snapshot = state.accounts.snapshot(
+            "n1-b-claude-valid",
+            std::slice::from_ref(&account),
+            None,
+            None,
+        );
+        assert_eq!(failed_snapshot[0].utilization_5h, Some(0.37));
+        assert_eq!(success_snapshot[0].utilization_5h, Some(0.37));
+        assert_eq!(
+            serde_json::to_value(&failed_snapshot).unwrap(),
+            serde_json::to_value(&success_snapshot).unwrap(),
+            "a later successful observation must replay to the failed alias"
+        );
+        assert_eq!(
+            crate::metrics::pool_utilization_value_for_tests("n1-a-claude-truncated", "5h"),
+            Some(0.37)
+        );
+        assert_eq!(
+            crate::metrics::pool_utilization_value_for_tests("n1-b-claude-valid", "5h"),
+            Some(0.37)
+        );
+        assert_eq!(
+            only_exported_quota(&state.accounts).utilization_5h,
+            Some(0.37)
+        );
+
+        let _ = std::fs::remove_file(creds);
+    }
+
+    #[tokio::test]
+    async fn poll_all_applies_cached_codex_report_to_each_alias_and_metric() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let access_token = chatgpt_access_token("acct-codex-alias");
+        let creds = write_temp(
+            "codex-alias-cache",
+            &codex_credential_json(&access_token, Some("refresh"), "acct-codex-alias"),
+        );
+        let mut refreshable = codex_account_with_credentials(&creds);
+        refreshable.uuid = Some("acct-codex-alias".to_string());
+        let static_alias = AccountConfig {
+            name: "codex-static-alias".to_string(),
+            token_env: Some("SHUNT_TEST_CODEX_STATIC_ALIAS".to_string()),
+            uuid: Some("acct-codex-alias".to_string()),
+            ..Default::default()
+        };
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/wham/usage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "primary_window": {
+                    "used_percent": 65.0,
+                    "limit_window_seconds": 18_000
+                },
+                "secondary_window": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut config = Config::default();
+        let mut provider = config
+            .providers
+            .remove("codex")
+            .expect("default config has a codex provider");
+        provider.base_url = server.uri();
+        provider.accounts = vec![refreshable.clone()];
+        config
+            .providers
+            .insert("a-codex-alias".to_string(), provider.clone());
+        provider.accounts = vec![static_alias.clone()];
+        config
+            .providers
+            .insert("b-codex-alias".to_string(), provider);
+
+        let state = AppState::new(config, reqwest::Client::new()).unwrap();
+        seed_full_codex_quota(&state.accounts, &refreshable);
+        poll_all(&state).await;
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "aliases must share one usage request");
+        for (provider, account) in [
+            ("a-codex-alias", &refreshable),
+            ("b-codex-alias", &static_alias),
+        ] {
+            let snapshot =
+                state
+                    .accounts
+                    .snapshot(provider, std::slice::from_ref(account), None, None);
+            assert!(snapshot[0].has_state);
+            assert_eq!(snapshot[0].utilization_5h, Some(0.65));
+            assert_eq!(snapshot[0].utilization_7d, None);
+            assert_eq!(
+                crate::metrics::pool_utilization_value_for_tests(provider, "5h"),
+                Some(0.65)
+            );
+            assert_eq!(
+                crate::metrics::pool_utilization_value_for_tests(provider, "7d"),
+                None
+            );
+        }
+        let quota = only_exported_quota(&state.accounts);
+        assert_eq!(quota.utilization_7d, None);
+        assert_eq!(quota.reset_7d, None);
+        assert_eq!(quota.status_7d, None);
+        assert_eq!(quota.observed_at_7d, None);
+
+        let _ = std::fs::remove_file(creds);
+    }
+
+    #[tokio::test]
+    async fn poll_all_retries_a_failed_codex_alias_before_caching() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let access_token = chatgpt_access_token("acct-codex-retry");
+        let creds = write_temp(
+            "codex-alias-retry",
+            &codex_credential_json(&access_token, Some("refresh"), "acct-codex-retry"),
+        );
+        let mut account = codex_account_with_credentials(&creds);
+        account.uuid = Some("acct-codex-retry".to_string());
+
+        let failure_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/wham/usage"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("temporary failure"))
+            .expect(1)
+            .mount(&failure_server)
+            .await;
+        let success_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/wham/usage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "primary_window": {
+                    "used_percent": 37.0,
+                    "limit_window_seconds": 18_000
+                }
+            })))
+            .expect(1)
+            .mount(&success_server)
+            .await;
+
+        let mut config = Config::default();
+        let mut provider = config
+            .providers
+            .remove("codex")
+            .expect("default config has a codex provider");
+        provider.accounts = vec![account.clone()];
+        provider.base_url = failure_server.uri();
+        config
+            .providers
+            .insert("a-codex-failed".to_string(), provider.clone());
+        provider.base_url = success_server.uri();
+        config
+            .providers
+            .insert("b-codex-success".to_string(), provider);
+        let state = AppState::new(config, reqwest::Client::new()).unwrap();
+
+        poll_all(&state).await;
+
+        assert_eq!(failure_server.received_requests().await.unwrap().len(), 1);
+        assert_eq!(success_server.received_requests().await.unwrap().len(), 1);
+        let failed_snapshot =
+            state
+                .accounts
+                .snapshot("a-codex-failed", std::slice::from_ref(&account), None, None);
+        let success_snapshot = state.accounts.snapshot(
+            "b-codex-success",
+            std::slice::from_ref(&account),
+            None,
+            None,
+        );
+        assert_eq!(failed_snapshot[0].utilization_5h, Some(0.37));
+        assert_eq!(success_snapshot[0].utilization_5h, Some(0.37));
+        assert_eq!(
+            serde_json::to_value(&failed_snapshot).unwrap(),
+            serde_json::to_value(&success_snapshot).unwrap(),
+            "a later successful observation must replay to the failed alias"
+        );
+        assert_eq!(
+            crate::metrics::pool_utilization_value_for_tests("a-codex-failed", "5h"),
+            Some(0.37)
+        );
+        assert_eq!(
+            crate::metrics::pool_utilization_value_for_tests("b-codex-success", "5h"),
+            Some(0.37)
+        );
+        assert_eq!(
+            only_exported_quota(&state.accounts).utilization_5h,
+            Some(0.37)
+        );
+
+        let _ = std::fs::remove_file(creds);
+    }
+
+    #[tokio::test]
+    async fn poll_all_retries_after_truncated_codex_alias_body() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let access_token = chatgpt_access_token("acct-codex-truncated-alias");
+        let creds = write_temp(
+            "codex-truncated-alias",
+            &codex_credential_json(&access_token, Some("refresh"), "acct-codex-truncated-alias"),
+        );
+        let mut account = codex_account_with_credentials(&creds);
+        account.uuid = Some("acct-codex-truncated-alias".to_string());
+        let Some((truncated_url, truncated_server)) = truncated_usage_server(
+            r#"{"primary_window":{"used_percent":20.0,"limit_window_seconds":18000}}"#,
+        )
+        .await
+        else {
+            let _ = std::fs::remove_file(creds);
+            return;
+        };
+
+        let success_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/wham/usage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "primary_window": {
+                    "used_percent": 37.0,
+                    "limit_window_seconds": 18_000
+                }
+            })))
+            .expect(1)
+            .mount(&success_server)
+            .await;
+
+        let mut config = Config::default();
+        let mut provider = config
+            .providers
+            .remove("codex")
+            .expect("default config has a codex provider");
+        provider.accounts = vec![account.clone()];
+        provider.base_url = truncated_url;
+        config
+            .providers
+            .insert("n1-a-codex-truncated".to_string(), provider.clone());
+        provider.base_url = success_server.uri();
+        config
+            .providers
+            .insert("n1-b-codex-valid".to_string(), provider);
+        let state = AppState::new(config, reqwest::Client::new()).unwrap();
+
+        poll_all(&state).await;
+        join_test_server(truncated_server).await;
+
+        assert_eq!(
+            success_server.received_requests().await.unwrap().len(),
+            1,
+            "the valid alias must receive exactly one retry request"
+        );
+        let failed_snapshot = state.accounts.snapshot(
+            "n1-a-codex-truncated",
+            std::slice::from_ref(&account),
+            None,
+            None,
+        );
+        let success_snapshot = state.accounts.snapshot(
+            "n1-b-codex-valid",
+            std::slice::from_ref(&account),
+            None,
+            None,
+        );
+        assert_eq!(failed_snapshot[0].utilization_5h, Some(0.37));
+        assert_eq!(success_snapshot[0].utilization_5h, Some(0.37));
+        assert_eq!(
+            serde_json::to_value(&failed_snapshot).unwrap(),
+            serde_json::to_value(&success_snapshot).unwrap(),
+            "a later successful observation must replay to the failed alias"
+        );
+        assert_eq!(
+            crate::metrics::pool_utilization_value_for_tests("n1-a-codex-truncated", "5h"),
+            Some(0.37)
+        );
+        assert_eq!(
+            crate::metrics::pool_utilization_value_for_tests("n1-b-codex-valid", "5h"),
+            Some(0.37)
+        );
+        assert_eq!(
+            only_exported_quota(&state.accounts).utilization_5h,
+            Some(0.37)
+        );
+
+        let _ = std::fs::remove_file(creds);
+    }
+
+    #[tokio::test]
     async fn poll_account_skips_non_refreshable_without_fetching() {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -919,6 +1442,10 @@ mod tests {
     }
 
     fn seed_full_codex_quota(pool: &AccountPool, account: &AccountConfig) {
+        seed_full_anthropic_quota(pool, "codex", account);
+    }
+
+    fn seed_full_anthropic_quota(pool: &AccountPool, provider: &str, account: &AccountConfig) {
         use reqwest::header::{HeaderMap, HeaderValue};
 
         let future = std::time::SystemTime::now()
@@ -953,13 +1480,61 @@ mod tests {
         ] {
             headers.insert(name, HeaderValue::from_str(&value).unwrap());
         }
-        pool.note_quota("codex", account, &headers);
+        pool.note_quota(provider, account, &headers);
     }
 
     fn only_exported_quota(pool: &AccountPool) -> crate::accounts::QuotaState {
         let quotas = pool.export_quotas();
         assert_eq!(quotas.len(), 1, "test pool must carry one quota entry");
         quotas.into_iter().next().unwrap().1
+    }
+
+    #[tokio::test]
+    async fn poll_codex_account_preserves_state_on_truncated_response_body() {
+        let access_token = chatgpt_access_token("acct-codex-body-read-error");
+        let creds = write_temp(
+            "codex-body-read-error",
+            &codex_credential_json(&access_token, Some("refresh"), "acct-codex-body-read-error"),
+        );
+        let account = codex_account_with_credentials(&creds);
+        let Some((base_url, server)) = truncated_usage_server(
+            r#"{"primary_window":{"used_percent":20.0,"limit_window_seconds":18000}}"#,
+        )
+        .await
+        else {
+            let _ = std::fs::remove_file(creds);
+            return;
+        };
+
+        let pool = AccountPool::new();
+        seed_full_codex_quota(&pool, &account);
+        let before = pool.export_quotas();
+        let config = codex_backend_config(&base_url, account.clone());
+        let applied = poll_codex_account(
+            &reqwest::Client::new(),
+            &pool,
+            &config,
+            "codex",
+            &base_url,
+            &account,
+        )
+        .await;
+        assert!(!applied, "a truncated body must be a failed observation");
+        join_test_server(server).await;
+        assert_eq!(
+            pool.export_quotas(),
+            before,
+            "a body-read error must preserve quota and clear flags"
+        );
+        let snapshot = pool.snapshot("codex", std::slice::from_ref(&account), None, None);
+        assert!(
+            snapshot[0].has_state,
+            "the prior observed state must survive"
+        );
+        assert_eq!(snapshot[0].utilization_5h, Some(0.11));
+        assert_eq!(snapshot[0].utilization_7d, Some(0.22));
+
+        let _ = std::fs::remove_file(creds);
     }
 
     /// Test 24: a live-shaped weekly-only `wham/usage` response applies the
