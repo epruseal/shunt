@@ -182,6 +182,14 @@ headers = { "x-api-key" = "..." }
 
 デフォルトでは `/device` は forwarding header を無視し、socket peer を rate limit します。shunt が、client 提供の forwarding header を削除して自分の値を設定する trusted reverse proxy からのみ到達可能な場合に限り、`trust_forwarded_for = true` を設定してください。直接公開された gateway では有効化しないでください。
 
+## `[server.usage]`（オプション）
+
+このテーブルの存在により、共有アカウントプールのクォータ状態をサニタイズして集約した `GET /usage` が登録されます。管理サーフェスを使わずに、クライアントがスロットリングを予測するためのエンドポイントです（[エンドポイントの詳細](/ja/reference/endpoints/)）。テーブルがなければ、ルートは登録されません。
+
+現在このテーブルにキーはなく、存在だけで有効になります。[`[server.auth]`](#serverauthオプション) が必須です。呼び出し元をクライアントトークンで識別するため、`[server.auth]` なしで `[server.usage]` を設定すると起動に失敗し、プールのテレメトリーを未認証で提供することはありません。
+
+`GET /usage` は `/v1/messages` と同じクライアントトークン（設定されたヘッダー、`x-api-key`、または `Authorization: Bearer`）で認証し、ウィンドウごとの残り余裕、リセット時刻、`ok`／`degraded`／`exhausted` のステータスを返します。アカウント名、件数、priority、`disabled`、しきい値、アカウント単位の数値は返しません。ウィンドウが `null` になるのは、無効化されていないアカウントがそのウィンドウを一度も報告していない場合だけです。Codex の `x-codex-*` レスポンスヘッダーは 5 時間と共有週次ウィンドウを埋めます。Codex 自体には Fable スコープ（`7d_oi`）のシグナルはありませんが、混在したプロバイダープールでは別のプロバイダーが集約 Fable 値を提供できます。このブランチは帯域外 Codex ポーラーを追加せず、#430 用に確保した非公開・未文書化の ChatGPT usage API も呼び出しません。
+
 ## `[server.pool]`（オプション）
 
 バージョン2の移行では、`observed_at_status` のない集約 `status` が、保存された `reset_5h`、`reset_7d`、`reset_7d_oi` のうち最も早いリセットを不変の期限として捕捉します。そのリセットがすでに過ぎている場合は、期限切れのリセット、スタンプのない集約 `status`、およびそのために合成したスタンプを同じ import で削除します。7 日という妥当な範囲を超える未来のリセットは、起動時刻から 7 日後を上限にします。リセットがなければ起動時刻から 7 日の上限を開始します。既存の v2 スタンプはリセットから再解釈しませんが、通常の import は孤立したメタデータを正規化し、経過したシグナルを失効させ、未来の時刻を起動時刻に補正し、残ったスタンプのない集約には必要に応じて起動時刻を設定します。後続の reset-only または usage 更新は捕捉した期限を延長せず、v3 への書き換えと二回目の復元後も同じ状態を保ちます。
@@ -201,7 +209,7 @@ headers = { "x-api-key" = "..." }
 | `ramp_initial_concurrency` | 無効（`0`/未設定） | ストーム制御: トラフィックを受け始めたばかりのアカウントアイデンティティに対する初期の並行受け入れ許容量。`0` または未設定で受け入れゲーティングは無効 |
 | `reprobe_seconds` | このテーブルが存在すれば `900`。`0` で無効 | 陳腐化した近接クォータの Codex/ChatGPT アカウントに対する日和見的な再プローブ間隔（秒）。60 未満の正の値は 60 秒の下限に切り上げられます。`0` で再プローブは無効。`[server.pool]` 自体が存在しない場合、この値に関係なく再プローブは無効（issue #135 以前の挙動）。プロバイダーの WebSocket 転送が有効な場合、outbound Responses 選択でも再プローブは無効 |
 
-各ウィンドウ `X` について、有効なソフトしきい値は次の順で解決されます: アカウントの `threshold_X` → アカウントの `threshold` → `default_threshold_X` → `default_threshold` → `hard_threshold`。これは `hard_threshold` を上限としてクランプされます。すべてのしきい値は `[0.0, 1.0]` の使用率の割合であり、範囲外の値は起動時にエラーになります。しきい値とバーンレートのノブは両方のプールファミリーを制御します: Anthropic プールは `anthropic-ratelimit-unified-*` ヘッダーから、Codex/ChatGPT プールは `x-codex-*` の 5 時間／週次ウィンドウから制御されます（Codex には Fable スコープの `7d_oi` ウィンドウがないため、そこでは `default_threshold_fable` は無効です）。`usage_refresh_seconds` は Anthropic 専用です — Codex には帯域外の usage API がありません。
+各ウィンドウ `X` について、有効なソフトしきい値は次の順で解決されます: アカウントの `threshold_X` → アカウントの `threshold` → `default_threshold_X` → `default_threshold` → `hard_threshold`。これは `hard_threshold` を上限としてクランプされます。すべてのしきい値は `[0.0, 1.0]` の使用率の割合であり、範囲外の値は起動時にエラーになります。しきい値とバーンレートのノブは両方のプールファミリーを制御します: Anthropic プールは `anthropic-ratelimit-unified-*` ヘッダーから、Codex/ChatGPT プールは `x-codex-*` の 5 時間／週次ウィンドウから制御されます（Codex には Fable スコープの `7d_oi` ウィンドウがないため、そこでは `default_threshold_fable` は無効です）。`usage_refresh_seconds` は Anthropic 専用です。このブランチは非公開・未文書化の ChatGPT usage API をポーリングせず、帯域外 Codex ポーラーは #430 用に確保されているため、ここではその API への依存を導入しません。
 
 正の `usage_refresh_seconds` は追加でバックグラウンドポーラーを起動し、Claude アカウントプールのクォータ状態を Anthropic OAuth usage API と突き合わせて補正します。未設定または `0` で無効（デフォルト）です。ポーリングされるのは imported（更新可能）な `claude_oauth` アカウントのみで、長期の `claude setup-token` や `token_env` アカウントは、usage エンドポイントが更新不可トークンを拒否するためスキップされます。ポーラーは報告された各ウィンドウの使用率、そのウィンドウ固有のリセット時刻、使用率の観測時刻を更新します。ウィンドウ別および集約 status の鮮度と、status の観測時にキャプチャしたリセット境界だけがヘッダー由来のままです。shunt の外での同一アカウントの消費まで含む権威ある使用量と突き合わせても、status の寿命は延長しません。間隔は起動時に固定され、設定のリロードではポーラーの起動・停止・再調整は行われません。
 

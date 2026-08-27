@@ -5,6 +5,8 @@ description: 将 ChatGPT/Codex 订阅 OAuth 账户组成池,以会话粘性、�
 
 shunt 可以在一个 `chatgpt_oauth` 提供方背后把多个 ChatGPT 订阅 OAuth 凭据组成池 —— 既可以是内置的 `codex` 提供方,也可以是任何使用该认证模式的 `responses` 提供方。当 Claude Code 提供 `x-claude-code-session-id` 时请求具有会话粘性;不带该头部的请求使用按提供方的轮询。与 [Anthropic 账户池](/zh-cn/guides/anthropic-multi-account/)一样,选择是**感知配额**的:shunt 记录后端的 `x-codex-*` 5 小时/7 天用量窗口,并在粘性账户接近其配额时主动轮换掉它,而基于冷却的被动故障转移仍是安全兜底。
 
+面向客户端的 [`GET /usage`](/zh-cn/reference/endpoints/) 聚合仅在没有任何未禁用账户报告某个窗口时才将该窗口报告为 `null`。Codex 响应中的 `x-codex-*` 头部会填充 5 小时和共享每周窗口;Codex 本身没有 Fable 范围(`7d_oi`)的信号,但混合提供方池中的其他提供方可以提供聚合 Fable 值。本分支没有带外 Codex 轮询器。ChatGPT 后端存在私有、未公开文档的用量 API,但它为 #430 保留,本分支不会调用。
+
 
 
 <Aside type="caution" title="订阅条款">
@@ -176,7 +178,7 @@ x-shunt-account: backup
 
 ## 后续待办
 
-- **带外用量对账:** Anthropic 账户池可以轮询权威的用量 API(`usage_refresh_seconds`);Codex 没有对应接口,因此它的配额状态只能从响应头部刷新。
+- **带外用量对账:** Anthropic 账户池可以轮询权威的用量 API(`usage_refresh_seconds`)。本分支不轮询 ChatGPT 后端的私有、未公开文档的用量 API,因此这里的 Codex 配额状态从响应头部刷新;带外 Codex 轮询器保留给 #430。
 - **管理 Web 预配:** 可选启用的[管理界面](/zh-cn/guides/admin-remote-provisioning/)可以在浏览器中运行 ChatGPT OAuth、存储一个可刷新的 Codex 账户、在共享的池表格中展示它,并显示上报的 5h/7d 用量(`7d_oi` 始终为空,因为 Codex 没有对应项)。
 
 账户池的完整内部机制见 [M10 行为规范](https://github.com/pleaseai/shunt/blob/main/docs/m10-codex-multi-account.md),单账户设置、模型路由以及力度/上下文配置见 [ChatGPT / Codex 指南](/zh-cn/guides/codex/)。

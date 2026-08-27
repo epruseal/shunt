@@ -193,6 +193,14 @@ headers = { "x-api-key" = "..." }
 
 `POST /backend-api/codex/responses`, `POST /responses`, `POST /v1/responses`를 등록하며, 모두 지정한 provider의 account pool이 처리합니다. `[server.auth]`가 있으면 다른 server-side credential route처럼 유효한 client token을 요구합니다. `[server.auth]`가 없으면 operator의 Codex credential을 주입하면서도 접근 가능한 누구에게나 **open** 상태이므로 loopback 외 환경에서는 반드시 보호하세요. `/v1/messages`와 달리 request는 Anthropic Messages로 변환하거나 그 반대로 변환하지 않고 upstream과 verbatim relay합니다.
 
+## `[server.usage]` (선택)
+
+이 테이블은 공유 계정 풀의 쿼터 상태를 정제해 집계한 클라이언트용 `GET /usage`를 등록하므로, 관리자 화면 없이도 클라이언트가 스로틀링을 예상할 수 있습니다([엔드포인트 상세](/ko/reference/endpoints/)). 테이블이 없으면 라우트도 등록되지 않습니다.
+
+현재 이 테이블에는 키가 없으며, 존재만으로 활성화됩니다. [`[server.auth]`](#serverauth-선택)가 필수입니다. 엔드포인트는 클라이언트 토큰으로 호출자를 식별하므로 `[server.auth]` 없이 `[server.usage]`를 설정하면 시작이 실패하고, 인증 없이 풀 텔레메트리를 제공하지 않습니다.
+
+`GET /usage`는 `/v1/messages`와 같은 클라이언트 토큰(구성된 헤더, `x-api-key`, `Authorization: Bearer`)으로 인증하고 창별 잔여 여유, 리셋 시각, `ok`/`degraded`/`exhausted` 상태를 반환합니다. 계정 이름, 수, priority, `disabled`, 임계값, 계정별 수치는 노출하지 않습니다. 비활성 계정이 아닌 계정 중 해당 창을 보고한 계정이 하나도 없을 때만 창이 `null`입니다. Codex 응답의 `x-codex-*` 헤더는 5시간 및 공유 주간 창을 채웁니다. Codex 자체에는 Fable 범위(`7d_oi`) 신호가 없지만 혼합 프로바이더 풀에서는 다른 프로바이더가 집계 Fable 값을 제공할 수 있습니다. 이 브랜치는 아웃오브밴드 Codex 폴러를 추가하지 않으며, #430에서 사용할 비공개·문서화되지 않은 ChatGPT usage API도 호출하지 않습니다.
+
 ## `[server.pool]` (선택)
 
 계정 풀을 위한 쿼터 인지 로드 밸런싱 튜닝 — Claude(Anthropic)([상세](/ko/guides/anthropic-multi-account/#선택-튜닝-serverpool))와, 이슈 #195부터는 Codex/ChatGPT([상세](/ko/guides/codex-multi-account/)). 테이블이 없으면 선택은 이 테이블이 존재하기 이전과 동일하게 단일 내장 `0.98` 임계값을 사용합니다.
@@ -210,7 +218,7 @@ headers = { "x-api-key" = "..." }
 | `ramp_initial_concurrency` | 비활성(`0`/미설정) | 폭주 제어: 방금 트래픽을 받기 시작한 계정 아이덴티티의 초기 동시 허용치. `0` 또는 미설정이면 허용 게이팅 비활성 |
 | `reprobe_seconds` | 이 테이블이 존재하면 `900`; `0`이면 비활성 | 오래된 근접 쿼터 Codex/ChatGPT 계정을 위한 기회적 재탐침 간격(초); 60 미만의 양수 값은 60초 하한으로 올림. `0`이면 재탐침 비활성; `[server.pool]` 자체가 없으면 이 값과 무관하게 재탐침 비활성(#135 이전 동작). 프로바이더의 WebSocket 전송을 켜면 outbound Responses 선택에서도 재탐침 비활성 |
 
-각 창 `X`에 대해 유효 소프트 임계값은 다음 순서로 결정됩니다: 계정 `threshold_X` → 계정 `threshold` → `default_threshold_X` → `default_threshold` → `hard_threshold`, 그리고 `hard_threshold`로 상한이 걸립니다. 모든 임계값은 `[0.0, 1.0]` 범위의 사용률 비율이며, 범위를 벗어나면 시작이 실패합니다. 임계값과 번-레이트 노브는 두 풀 계열 모두를 관장합니다: Anthropic 풀은 `anthropic-ratelimit-unified-*` 헤더로부터, Codex/ChatGPT 풀은 `x-codex-*` 5시간/주간 윈도우로부터 동작합니다(Codex에는 Fable 범위의 `7d_oi` 창이 없어 `default_threshold_fable`은 그곳에서 무력화됩니다). `usage_refresh_seconds`는 Anthropic 전용입니다 — Codex에는 out-of-band usage API가 없습니다.
+각 창 `X`에 대해 유효 소프트 임계값은 다음 순서로 결정됩니다: 계정 `threshold_X` → 계정 `threshold` → `default_threshold_X` → `default_threshold` → `hard_threshold`, 그리고 `hard_threshold`로 상한이 걸립니다. 모든 임계값은 `[0.0, 1.0]` 범위의 사용률 비율이며, 범위를 벗어나면 시작이 실패합니다. 임계값과 번-레이트 노브는 두 풀 계열 모두를 관장합니다: Anthropic 풀은 `anthropic-ratelimit-unified-*` 헤더로부터, Codex/ChatGPT 풀은 `x-codex-*` 5시간/주간 윈도우로부터 동작합니다(Codex에는 Fable 범위의 `7d_oi` 창이 없어 `default_threshold_fable`은 그곳에서 무력화됩니다). `usage_refresh_seconds`는 Anthropic 전용입니다. 이 브랜치는 비공개·문서화되지 않은 ChatGPT usage API를 폴링하지 않으며, 아웃오브밴드 Codex 폴러는 #430에 예약되어 있어 이곳에 해당 API 의존성을 추가하지 않습니다.
 
 양수 `usage_refresh_seconds`는 추가로 백그라운드 폴러를 시작해, Claude 계정 풀의 쿼터 상태를 Anthropic OAuth usage API와 대조해 재보정합니다; 미설정 또는 `0`이면 비활성(기본값)입니다. imported(갱신 가능) `claude_oauth` 계정만 폴링되며 — 장기 `claude setup-token`이나 `token_env` 계정은 usage 엔드포인트가 비갱신 토큰을 거부하므로 건너뜁니다. 폴러는 보고된 각 창의 사용률, 해당 창의 고유 리셋 시각과 사용률 관측 시각을 갱신합니다. 창별 및 집계 status의 freshness와 status 관측 때 캡처한 리셋 경계만 헤더에서 유지합니다. shunt 외부의 동일 계정 소비까지 포함한 권위 있는 사용량과 대조하지만 status 수명은 연장하지 않습니다. 간격은 부팅 시 고정되며, 설정 리로드는 폴러를 시작·중지·재조정하지 않습니다.
 

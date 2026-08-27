@@ -182,6 +182,14 @@ headers = { "x-api-key" = "..." }
 
 默认情况下,`/device` 忽略 forwarding header 并按 socket peer 做 rate limit。只有在 shunt 仅能通过会删除 client 所提供 forwarding header 并设置自身值的 trusted reverse proxy 访问时,才设置 `trust_forwarded_for = true`。不要在直接暴露的 gateway 上启用。
 
+## `[server.usage]`(可选)
+
+存在此表会注册面向客户端的 `GET /usage`,返回共享账户池配额状态的**净化聚合**视图,使非管理员客户端无需管理界面也能预判限流([端点详情](/zh-cn/reference/endpoints/))。没有此表时,该路由不会注册。
+
+此表目前没有键,仅凭存在即启用。它**要求 [`[server.auth]`](#serverauth可选)**:端点通过客户端 token 识别调用方,因此配置 `[server.usage]` 却没有 `[server.auth]` 时启动会失败,不会在未认证的情况下提供池遥测。
+
+`GET /usage` 使用与 `/v1/messages` 相同的客户端 token(配置的头部、`x-api-key` 或 `Authorization: Bearer`)进行认证,并返回每个窗口的剩余余量、重置时间以及 `ok`/`degraded`/`exhausted` 状态。它不会暴露账户名称、数量、优先级、`disabled`、阈值或账户级数值。只有在没有任何未禁用账户报告某个窗口时,该窗口才是 `null`。Codex 响应中的 `x-codex-*` 头部会填充 5 小时和共享每周窗口。Codex 本身没有 Fable 范围(`7d_oi`)的信号,但混合提供方池中的其他提供方可以提供聚合 Fable 值。本分支不添加带外 Codex 轮询器,也不会调用为 #430 保留的私有、未公开文档的 ChatGPT 用量 API。
+
 ## `[server.pool]`(可选)
 
 迁移时,没有 `observed_at_status` 的聚合 `status` 会捕获已保存的 `reset_5h`、`reset_7d`、`reset_7d_oi` 中最早的重置作为不可变期限。若该重置已经过去,则在同一次 import 中同时删除已过期的重置、无时间戳的聚合 `status` 及其合成时间戳。超过合理七天范围的未来重置会保守地限制在启动时间加七天;没有重置时则从启动时间开始七天上限。已有 v2 时间戳不会根据重置重新解释,但正常 import 仍会规范化孤立元数据、使已过去的信号失效、将未来时间钳制到启动时间,并在必要时为仍存活且无时间戳的聚合补上启动时间。后续 reset-only 或 usage 更新不会延长期限,重写为 v3 并第二次恢复后结果仍保持等价。
@@ -201,7 +209,7 @@ headers = { "x-api-key" = "..." }
 | `ramp_initial_concurrency` | 禁用(`0`/未设置) | 风暴控制:对刚开始承接流量的账户身份的初始并发准入额度。`0` 或未设置则禁用准入门控 |
 | `reprobe_seconds` | 只要该表存在就是 `900`;`0` 则禁用 | 对陈旧的近配额 Codex/ChatGPT 账户进行机会性重新探测的间隔(秒);低于 60 的正值会向上取到 60 秒下限。`0` 禁用重新探测;若 `[server.pool]` 本身不存在,无论该值为何都禁用重新探测(#135 之前的行为)。为提供方启用 WebSocket 传输时,outbound Responses 选择也会禁用重新探测 |
 
-对每个窗口 `X`,生效的软阈值按以下顺序解析:账户 `threshold_X` → 账户 `threshold` → `default_threshold_X` → `default_threshold` → `hard_threshold`,并以 `hard_threshold` 为上限。所有阈值都是 `[0.0, 1.0]` 范围内的使用率分数;超出范围会导致启动失败。阈值与 burn-rate 旋钮对两个池家族都生效:Anthropic 池取自其 `anthropic-ratelimit-unified-*` 头部,Codex/ChatGPT 池取自其 `x-codex-*` 5 小时/周窗口(Codex 没有 Fable 范围的 `7d_oi` 窗口,因此 `default_threshold_fable` 在那里不起作用)。`usage_refresh_seconds` 仅限 Anthropic —— Codex 没有带外 usage API。
+对每个窗口 `X`,生效的软阈值按以下顺序解析:账户 `threshold_X` → 账户 `threshold` → `default_threshold_X` → `default_threshold` → `hard_threshold`,并以 `hard_threshold` 为上限。所有阈值都是 `[0.0, 1.0]` 范围内的使用率分数;超出范围会导致启动失败。阈值与 burn-rate 旋钮对两个池家族都生效:Anthropic 池取自其 `anthropic-ratelimit-unified-*` 头部,Codex/ChatGPT 池取自其 `x-codex-*` 5 小时/周窗口(Codex 没有 Fable 范围的 `7d_oi` 窗口,因此 `default_threshold_fable` 在那里不起作用)。`usage_refresh_seconds` 仅限 Anthropic。本分支不轮询私有、未公开文档的 ChatGPT 用量 API;带外 Codex 轮询器保留给 #430,因此这里不会引入对该私有 API 的依赖。
 
 正的 `usage_refresh_seconds` 还会启动一个后台轮询器,把 Claude 账户池的配额状态与 Anthropic OAuth usage API 对账校正;未设置或为 `0` 时禁用(默认)。只有 imported(可刷新)的 `claude_oauth` 账户会被轮询 —— 长期 `claude setup-token` 或 `token_env` 账户会被跳过,因为 usage 端点会拒绝不可刷新的令牌。轮询器会更新每个报告窗口的用量、该窗口自身的重置时刻和用量观测时间;只有按窗口及聚合 status 的新鲜度,以及观测 status 时捕获的重置边界仍由头部驱动,即使权威用量包含 shunt 之外同一账户的消耗。间隔在启动时固定;配置重载不会启动、停止或重新调整轮询器。
 
