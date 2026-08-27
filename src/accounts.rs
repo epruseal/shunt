@@ -618,13 +618,24 @@ impl AccountPool {
                     {
                         continue;
                     }
-                    // Freshness is the newest of all four observation stamps;
-                    // an account with no stamps at all has never been observed
+                    // Freshness is the newest observation for each logical
+                    // window, combining its utilization and status stamps,
+                    // plus the independent aggregate status observation. An
+                    // account with no stamps at all has never been observed
                     // and is treated as infinitely old, i.e. always eligible.
                     let freshness = [
-                        health.quota.observed_at_5h,
-                        health.quota.observed_at_7d,
-                        health.quota.observed_at_7d_oi,
+                        health
+                            .quota
+                            .observed_at_5h
+                            .max(health.quota.observed_at_status_5h),
+                        health
+                            .quota
+                            .observed_at_7d
+                            .max(health.quota.observed_at_status_7d),
+                        health
+                            .quota
+                            .observed_at_7d_oi
+                            .max(health.quota.observed_at_status_7d_oi),
                         health.quota.observed_at_status,
                     ]
                     .into_iter()
@@ -5487,6 +5498,46 @@ mod tests {
     }
 
     #[test]
+    fn usage_only_poll_preserves_per_window_status_freshness() {
+        let pool = AccountPool::new();
+        let account = account("status-freshness");
+        pool.note_quota(
+            "anthropic",
+            &account,
+            &quota_headers(&[(QUOTA_STATUS_HEADERS[0], "rejected".to_string())]),
+        );
+        let key = account_key("anthropic", &account);
+        let status_observed_at = unix_now().saturating_sub(60);
+        {
+            let mut entries = pool.entries.lock().unwrap();
+            entries
+                .get_mut(&key)
+                .expect("status observation was recorded")
+                .quota
+                .observed_at_status_5h = Some(status_observed_at);
+        }
+
+        pool.note_usage(
+            "anthropic",
+            &account,
+            &UsageSnapshot {
+                five_hour: Some(UsageWindow {
+                    utilization: 0.1,
+                    resets_at: None,
+                }),
+                seven_day: None,
+                seven_day_oi: None,
+            },
+        );
+
+        let quota = pool.raw_quota_for_test(&key).unwrap().1;
+        assert_eq!(quota.observed_at_status_5h, Some(status_observed_at));
+        assert!(quota
+            .observed_at_5h
+            .is_some_and(|at| at >= status_observed_at));
+    }
+
+    #[test]
     fn usage_without_reset_preserves_header_reset() {
         let pool = AccountPool::new();
         let accounts = [account("a")];
@@ -6654,6 +6705,42 @@ mod tests {
             order,
             vec![other, sticky],
             "a freshly observed near-quota account sorts normally, with no promotion"
+        );
+    }
+
+    #[test]
+    fn fresh_per_window_status_rejection_suppresses_probe() {
+        let pool_cfg = PoolConfig {
+            default_threshold: Some(0.5),
+            reprobe_seconds: Some(60),
+            ..Default::default()
+        };
+        let pool = Arc::new(AccountPool::new());
+        let mut a = account("codex-a");
+        a.store_family = Some(StoreFamily::Chatgpt);
+        let mut b = account("codex-b");
+        b.store_family = Some(StoreFamily::Chatgpt);
+        let accounts = vec![a, b];
+        let session = "per-window-status-rejection";
+        let initial = pool.select_order("codex", &accounts, Some(session), None, Some(&pool_cfg));
+        let sticky = initial[0];
+        let other = initial[1];
+
+        {
+            let mut entries = pool.entries.lock().expect("account health lock poisoned");
+            let health = entries
+                .entry(account_key("codex", &accounts[sticky]))
+                .or_default();
+            health.quota.status_5h = Some("rejected".to_string());
+            health.quota.observed_at_status_5h = Some(unix_now());
+        }
+
+        let (order, reservation) =
+            pool.select_order_deferred("codex", &accounts, Some(session), None, Some(&pool_cfg));
+        assert_eq!(order, vec![other, sticky]);
+        assert!(
+            reservation.is_none(),
+            "a fresh 5h status must suppress probing"
         );
     }
 
