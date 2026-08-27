@@ -27,7 +27,7 @@
 //! — a `chatgpt_oauth` provider pointed at some other base is never polled.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -95,6 +95,7 @@ async fn poll_all(state: &AppState) {
     let state = state.refreshed();
     let mut cached = HashMap::<AccountKey, CachedUsage>::new();
     let mut pending = HashMap::<AccountKey, Vec<(String, AccountConfig)>>::new();
+    let mut applied = HashSet::<(AccountKey, String)>::new();
     for (name, provider) in &state.config.providers {
         match provider.auth {
             AuthMode::ClaudeOauth => {
@@ -118,7 +119,9 @@ async fn poll_all(state: &AppState) {
                 for account in &accounts {
                     let key = account_key(name, account);
                     if let Some(CachedUsage::Claude(snapshot)) = cached.get(&key) {
-                        state.accounts.note_usage(name, account, snapshot);
+                        if applied.insert((key.clone(), name.clone())) {
+                            state.accounts.note_usage(name, account, snapshot);
+                        }
                         continue;
                     }
                     if cached.contains_key(&key) {
@@ -129,11 +132,15 @@ async fn poll_all(state: &AppState) {
                         );
                         continue;
                     }
-                    let aliases = pending.entry(key.clone()).or_default();
-                    if aliases.iter().any(|(provider, _)| provider == name) {
+                    {
+                        let aliases = pending.entry(key.clone()).or_default();
+                        if !aliases.iter().any(|(provider, _)| provider == name) {
+                            aliases.push((name.clone(), account.clone()));
+                        }
+                    }
+                    if applied.contains(&(key.clone(), name.clone())) {
                         continue;
                     }
-                    aliases.push((name.clone(), account.clone()));
                     if !account_is_refreshable(account).await {
                         continue;
                     }
@@ -143,7 +150,9 @@ async fn poll_all(state: &AppState) {
                         continue;
                     };
                     for (provider, account) in pending.remove(&key).unwrap_or_default() {
-                        state.accounts.note_usage(&provider, &account, &snapshot);
+                        if applied.insert((key.clone(), provider.clone())) {
+                            state.accounts.note_usage(&provider, &account, &snapshot);
+                        }
                     }
                     cached.insert(key, CachedUsage::Claude(snapshot));
                 }
@@ -169,13 +178,15 @@ async fn poll_all(state: &AppState) {
                 for account in &accounts {
                     let key = account_key(name, account);
                     if let Some(CachedUsage::Codex(report)) = cached.get(&key) {
-                        state.accounts.note_codex_usage(
-                            name,
-                            account,
-                            &report.usage,
-                            report.clear_five_hour,
-                            report.clear_seven_day,
-                        );
+                        if applied.insert((key.clone(), name.clone())) {
+                            state.accounts.note_codex_usage(
+                                name,
+                                account,
+                                &report.usage,
+                                report.clear_five_hour,
+                                report.clear_seven_day,
+                            );
+                        }
                         continue;
                     }
                     if cached.contains_key(&key) {
@@ -186,11 +197,15 @@ async fn poll_all(state: &AppState) {
                         );
                         continue;
                     }
-                    let aliases = pending.entry(key.clone()).or_default();
-                    if aliases.iter().any(|(provider, _)| provider == name) {
+                    {
+                        let aliases = pending.entry(key.clone()).or_default();
+                        if !aliases.iter().any(|(provider, _)| provider == name) {
+                            aliases.push((name.clone(), account.clone()));
+                        }
+                    }
+                    if applied.contains(&(key.clone(), name.clone())) {
                         continue;
                     }
-                    aliases.push((name.clone(), account.clone()));
                     if !codex_account_is_refreshable(account).await {
                         continue;
                     }
@@ -201,13 +216,15 @@ async fn poll_all(state: &AppState) {
                         continue;
                     };
                     for (provider, account) in pending.remove(&key).unwrap_or_default() {
-                        state.accounts.note_codex_usage(
-                            &provider,
-                            &account,
-                            &report.usage,
-                            report.clear_five_hour,
-                            report.clear_seven_day,
-                        );
+                        if applied.insert((key.clone(), provider.clone())) {
+                            state.accounts.note_codex_usage(
+                                &provider,
+                                &account,
+                                &report.usage,
+                                report.clear_five_hour,
+                                report.clear_seven_day,
+                            );
+                        }
                     }
                     cached.insert(key, CachedUsage::Codex(report));
                 }
@@ -1071,6 +1088,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_all_retries_duplicate_claude_configs_before_applying_once() {
+        use crate::config::{ApiKeyHeader, CountTokens, ProviderConfig, ProviderKind};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let uuid = "acct-claude-same-provider";
+        let first_creds = write_temp(
+            "claude-same-provider-first",
+            &refreshable_claude_credential_json(Some(uuid)),
+        );
+        let second_creds = write_temp(
+            "claude-same-provider-second",
+            &refreshable_claude_credential_json(Some(uuid)),
+        );
+        let third_creds = write_temp(
+            "claude-same-provider-third",
+            &refreshable_claude_credential_json(Some(uuid)),
+        );
+        let account = |path: &Path, name: &str| {
+            let mut account = account_with_credentials(path);
+            account.name = name.to_string();
+            account.uuid = Some(uuid.to_string());
+            account
+        };
+        let first = account(&first_creds, "claude-same-provider-first");
+        let second = account(&second_creds, "claude-same-provider-second");
+        let third = account(&third_creds, "claude-same-provider-third");
+
+        let server = MockServer::start().await;
+        let response_number = Arc::new(AtomicUsize::new(0));
+        let response_number_for_mock = Arc::clone(&response_number);
+        Mock::given(method("GET"))
+            .and(path("/api/oauth/usage"))
+            .respond_with(move |_request: &Request| {
+                if response_number_for_mock.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(500).set_body_string("temporary failure")
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "five_hour": { "utilization": 37.0 }
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mut config = Config::default();
+        config.providers.remove("codex");
+        config.providers.insert(
+            "same-claude-provider".to_string(),
+            ProviderConfig {
+                kind: ProviderKind::Anthropic,
+                base_url: server.uri(),
+                auth: AuthMode::ClaudeOauth,
+                api_key_env: None,
+                api_key_header: ApiKeyHeader::Bearer,
+                effort: None,
+                service_tier: None,
+                count_tokens: CountTokens::default(),
+                accounts: vec![first.clone(), second.clone(), third.clone()],
+                account_scope: Vec::new(),
+                websocket: false,
+                tool_search: None,
+                request_compression: true,
+                retry: Default::default(),
+                workspace_roots: Vec::new(),
+                sandbox: true,
+            },
+        );
+        let state = AppState::new(config, reqwest::Client::new()).unwrap();
+
+        poll_all(&state).await;
+
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        let first_snapshot = state.accounts.snapshot(
+            "same-claude-provider",
+            std::slice::from_ref(&first),
+            None,
+            None,
+        );
+        let second_snapshot = state.accounts.snapshot(
+            "same-claude-provider",
+            std::slice::from_ref(&second),
+            None,
+            None,
+        );
+        let third_snapshot = state.accounts.snapshot(
+            "same-claude-provider",
+            std::slice::from_ref(&third),
+            None,
+            None,
+        );
+        assert!(first_snapshot[0].has_state);
+        assert_eq!(first_snapshot[0].utilization_5h, Some(0.37));
+        let mut first_state = serde_json::to_value(&first_snapshot).unwrap();
+        let mut second_state = serde_json::to_value(&second_snapshot).unwrap();
+        let mut third_state = serde_json::to_value(&third_snapshot).unwrap();
+        first_state[0].as_object_mut().unwrap().remove("name");
+        second_state[0].as_object_mut().unwrap().remove("name");
+        third_state[0].as_object_mut().unwrap().remove("name");
+        assert_eq!(first_state, second_state);
+        assert_eq!(second_state, third_state);
+        assert_eq!(
+            crate::metrics::pool_utilization_value_for_tests("same-claude-provider", "5h"),
+            Some(0.37)
+        );
+        assert_eq!(
+            only_exported_quota(&state.accounts).utilization_5h,
+            Some(0.37)
+        );
+
+        for path in [first_creds, second_creds, third_creds] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[tokio::test]
     async fn poll_all_applies_cached_codex_report_to_each_alias_and_metric() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1237,6 +1375,123 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(creds);
+    }
+
+    #[tokio::test]
+    async fn poll_all_retries_duplicate_codex_configs_before_applying_once() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let uuid = "acct-codex-same-provider";
+        let access_token = chatgpt_access_token(uuid);
+        let first_creds = write_temp(
+            "codex-same-provider-first",
+            &codex_credential_json(&access_token, Some("refresh"), uuid),
+        );
+        let second_creds = write_temp(
+            "codex-same-provider-second",
+            &codex_credential_json(&access_token, Some("refresh"), uuid),
+        );
+        let third_creds = write_temp(
+            "codex-same-provider-third",
+            &codex_credential_json(&access_token, Some("refresh"), uuid),
+        );
+        let account = |path: &Path, name: &str| {
+            let mut account = codex_account_with_credentials(path);
+            account.name = name.to_string();
+            account.uuid = Some(uuid.to_string());
+            account
+        };
+        let first = account(&first_creds, "codex-same-provider-first");
+        let second = account(&second_creds, "codex-same-provider-second");
+        let third = account(&third_creds, "codex-same-provider-third");
+
+        let server = MockServer::start().await;
+        let response_number = Arc::new(AtomicUsize::new(0));
+        let response_number_for_mock = Arc::clone(&response_number);
+        Mock::given(method("GET"))
+            .and(path("/wham/usage"))
+            .respond_with(move |_request: &Request| {
+                if response_number_for_mock.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(500).set_body_string("temporary failure")
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "primary_window": {
+                            "used_percent": 37.0,
+                            "limit_window_seconds": 18_000
+                        }
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let mut config = Config::default();
+        let mut provider = config
+            .providers
+            .remove("codex")
+            .expect("default config has a codex provider");
+        provider.base_url = server.uri();
+        provider.accounts = vec![first.clone(), second.clone(), third.clone()];
+        config
+            .providers
+            .insert("same-codex-provider".to_string(), provider);
+        let state = AppState::new(config, reqwest::Client::new()).unwrap();
+        seed_full_codex_quota(&state.accounts, &first);
+
+        poll_all(&state).await;
+
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+        let first_snapshot = state.accounts.snapshot(
+            "same-codex-provider",
+            std::slice::from_ref(&first),
+            None,
+            None,
+        );
+        let second_snapshot = state.accounts.snapshot(
+            "same-codex-provider",
+            std::slice::from_ref(&second),
+            None,
+            None,
+        );
+        let third_snapshot = state.accounts.snapshot(
+            "same-codex-provider",
+            std::slice::from_ref(&third),
+            None,
+            None,
+        );
+        assert!(first_snapshot[0].has_state);
+        assert_eq!(first_snapshot[0].utilization_5h, Some(0.37));
+        let mut first_state = serde_json::to_value(&first_snapshot).unwrap();
+        let mut second_state = serde_json::to_value(&second_snapshot).unwrap();
+        let mut third_state = serde_json::to_value(&third_snapshot).unwrap();
+        first_state[0].as_object_mut().unwrap().remove("name");
+        second_state[0].as_object_mut().unwrap().remove("name");
+        third_state[0].as_object_mut().unwrap().remove("name");
+        assert_eq!(first_state, second_state);
+        assert_eq!(second_state, third_state);
+        assert_eq!(
+            crate::metrics::pool_utilization_value_for_tests("same-codex-provider", "5h"),
+            Some(0.37)
+        );
+        assert_eq!(
+            crate::metrics::pool_utilization_value_for_tests("same-codex-provider", "7d"),
+            None
+        );
+        let quota = only_exported_quota(&state.accounts);
+        assert_eq!(quota.utilization_7d, None);
+        assert_eq!(quota.reset_7d, None);
+        assert_eq!(quota.status_7d, None);
+        assert_eq!(quota.observed_at_7d, None);
+
+        for path in [first_creds, second_creds, third_creds] {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[tokio::test]
