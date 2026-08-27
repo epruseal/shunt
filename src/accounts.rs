@@ -123,7 +123,13 @@ pub struct QuotaState {
     /// own unconditional lifetime cap in `expire_stale_quota` — otherwise a
     /// window signal kept fresh by something else (e.g. a usage poller that
     /// never touches `status`) could keep a stale aggregate rejection from
-    /// ever expiring on its own.
+    /// ever expiring on its own. A value recorded at runtime is a real
+    /// aggregate-status observation time. A value persisted in v3 may instead
+    /// be the synthetic deadline encoding produced by an earlier v2 migration;
+    /// normal v3 import must preserve it rather than reinterpret reset
+    /// metadata. Normal import still normalizes orphan metadata, expires
+    /// elapsed signals, clamps future timestamps to boot time, and supplies
+    /// boot time when a surviving aggregate is unstamped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_at_status: Option<u64>,
 }
@@ -1000,11 +1006,15 @@ impl AccountPool {
     /// observation time is stamped with boot time rather than left unstamped:
     /// `expire_stale_quota` treats an unstamped reset-less signal as expired,
     /// which would defeat the intended warm start. Version-2 migration uses
-    /// the old combined timestamp for a surviving status only; normal v3
-    /// import never infers status freshness from utilization freshness.
-    /// Future observation timestamps are clamped to boot time. This correction
-    /// runs only at import, so a future timestamp created at runtime by a
-    /// backwards clock remains until the next restart.
+    /// the old combined timestamp for surviving per-window status and may
+    /// synthesize an aggregate deadline stamp from the earliest captured
+    /// reset. That synthetic value can remain in the v3 rewrite; normal v3
+    /// import does not infer either form from reset metadata. Every import
+    /// still normalizes orphan metadata, expires elapsed signals, clamps
+    /// future timestamps to boot time, and stamps a surviving aggregate that
+    /// lacks its observation time with boot time. This correction runs only at
+    /// import, so a future timestamp created at runtime by a backwards clock
+    /// remains until the next restart.
     pub(crate) fn import_quotas(
         &self,
         quotas: impl IntoIterator<Item = (AccountKey, QuotaState)>,
@@ -1015,6 +1025,9 @@ impl AccountPool {
     /// Import quota state with the version-2 combined timestamp compatibility
     /// path. Only persistence migration may enable this mode; live callers and
     /// normal v3 restore must keep utilization and status freshness separate.
+    /// The legacy path may synthesize an aggregate deadline stamp from the
+    /// earliest captured reset. That value is retained by the v3 rewrite;
+    /// normal v3 restore does not reinterpret it from reset metadata.
     pub(crate) fn import_quotas_legacy(
         &self,
         quotas: impl IntoIterator<Item = (AccountKey, QuotaState)>,
@@ -1034,6 +1047,9 @@ impl AccountPool {
             // v2's combined timestamp belongs to whichever signal survived;
             // normalize that ownership before expiry so a stale utilization
             // timestamp cannot make a future reset-only record disappear.
+            // The same legacy pass captures an unstamped aggregate's earliest
+            // reset deadline before `stamp_missing_observation` can apply the
+            // ordinary boot-time fallback.
             if legacy_combined_timestamps {
                 corrected |= migrate_legacy_status_timestamps(&mut quota, now);
             }
@@ -1587,8 +1603,9 @@ fn expire_stale_quota(quota: &mut QuotaState, now: u64) -> bool {
 }
 
 /// Stamps a restored signal that has no observation time with boot time. This
-/// is only a warm-start fallback; it never copies utilization freshness into a
-/// status field during normal v3 import.
+/// is only a warm-start fallback; v2's aggregate migration runs first so an
+/// encoded reset deadline is not replaced, and normal v3 import never copies
+/// utilization freshness or reset metadata into a status field.
 fn stamp_missing_observation(quota: &mut QuotaState, now: u64) -> bool {
     let mut corrected = false;
     if quota.utilization_5h.is_some() && quota.observed_at_5h.is_none() {
@@ -1622,10 +1639,14 @@ fn stamp_missing_observation(quota: &mut QuotaState, now: u64) -> bool {
     corrected
 }
 
-/// Migrate the v2 combined per-window timestamp into the independent status
-/// timestamp. A status that survived the pre-backfill expiry sweep captures
-/// the reset that was current when the old state was written; v3 must never
-/// repeat this inference merely because a captured reset is absent.
+/// Migrate v2's combined per-window timestamp into independent status
+/// timestamps. A per-window status that survived the pre-backfill expiry
+/// sweep captures the reset that was current when the old state was written;
+/// an unstamped aggregate status instead synthesizes a stamp that encodes the
+/// earliest reset across all windows. The synthesized value preserves the old
+/// reset-driven deadline across the v3 rewrite and later reset-only or usage
+/// updates. Normal v3 import must preserve that value and never repeat either
+/// inference merely because reset metadata is present.
 fn migrate_legacy_status_timestamps(quota: &mut QuotaState, now: u64) -> bool {
     let mut corrected = false;
     for (status, observed_utilization, observed_status, captured_reset, shared_reset) in [
@@ -1656,6 +1677,18 @@ fn migrate_legacy_status_timestamps(quota: &mut QuotaState, now: u64) -> bool {
             *captured_reset = *shared_reset;
             corrected = true;
         }
+    }
+    if quota.status.is_some() && quota.observed_at_status.is_none() {
+        let earliest_reset = [quota.reset_5h, quota.reset_7d, quota.reset_7d_oi]
+            .into_iter()
+            .flatten()
+            .min();
+        quota.observed_at_status = Some(
+            earliest_reset
+                .map(|reset| reset.saturating_sub(WINDOW_7D_SECS).min(now))
+                .unwrap_or(now),
+        );
+        corrected = true;
     }
     corrected
 }
@@ -4377,6 +4410,322 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    #[test]
+    fn legacy_aggregate_status_uses_the_earliest_reset_and_expires_at_that_boundary() {
+        let now = unix_now();
+        let earliest = now + 3_600;
+        let later = now + 7_200;
+        let mut quota = QuotaState {
+            status: Some("rejected".to_string()),
+            reset_5h: Some(later),
+            reset_7d: Some(earliest),
+            reset_7d_oi: Some(later + 3_600),
+            ..Default::default()
+        };
+
+        assert!(migrate_legacy_status_timestamps(&mut quota, now));
+        assert_eq!(
+            quota.observed_at_status,
+            Some(earliest.saturating_sub(WINDOW_7D_SECS))
+        );
+
+        expire_stale_quota(&mut quota, earliest - 1);
+        assert_eq!(quota.status.as_deref(), Some("rejected"));
+        expire_stale_quota(&mut quota, earliest);
+        assert_eq!(quota.status, None);
+        assert_eq!(quota.observed_at_status, None);
+        assert_eq!(quota.reset_5h, Some(later));
+        assert_eq!(quota.reset_7d, None);
+    }
+
+    #[test]
+    fn legacy_aggregate_status_handles_past_reset_reset_only_and_no_reset() {
+        let now = unix_now();
+
+        let past = now.saturating_sub(1);
+        let mut past_quota = QuotaState {
+            status: Some("rejected".to_string()),
+            reset_5h: Some(past),
+            ..Default::default()
+        };
+        migrate_legacy_status_timestamps(&mut past_quota, now);
+        expire_stale_quota(&mut past_quota, now);
+        assert_eq!(past_quota, QuotaState::default());
+
+        let reset_only = now + 3_600;
+        let mut reset_only_quota = QuotaState {
+            status: Some("rejected".to_string()),
+            reset_7d_oi: Some(reset_only),
+            ..Default::default()
+        };
+        migrate_legacy_status_timestamps(&mut reset_only_quota, now);
+        assert_eq!(
+            reset_only_quota.observed_at_status,
+            Some(reset_only.saturating_sub(WINDOW_7D_SECS))
+        );
+        assert!(reset_only_quota.utilization_7d_oi.is_none());
+        expire_stale_quota(&mut reset_only_quota, reset_only);
+        assert_eq!(reset_only_quota.status, None);
+        assert_eq!(reset_only_quota.reset_7d_oi, None);
+
+        let mut no_reset_quota = QuotaState {
+            status: Some("rejected".to_string()),
+            ..Default::default()
+        };
+        migrate_legacy_status_timestamps(&mut no_reset_quota, now);
+        assert_eq!(no_reset_quota.observed_at_status, Some(now));
+        expire_stale_quota(&mut no_reset_quota, now + WINDOW_7D_SECS - 1);
+        assert_eq!(no_reset_quota.status.as_deref(), Some("rejected"));
+        expire_stale_quota(&mut no_reset_quota, now + WINDOW_7D_SECS);
+        assert_eq!(no_reset_quota.status, None);
+    }
+
+    #[test]
+    fn legacy_aggregate_status_clamps_far_future_max_and_epoch_near_resets() {
+        let now = unix_now();
+        for reset in [now + WINDOW_7D_SECS + 1, u64::MAX] {
+            let mut quota = QuotaState {
+                status: Some("rejected".to_string()),
+                reset_5h: Some(reset),
+                ..Default::default()
+            };
+            migrate_legacy_status_timestamps(&mut quota, now);
+            assert_eq!(quota.observed_at_status, Some(now));
+            expire_stale_quota(&mut quota, now + WINDOW_7D_SECS - 1);
+            assert_eq!(quota.status.as_deref(), Some("rejected"));
+            expire_stale_quota(&mut quota, now + WINDOW_7D_SECS);
+            assert_eq!(quota.status, None);
+            assert_eq!(quota.observed_at_status, None);
+            assert_eq!(quota.reset_5h, Some(reset));
+        }
+
+        let mut epoch_near = QuotaState {
+            status: Some("rejected".to_string()),
+            reset_5h: Some(WINDOW_7D_SECS - 1),
+            ..Default::default()
+        };
+        migrate_legacy_status_timestamps(&mut epoch_near, now);
+        assert_eq!(epoch_near.observed_at_status, Some(0));
+        expire_stale_quota(&mut epoch_near, now);
+        assert_eq!(epoch_near, QuotaState::default());
+    }
+
+    #[test]
+    fn legacy_aggregate_deadline_survives_reset_only_and_usage_updates() {
+        let pool = AccountPool::new();
+        let account = account("legacy-aggregate-updates");
+        let key = account_key("anthropic", &account);
+        let now = unix_now();
+        let captured_reset = now + 3_600;
+
+        pool.import_quotas_legacy([(
+            key.clone(),
+            QuotaState {
+                status: Some("rejected".to_string()),
+                reset_5h: Some(captured_reset),
+                ..Default::default()
+            },
+        )]);
+        let captured = pool.raw_quota_for_test(&key).unwrap().1;
+
+        pool.note_quota(
+            "anthropic",
+            &account,
+            &quota_headers(&[(
+                "anthropic-ratelimit-unified-5h-reset",
+                (captured_reset + 3_600).to_string(),
+            )]),
+        );
+        let after_reset_only = pool.raw_quota_for_test(&key).unwrap().1;
+        assert_eq!(
+            after_reset_only.observed_at_status, captured.observed_at_status,
+            "a reset-only header must not move the migrated aggregate deadline"
+        );
+
+        pool.note_usage(
+            "anthropic",
+            &account,
+            &UsageSnapshot {
+                five_hour: Some(UsageWindow {
+                    utilization: 0.2,
+                    resets_at: Some(captured_reset + 7_200),
+                }),
+                ..Default::default()
+            },
+        );
+        let after_usage = pool.raw_quota_for_test(&key).unwrap().1;
+        assert_eq!(
+            after_usage.observed_at_status, captured.observed_at_status,
+            "a usage update must not move the migrated aggregate deadline"
+        );
+
+        let mut swept = after_usage;
+        expire_stale_quota(&mut swept, captured_reset);
+        assert_eq!(swept.status, None);
+        assert_eq!(swept.utilization_5h, Some(0.2));
+    }
+
+    #[test]
+    fn aggregate_migration_preserves_existing_v2_stamp_and_skips_normal_v3_inference() {
+        let now = unix_now();
+        let reset = now + 3_600;
+        let old_stamp = now.saturating_sub(60);
+        let legacy_stamped = account("legacy-stamped");
+        let legacy_missing = account("legacy-missing");
+        let pool = AccountPool::new();
+        pool.import_quotas_legacy([
+            (
+                account_key("anthropic", &legacy_stamped),
+                QuotaState {
+                    status: Some("rejected".to_string()),
+                    observed_at_status: Some(old_stamp),
+                    reset_5h: Some(reset),
+                    ..Default::default()
+                },
+            ),
+            (
+                account_key("anthropic", &legacy_missing),
+                QuotaState {
+                    status: Some("rejected".to_string()),
+                    reset_5h: Some(reset),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        assert_eq!(
+            pool.raw_quota_for_test(&account_key("anthropic", &legacy_stamped))
+                .unwrap()
+                .1
+                .observed_at_status,
+            Some(old_stamp)
+        );
+        assert_eq!(
+            pool.raw_quota_for_test(&account_key("anthropic", &legacy_missing))
+                .unwrap()
+                .1
+                .observed_at_status,
+            Some(reset.saturating_sub(WINDOW_7D_SECS))
+        );
+
+        let v3_stamped = account("v3-stamped");
+        let v3_missing = account("v3-missing");
+        let before = unix_now();
+        let v3_pool = AccountPool::new();
+        v3_pool.import_quotas([
+            (
+                account_key("anthropic", &v3_stamped),
+                QuotaState {
+                    status: Some("rejected".to_string()),
+                    observed_at_status: Some(old_stamp),
+                    reset_5h: Some(reset),
+                    ..Default::default()
+                },
+            ),
+            (
+                account_key("anthropic", &v3_missing),
+                QuotaState {
+                    status: Some("rejected".to_string()),
+                    reset_5h: Some(reset),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        assert_eq!(
+            v3_pool
+                .raw_quota_for_test(&account_key("anthropic", &v3_stamped))
+                .unwrap()
+                .1
+                .observed_at_status,
+            Some(old_stamp)
+        );
+        let v3_missing_stamp = v3_pool
+            .raw_quota_for_test(&account_key("anthropic", &v3_missing))
+            .unwrap()
+            .1
+            .observed_at_status
+            .expect("normal v3 import stamps missing aggregate status");
+        assert!(v3_missing_stamp >= before);
+        assert_ne!(
+            v3_missing_stamp,
+            reset.saturating_sub(WINDOW_7D_SECS),
+            "normal v3 import must not infer a timestamp from reset metadata"
+        );
+    }
+
+    #[test]
+    fn aggregate_migration_is_independent_per_account_and_shared_by_aliases() {
+        let now = unix_now();
+        let first = account_with_uuid("first", "physical-first");
+        let first_alias = account_with_uuid("first-alias", "physical-first");
+        let second = account_with_uuid("second", "physical-second");
+        let first_reset = now + 3_600;
+        let second_reset = now + 7_200;
+        let pool = AccountPool::new();
+        pool.import_quotas_legacy([
+            (
+                account_key("anthropic", &first),
+                QuotaState {
+                    status: Some("rejected".to_string()),
+                    reset_5h: Some(first_reset),
+                    ..Default::default()
+                },
+            ),
+            (
+                account_key("anthropic", &second),
+                QuotaState {
+                    status: Some("rejected".to_string()),
+                    reset_5h: Some(second_reset),
+                    ..Default::default()
+                },
+            ),
+        ]);
+
+        let first_key = account_key("anthropic", &first);
+        let alias_key = account_key("anthropic", &first_alias);
+        let second_key = account_key("anthropic", &second);
+        assert_eq!(first_key, alias_key);
+        assert_eq!(
+            pool.raw_quota_for_test(&first_key)
+                .unwrap()
+                .1
+                .observed_at_status,
+            Some(first_reset.saturating_sub(WINDOW_7D_SECS))
+        );
+        assert_eq!(
+            pool.raw_quota_for_test(&second_key)
+                .unwrap()
+                .1
+                .observed_at_status,
+            Some(second_reset.saturating_sub(WINDOW_7D_SECS))
+        );
+
+        pool.note_usage(
+            "anthropic",
+            &first_alias,
+            &UsageSnapshot {
+                five_hour: Some(UsageWindow {
+                    utilization: 0.3,
+                    resets_at: Some(first_reset + 3_600),
+                }),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            pool.raw_quota_for_test(&alias_key)
+                .unwrap()
+                .1
+                .observed_at_status,
+            Some(first_reset.saturating_sub(WINDOW_7D_SECS))
+        );
+        assert_eq!(
+            pool.raw_quota_for_test(&second_key)
+                .unwrap()
+                .1
+                .observed_at_status,
+            Some(second_reset.saturating_sub(WINDOW_7D_SECS))
+        );
     }
 
     #[test]

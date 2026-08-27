@@ -13,7 +13,14 @@
 //! windows whose reset has already passed are dropped during import, before
 //! the first `select_order`/`snapshot`, exactly as live ones are. A legacy
 //! aggregate status attached to such a window is dropped at the same import
-//! boundary when it has no independent observation timestamp. A window that
+//! boundary when it has no independent observation timestamp. Version-2
+//! aggregate status without an independent timestamp captures the earliest
+//! persisted window reset as an immutable deadline through the existing
+//! aggregate cap; a synthesized future timestamp is clamped to boot time. A
+//! version-2 aggregate without a reset uses boot time as its cap. The
+//! synthesized stamp can remain in the v3 rewrite, and a later v3 restore
+//! preserves it while still running normal metadata normalization, expiry,
+//! missing-signal boot stamping, and future-timestamp clamping. A window that
 //! never carried a reset instant is bounded instead by its persisted
 //! utilization observation time and independent per-window status observation
 //! time: each reset-less signal expires one window length after its own
@@ -63,8 +70,13 @@ fn state_path(state: &AppState) -> Option<&Path> {
 
 /// Restore pool quota from disk at boot. A no-op when `state_path` is unset or
 /// the file is absent/unreadable/incompatible — every failure mode falls back
-/// to a cold start, never a boot error. Call once before serving requests so
-/// the first request already sees the restored quota.
+/// to a cold start, never a boot error. Version-2 files take the explicit
+/// legacy import path, which synthesizes an unstamped aggregate's earliest
+/// captured reset deadline through the existing v3 cap before rewriting the
+/// file. A second restore treats that synthesized value as an existing v3
+/// stamp while still applying normal normalization, expiry, and future-time
+/// clamping. Call once before serving requests so the first request already
+/// sees the restored quota.
 pub async fn restore(state: &AppState) {
     let Some(path) = state_path(state).map(Path::to_path_buf) else {
         return;
@@ -280,6 +292,44 @@ mod tests {
         }
     }
 
+    async fn restore_v2_then_v3(
+        path: &Path,
+        quota: QuotaState,
+    ) -> (QuotaState, Option<QuotaState>, PersistedPool) {
+        let key = crate::accounts::account_key("anthropic", &account("acct-matrix"));
+        save(
+            path,
+            &PersistedPool {
+                version: LEGACY_STATE_VERSION,
+                accounts: vec![PersistedAccount {
+                    key: key.clone(),
+                    quota,
+                }],
+            },
+        )
+        .expect("save v2 succeeds");
+
+        let first_state = state_with_path(path.to_path_buf());
+        restore(&first_state).await;
+        let first = first_state
+            .accounts
+            .raw_quota_for_test(&key)
+            .expect("v2 account is restored")
+            .1;
+        flush(&first_state).await;
+
+        let rewritten = load(path)
+            .expect("load rewritten state succeeds")
+            .expect("rewritten v3 state exists");
+        let second_state = state_with_path(path.to_path_buf());
+        restore(&second_state).await;
+        let second = second_state
+            .accounts
+            .raw_quota_for_test(&key)
+            .map(|(_, quota)| quota);
+        (first, second, rewritten)
+    }
+
     #[test]
     fn save_then_load_round_trips_quota() {
         let path = temp_file("roundtrip");
@@ -475,6 +525,277 @@ mod tests {
             Some(observed)
         );
         remove_test_dir(&path);
+    }
+
+    #[tokio::test]
+    async fn restore_migrates_v2_aggregate_status_to_earliest_reset_deadline() {
+        const WINDOW_7D_SECS: u64 = 7 * 24 * 60 * 60;
+        let path = temp_file("migrate-v2-aggregate");
+        let account = account("acct-aggregate");
+        let before = unix_now();
+        let earliest = before + 3_600;
+        let quota = QuotaState {
+            status: Some("rejected".to_string()),
+            reset_5h: Some(before + 7_200),
+            reset_7d: Some(earliest),
+            reset_7d_oi: Some(before + 10_800),
+            ..Default::default()
+        };
+        save(
+            &path,
+            &PersistedPool {
+                version: LEGACY_STATE_VERSION,
+                accounts: vec![PersistedAccount {
+                    key: crate::accounts::account_key("anthropic", &account),
+                    quota,
+                }],
+            },
+        )
+        .expect("save succeeds");
+        let state = state_with_path(path.clone());
+
+        restore(&state).await;
+
+        let key = crate::accounts::account_key("anthropic", &account);
+        let (_, quota) = state.accounts.raw_quota_for_test(&key).unwrap();
+        assert_eq!(
+            quota.observed_at_status,
+            Some(earliest.saturating_sub(WINDOW_7D_SECS)),
+            "v2 aggregate status keeps the earliest captured reset as its cap"
+        );
+        assert!(state.accounts.take_dirty(), "v2 import schedules a rewrite");
+        state.accounts.mark_dirty();
+        flush(&state).await;
+
+        let rewritten = load(&path)
+            .expect("load succeeds")
+            .expect("rewritten file exists");
+        assert_eq!(rewritten.version, STATE_VERSION);
+        assert_eq!(
+            rewritten.accounts[0].quota.observed_at_status,
+            Some(earliest.saturating_sub(WINDOW_7D_SECS))
+        );
+        remove_test_dir(&path);
+    }
+
+    #[tokio::test]
+    async fn restore_v2_aggregate_boundaries_survive_the_v3_restore_pipeline() {
+        const WINDOW_7D_SECS: u64 = 7 * 24 * 60 * 60;
+        enum Expectation {
+            Removed,
+            Deadline {
+                earliest: u64,
+                resets: [Option<u64>; 3],
+            },
+            BootCap,
+        }
+
+        let before = unix_now();
+        let valid = before + 3_600;
+        let later = before + 7_200;
+        let cases = [
+            (
+                "matrix-past",
+                QuotaState {
+                    status: Some("rejected".to_string()),
+                    reset_5h: Some(before.saturating_sub(1)),
+                    ..Default::default()
+                },
+                Expectation::Removed,
+            ),
+            (
+                "matrix-reset-only",
+                QuotaState {
+                    status: Some("rejected".to_string()),
+                    reset_5h: Some(valid),
+                    ..Default::default()
+                },
+                Expectation::Deadline {
+                    earliest: valid,
+                    resets: [Some(valid), None, None],
+                },
+            ),
+            (
+                "matrix-no-reset",
+                QuotaState {
+                    status: Some("rejected".to_string()),
+                    ..Default::default()
+                },
+                Expectation::BootCap,
+            ),
+            (
+                "matrix-far-future",
+                QuotaState {
+                    status: Some("rejected".to_string()),
+                    reset_5h: Some(before + WINDOW_7D_SECS + 3_600),
+                    ..Default::default()
+                },
+                Expectation::BootCap,
+            ),
+            (
+                "matrix-max",
+                QuotaState {
+                    status: Some("rejected".to_string()),
+                    reset_7d: Some(u64::MAX),
+                    ..Default::default()
+                },
+                Expectation::BootCap,
+            ),
+            (
+                "matrix-epoch-near",
+                QuotaState {
+                    status: Some("rejected".to_string()),
+                    reset_7d_oi: Some(WINDOW_7D_SECS - 1),
+                    ..Default::default()
+                },
+                Expectation::Removed,
+            ),
+            (
+                "matrix-multiple-reset",
+                QuotaState {
+                    status: Some("rejected".to_string()),
+                    reset_5h: Some(later),
+                    reset_7d: Some(valid),
+                    reset_7d_oi: Some(later + 3_600),
+                    ..Default::default()
+                },
+                Expectation::Deadline {
+                    earliest: valid,
+                    resets: [Some(later), Some(valid), Some(later + 3_600)],
+                },
+            ),
+        ];
+
+        for (label, input, expectation) in cases {
+            let path = temp_file(label);
+            let (first, second, rewritten) = restore_v2_then_v3(&path, input).await;
+            assert_eq!(rewritten.version, STATE_VERSION, "{label} rewrites as v3");
+            match expectation {
+                Expectation::Removed => {
+                    assert_eq!(first, QuotaState::default(), "{label} clears on import");
+                    assert!(second.is_none(), "{label} stays absent after v3 restore");
+                    assert!(rewritten.accounts.is_empty(), "{label} is removed on flush");
+                }
+                Expectation::Deadline { earliest, resets } => {
+                    assert_eq!(first.status.as_deref(), Some("rejected"), "{label}");
+                    assert_eq!(
+                        first.observed_at_status,
+                        Some(earliest - WINDOW_7D_SECS),
+                        "{label} captures the earliest reset deadline"
+                    );
+                    assert_eq!([first.reset_5h, first.reset_7d, first.reset_7d_oi], resets);
+                    assert_eq!(second.as_ref(), Some(&first), "{label} survives v3 restore");
+                    assert_eq!(rewritten.accounts.len(), 1, "{label} remains persisted");
+                    assert_eq!(
+                        rewritten.accounts[0].quota, first,
+                        "{label} rewrites equivalently"
+                    );
+                }
+                Expectation::BootCap => {
+                    assert_eq!(first.status.as_deref(), Some("rejected"), "{label}");
+                    let stamp = first
+                        .observed_at_status
+                        .expect("{label} has a boot-time aggregate stamp");
+                    let after = unix_now();
+                    assert!(
+                        stamp >= before && stamp <= after,
+                        "{label} uses boot-time cap"
+                    );
+                    assert_eq!(second.as_ref(), Some(&first), "{label} survives v3 restore");
+                    assert_eq!(rewritten.accounts.len(), 1, "{label} remains persisted");
+                    assert_eq!(
+                        rewritten.accounts[0].quota, first,
+                        "{label} rewrites equivalently"
+                    );
+                }
+            }
+            remove_test_dir(&path);
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_v2_existing_aggregate_stamps_are_stable_or_removed() {
+        const WINDOW_7D_SECS: u64 = 7 * 24 * 60 * 60;
+        enum Expectation {
+            SurvivesInBootRange,
+            Removed,
+            SurvivesWithPastWindowResetCleared,
+        }
+
+        let before = unix_now();
+        let cases = [
+            (
+                "stamp-future",
+                QuotaState {
+                    status: Some("rejected".to_string()),
+                    observed_at_status: Some(before + 86_400),
+                    ..Default::default()
+                },
+                Expectation::SurvivesInBootRange,
+            ),
+            (
+                "stamp-expired",
+                QuotaState {
+                    status: Some("rejected".to_string()),
+                    observed_at_status: Some(before.saturating_sub(WINDOW_7D_SECS)),
+                    ..Default::default()
+                },
+                Expectation::Removed,
+            ),
+            (
+                "stamp-orphan",
+                QuotaState {
+                    observed_at_status: Some(before + 86_400),
+                    ..Default::default()
+                },
+                Expectation::Removed,
+            ),
+            (
+                "stamp-past-window-reset",
+                QuotaState {
+                    status: Some("rejected".to_string()),
+                    observed_at_status: Some(before.saturating_sub(60)),
+                    reset_5h: Some(before.saturating_sub(1)),
+                    ..Default::default()
+                },
+                Expectation::SurvivesWithPastWindowResetCleared,
+            ),
+        ];
+
+        for (label, input, expectation) in cases {
+            let path = temp_file(label);
+            let (first, second, rewritten) = restore_v2_then_v3(&path, input).await;
+            assert_eq!(rewritten.version, STATE_VERSION, "{label} rewrites as v3");
+            match expectation {
+                Expectation::SurvivesInBootRange => {
+                    let stamp = first.observed_at_status.expect("future v2 stamp survives");
+                    let after = unix_now();
+                    assert!(
+                        stamp >= before && stamp <= after,
+                        "future stamp clamps to boot"
+                    );
+                    assert_eq!(first.status.as_deref(), Some("rejected"));
+                    assert_eq!(second.as_ref(), Some(&first));
+                    assert_eq!(rewritten.accounts[0].quota, first);
+                }
+                Expectation::Removed => {
+                    assert_eq!(first, QuotaState::default(), "{label} is normalized away");
+                    assert!(second.is_none(), "{label} stays removed after v3 restore");
+                    assert!(
+                        rewritten.accounts.is_empty(),
+                        "{label} is absent from v3 state"
+                    );
+                }
+                Expectation::SurvivesWithPastWindowResetCleared => {
+                    assert_eq!(first.status.as_deref(), Some("rejected"));
+                    assert_eq!(first.observed_at_status, Some(before.saturating_sub(60)));
+                    assert_eq!(first.reset_5h, None);
+                    assert_eq!(second.as_ref(), Some(&first));
+                    assert_eq!(rewritten.accounts[0].quota, first);
+                }
+            }
+            remove_test_dir(&path);
+        }
     }
 
     #[tokio::test]

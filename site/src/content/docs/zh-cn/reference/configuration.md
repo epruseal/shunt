@@ -184,6 +184,8 @@ headers = { "x-api-key" = "..." }
 
 ## `[server.pool]`(可选)
 
+迁移时,没有 `observed_at_status` 的聚合 `status` 会捕获已保存的 `reset_5h`、`reset_7d`、`reset_7d_oi` 中最早的重置作为不可变期限。若该重置已经过去,则在同一次 import 中同时删除已过期的重置、无时间戳的聚合 `status` 及其合成时间戳。超过合理七天范围的未来重置会保守地限制在启动时间加七天;没有重置时则从启动时间开始七天上限。已有 v2 时间戳不会根据重置重新解释,但正常 import 仍会规范化孤立元数据、使已过去的信号失效、将未来时间钳制到启动时间,并在必要时为仍存活且无时间戳的聚合补上启动时间。后续 reset-only 或 usage 更新不会延长期限,重写为 v3 并第二次恢复后结果仍保持等价。
+
 面向账户池的配额感知负载均衡调优 —— Claude(Anthropic)([详情](/zh-cn/guides/anthropic-multi-account/#调优选择serverpool)),以及自 issue #195 起的 Codex/ChatGPT([详情](/zh-cn/guides/codex-multi-account/))。此表不存在时,选择逻辑使用单一的内置 `0.98` 阈值,与该表出现之前的行为完全一致。
 
 | 键 | 默认 | 含义 |
