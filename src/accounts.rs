@@ -2649,7 +2649,7 @@ mod tests {
                 .unwrap()
                 .quota;
             // Model an old, unstamped aggregate from before independent
-            // aggregate freshness existed, then pass the shared reset before
+            // aggregate freshness existed, then pass the 5-hour reset before
             // the next Codex response replaces the utilization.
             quota.observed_at_status = None;
             quota.reset_5h = Some(now.saturating_sub(1));
