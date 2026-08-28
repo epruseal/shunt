@@ -184,6 +184,8 @@ headers = { "x-api-key" = "..." }
 
 ## `[server.pool]`(可选)
 
+迁移时,没有 `observed_at_status` 的聚合 `status` 会捕获已保存的 `reset_5h`、`reset_7d`、`reset_7d_oi` 中最早的重置作为不可变期限。若该重置已经过去,则在同一次 import 中同时删除已过期的重置、无时间戳的聚合 `status` 及其合成时间戳。超过合理七天范围的未来重置会保守地限制在启动时间加七天;没有重置时则从启动时间开始七天上限。已有 v2 时间戳不会根据重置重新解释,但正常 import 仍会规范化孤立元数据、使已过去的信号失效、将未来时间钳制到启动时间,并在必要时为仍存活且无时间戳的聚合补上启动时间。后续 reset-only 或 usage 更新不会延长期限,重写为 v3 并第二次恢复后结果仍保持等价。
+
 面向账户池的配额感知负载均衡调优 —— Claude(Anthropic)([详情](/zh-cn/guides/anthropic-multi-account/#调优选择serverpool)),以及自 issue #195 起的 Codex/ChatGPT([详情](/zh-cn/guides/codex-multi-account/))。此表不存在时,选择逻辑使用单一的内置 `0.98` 阈值,与该表出现之前的行为完全一致。
 
 | 键 | 默认 | 含义 |
@@ -200,9 +202,9 @@ headers = { "x-api-key" = "..." }
 
 对每个窗口 `X`,生效的软阈值按以下顺序解析:账户 `threshold_X` → 账户 `threshold` → `default_threshold_X` → `default_threshold` → `hard_threshold`,并以 `hard_threshold` 为上限。所有阈值都是 `[0.0, 1.0]` 范围内的使用率分数;超出范围会导致启动失败。阈值与 burn-rate 旋钮对两个池家族都生效:Anthropic 池取自其 `anthropic-ratelimit-unified-*` 头部,Codex/ChatGPT 池取自其 `x-codex-*` 5 小时/周窗口(Codex 没有 Fable 范围的 `7d_oi` 窗口,因此 `default_threshold_fable` 在那里不起作用)。`usage_refresh_seconds` 仅限 Anthropic —— Codex 没有带外 usage API。
 
-正的 `usage_refresh_seconds` 还会启动一个后台轮询器,把 Claude 账户池的配额状态与 Anthropic OAuth usage API 对账校正;未设置或为 `0` 时禁用(默认)。只有 imported(可刷新)的 `claude_oauth` 账户会被轮询 —— 长期 `claude setup-token` 或 `token_env` 账户会被跳过,因为 usage 端点会拒绝不可刷新的令牌。轮询器会把基于头部的 5h/周/Fable(`7d_oi`)配额状态,与包含 shunt 之外同一账户消耗在内的权威用量对账。间隔在启动时固定;配置重载不会启动、停止或重新调整轮询器。
+正的 `usage_refresh_seconds` 还会启动一个后台轮询器,把 Claude 账户池的配额状态与 Anthropic OAuth usage API 对账校正;未设置或为 `0` 时禁用(默认)。只有 imported(可刷新)的 `claude_oauth` 账户会被轮询 —— 长期 `claude setup-token` 或 `token_env` 账户会被跳过,因为 usage 端点会拒绝不可刷新的令牌。轮询器会更新每个报告窗口的用量、该窗口自身的重置时刻和用量观测时间;只有按窗口及聚合 status 的新鲜度,以及观测 status 时捕获的重置边界仍由头部驱动,即使权威用量包含 shunt 之外同一账户的消耗。间隔在启动时固定;配置重载不会启动、停止或重新调整轮询器。
 
-`state_path` 会把池的配额状态(所有 provider 账户的按窗口使用率与重置)写入磁盘。不设置时,重启会从空池开始:每个账户在重启后首个响应之前都显示为未观测,这会禁用 burn-rate 规避,并使 `GET /usage` 在流量重新填充池之前返回空值。该文件是尽力而为的缓存,而非权威来源 —— 配额无论如何都会从上游响应重新导出,因此文件缺失、陈旧或损坏只会导致冷启动,绝不会导致启动失败。写入使用私有 temp 文件(Unix 上为 `0600`)并将其原子重命名覆盖目标,且仅在配额发生变化时按后台定时器进行。写入失败时会在下一个 tick 重试。冷却不会被持久化(重启即失效),恢复的窗口中重置已过期的会在恢复后的首次选择或 snapshot 时延迟丢弃。路径在启动时固定;配置重载不会启动、停止或改变持久化路径。
+`state_path` 会把池的配额状态(所有 provider 账户的按窗口使用率与各窗口自身的重置时刻,使用率和 status 的独立观测时间及捕获的 status 重置边界)写入磁盘。不设置时,重启会从空池开始:每个账户在重启后首个响应之前都显示为未观测,这会禁用 burn-rate 规避,并使 `GET /usage` 在流量重新填充池之前返回空值。该文件是尽力而为的缓存,而非权威来源 —— 配额无论如何都会从上游响应重新导出,因此文件缺失、陈旧或损坏只会导致冷启动,绝不会导致启动失败。写入使用私有 temp 文件(Unix 上为 `0600`)并将其原子重命名覆盖目标,且仅在配额发生变化时按后台定时器进行。写入失败时会在下一个 tick 重试。冷却不会被持久化(重启即失效),恢复的窗口中重置已过期的会在恢复时的 import 阶段、首次选择或 snapshot 之前丢弃。使用率在自身观测时间上限和该窗口的重置之间较早者到达时过期;仅上限经过时该窗口的未来重置仍可保留。按窗口 status 在自身观测时间上限和观测时捕获的 status 重置边界之间较早者到达时过期,捕获边界也会随 status 清除。版本2文件通过明确的迁移路径重写为版本3;版本3的无重置 status 在仅重置更新后仍保持无重置。路径在启动时固定;配置重载不会启动、停止或改变持久化路径。
 
 正的 `ramp_initial_concurrency` 会在每个账户池上启用**风暴控制(storm control)**:一次故障转移切换之后,在途的并发请求本会全部同时落到刚选中的账户上。开启该门控后,刚开始承接流量的身份(全新、刚从冷却回来,或空闲 60 秒)最多准入所配置数量的并发请求;每次成功响应把额度翻倍(slow start),一次达到故障转移条件的失败会重启该 ramp,被拒绝的请求则顺延到选择顺序中的下一个账户。无论门控如何,最后一个候选始终会被尝试,因此门控只能推迟、而绝不会失败一个未门控的池本会服务的请求。这也意味着,若池中所有账户都解析到同一个上游身份,则该池实际上不受门控:唯一的候选同时也是最后一个候选,因此该设置仅在存在两个及以上不同账户身份时才生效。
 
@@ -278,7 +280,7 @@ codex-fallback = "gpt-5.2"
 
 现有配置**无需更改**。旧式 provider 会保留原有路由及按名称排序的选择行为。升级时有以下三项新增或有意的行为变化：
 
-1. 解析到同一物理 OAuth 账户的旧式 provider 现在会共享配额窗口、health、cooldown、refresh lock 和 in-flight admission 状态。池持久化键的 schema 已提升版本，因此现有 `state_path` 缓存会被忽略一次，池会经历一次冷启动。
+1. 解析到同一物理 OAuth 账户的旧式 provider 现在会共享配额窗口、health、cooldown、refresh lock 和 in-flight admission 状态。池持久化键的 schema 已提升版本,版本2配额缓存会迁移一次为分离使用率/status 新鲜度的版本3。
 2. 每个代理响应都会新增上述三个 `x-gateway-*` metadata 头部。
 3. 在 Anthropic Messages 路由（`/v1/messages`）上，无论 Claude 或 Codex OAuth 池的规模如何，若所有尝试都在响应头之前失败，现在都会返回 `all upstreams failed (N attempted)`，而不是该池专用的 `all Claude OAuth accounts failed before receiving an upstream response` 或 `all Codex OAuth accounts failed before receiving an upstream response`。单独的 `[server.codex_endpoint]` 入站路径不受影响，并保留 Codex 专用消息。
 

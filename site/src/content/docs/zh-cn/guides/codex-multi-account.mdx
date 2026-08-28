@@ -109,7 +109,7 @@ Codex 没有可配置的显式 `uuid` 字段。作为替代,shunt 对每个账�
 
 - 带 `x-claude-code-session-id` 时:一个稳定的哈希选出粘性账户,机制与 Anthropic 账户池相同。
 - 不带该头部时:每个提供方有自己的轮询计数器。
-- 成功的响应会记录 `x-codex-primary-*` 与 `x-codex-secondary-*` 头部中的用量。shunt 按 `window-minutes` 映射每一组:约 300 分钟归入 5h,约 10080 分钟归入 7d,其他窗口被忽略。Codex 没有 `7d_oi` 的对应项。
+- 成功的响应会记录 `x-codex-primary-*` 与 `x-codex-secondary-*` 头部中的用量。shunt 按 `window-minutes` 映射每一组:约 300 分钟归入 5h,约 10080 分钟归入 7d,其他窗口被忽略。即使某组的 `x-codex-*-reset-at` 头部为空,shunt 仍会记录该位置对应的窗口组及其用量;没有重置时,用量会从自身观测时间起在一个窗口长度后过期。Codex 没有 `7d_oi` 的对应项。
 - 记录的用量会参与选择,与 [Anthropic 账户池](/zh-cn/guides/anthropic-multi-account/)完全一致:达到或超过其阈值(内置的 `0.98`,或 [`[server.pool]`](/zh-cn/reference/configuration/#serverpool可选)/按账户的软阈值)的粘性账户会主动让位给余量最大的账户,`burn_rate_avoidance` 以及优先级/余量排序同样适用。`x-codex-rate-limit-reached-type` 的值仅被记录用于展示。
 - 设置了 `[server.pool] ramp_initial_concurrency` 时,一个 slow-start 准入门控会保护刚刚选中的账户,使其在故障转移之后不被瞬间冲垮;参见 [`[server.pool]`](/zh-cn/reference/configuration/#serverpool可选)。
 - 成功的响应会清除该账户的冷却。

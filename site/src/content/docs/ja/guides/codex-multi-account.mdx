@@ -109,7 +109,7 @@ admin web サーフェスからストア管理アカウントを削除すると�
 
 - `x-claude-code-session-id` がある場合: 安定したハッシュがスティッキーアカウントを選びます。Anthropic プールと同じ仕組みです。
 - ヘッダーがない場合: プロバイダーごとに独自のラウンドロビンカウンターを持ちます。
-- 成功レスポンスは `x-codex-primary-*` と `x-codex-secondary-*` ヘッダーから使用量を記録します。shunt は各グループを `window-minutes` でマッピングします。約 300 分は 5h、約 10080 分は 7d に現れ、それ以外のウィンドウは無視されます。Codex に `7d_oi` 相当はありません。
+- 成功レスポンスは `x-codex-primary-*` と `x-codex-secondary-*` ヘッダーから使用量を記録します。shunt は各グループを `window-minutes` でマッピングします。約 300 分は 5h、約 10080 分は 7d に現れ、それ以外のウィンドウは無視されます。グループの `x-codex-*-reset-at` ヘッダーが空でも、shunt はその位置に対応するウィンドウグループと使用量を記録します。リセットがない場合、使用量は自身の観測時刻からウィンドウ長が経過した時点で失効します。Codex に `7d_oi` 相当はありません。
 - 記録された使用量は、[Anthropic プール](/ja/guides/anthropic-multi-account/)とまったく同じように選択へ供給されます。しきい値（組み込みの `0.98`、または [`[server.pool]`](/ja/reference/configuration/#serverpoolオプション) / アカウント単位のソフトしきい値）に達したスティッキーアカウントは、最も余裕のあるアカウントへプロアクティブに道を譲り、`burn_rate_avoidance` と priority / 余裕（headroom）による順序付けが適用されます。`x-codex-rate-limit-reached-type` の値は表示用にのみ記録されます。
 - `[server.pool] ramp_initial_concurrency` を設定すると、スロースタートの受け入れゲートが、フェイルオーバー直後に選択されたばかりのアカウントへ殺到が起きるのを防ぎます。[`[server.pool]`](/ja/reference/configuration/#serverpoolオプション) を参照してください。
 - 成功レスポンスは、そのアカウントのクールダウンを解除します。

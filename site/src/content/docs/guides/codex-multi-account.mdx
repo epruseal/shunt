@@ -109,7 +109,7 @@ Deleting a store-managed account through the admin web surface clears that ident
 
 - With `x-claude-code-session-id`: a stable hash picks the sticky account, same mechanism as the Anthropic pool.
 - Without the header: each provider has its own round-robin counter.
-- Successful responses record usage from `x-codex-primary-*` and `x-codex-secondary-*` headers. shunt maps each group by `window-minutes`: about 300 minutes appears in 5h, about 10080 minutes appears in 7d, and other windows are ignored. Codex has no `7d_oi` analog.
+- Successful responses record usage from `x-codex-primary-*` and `x-codex-secondary-*` headers. shunt maps each group by `window-minutes`: about 300 minutes appears in 5h, about 10080 minutes appears in 7d, and other windows are ignored. If a group's `x-codex-*-reset-at` header is blank, shunt still records that positional window group and its utilization; without a reset, the utilization expires after the window length from its own observation timestamp. Codex has no `7d_oi` analog.
 - Recorded usage feeds selection, exactly as in the [Anthropic pool](/guides/anthropic-multi-account/): a sticky account at or past its threshold (the built-in `0.98`, or the [`[server.pool]`](/reference/configuration/#serverpool-optional)/per-account soft thresholds) proactively yields to the account with the most headroom, and `burn_rate_avoidance` and priority/headroom ordering apply. The `x-codex-rate-limit-reached-type` value is recorded for display only.
 - With `[server.pool] ramp_initial_concurrency` set, a slow-start admission gate protects a freshly selected account from being stampeded after a failover; see [`[server.pool]`](/reference/configuration/#serverpool-optional).
 - A successful response clears that account's cooldown.
