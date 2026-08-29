@@ -199,6 +199,7 @@ Both metric sinks export the same low-cardinality series:
 | `shunt.upstream_retries` | Counter | `provider`, `reason` | Bounded transient retries. |
 | `shunt.pool.quota_utilization` | Gauge | `provider`, `window` | Minimum utilization across enabled, non-stale accounts for `5h`, `7d`, or `7d_oi`. |
 | `shunt.pool.rotations` | Counter | `provider`, `reason` | Account rotations and pool exhaustion by low-cardinality cause. |
+| `shunt.pool.reprobes` | Counter | `provider` | Reprobes committed at the first HTTP dispatch for stale near-quota Codex/ChatGPT accounts; WebSocket-enabled providers count inbound HTTP probes only. |
 
 **Routing precedence** (`src/routing.rs`): matching `[models.upstream_model]` entry → exact
 `[[routes]]` match → `[[route_prefixes]]` prefix match → `server.default_provider`. A model
