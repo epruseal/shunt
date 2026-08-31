@@ -564,6 +564,114 @@ responses now populate the 5h/7d fields from `x-codex-*` rate-limit headers;
 unsupported windows are ignored and `7d_oi` remains `None` because Codex has no
 analog. Since issue #195 this recorded state also feeds Codex account selection (see `m10-codex-multi-account.md`), in addition to the dashboard display.
 
+The Claude store table in that section reports a **derived status** rather than
+the raw `claudeAiOauth.expiresAt` it used to render. That timestamp is the
+~8-hour *access*-token deadline and means opposite things per credential kind,
+so showing it verbatim made healthy accounts read as broken. An `imported`
+account carries a refresh token and shunt renews it in-band (single-flight
+writeback in `auth/claude/auth.rs`, triggered five minutes before expiry), so a
+past timestamp there is routine and needs no operator action — the row reads
+"Auto-refreshes", with the raw timestamp preserved on hover. A `setup_token`
+account has no refresh token at all (one-year lifetime), so the same timestamp
+is genuinely actionable: with more than the refresh buffer left, the row reads
+"Valid until" followed by that date; inside that buffer — or past the date, or
+with no date at all — it reads "Expired" under the `expired` danger style with a
+`Setup token cannot refresh · re-login required` note. Only the setup-token kind
+can reach that state.
+
+The buffer is the same five minutes routing itself applies, and the dashboard
+takes it from that constant rather than copying the number.
+`Tokens::is_valid_at` accepts a credential only while
+`expiresAt > now + EXPIRY_BUFFER`, where `EXPIRY_BUFFER` is `auth/claude/auth.rs`'s
+own five minutes — `auth/shared.rs` declares a same-named constant that drives
+the generic JWT helper, not this path. A setup token has no refresh token to
+recover with, so inside that window a routed request already fails on the
+no-refresh-token path; comparing against the bare deadline here would have the
+dashboard call a credential usable for the last five minutes of its life while
+routing rejects it, the window in which the operator most needs the warning.
+`dashboard_page` substitutes the constant's millisecond value into the script's
+`{expiry_buffer_ms}` placeholder, so the two cannot drift apart.
+
+The Codex store table alongside it carries the same status column, but
+unconditionally: that store has no non-refreshable kind at all. Both writers
+into it reject a missing or empty refresh token (`import_auth` and
+`store_chatgpt_tokens` in `auth/codex/store.rs`) and there is no setup-token
+analog, so shunt owns renewal for every row (single-flight refresh and atomic
+writeback in `auth/codex/auth.rs`, five minutes before the access token's JWT
+`exp`, via the shared `EXPIRY_BUFFER`). The expiry this column used to print
+was therefore never actionable — it simply made every healthy Codex account
+read as broken within the hour, directly beneath a Claude row saying
+"Auto-refreshes" for the identical situation. Every Codex row now reads
+"Auto-refreshes" too, with the raw timestamp on hover.
+
+Each store row in both tables also carries a **Re-login** action beside Remove.
+It adds no endpoint: re-provisioning is already the ordinary flow run under an
+existing name (`POST /admin/accounts/{claude,codex}` → paste →
+`.../complete`). Neither start route carries a duplicate-name guard, and both
+completions capture the pre-store identity, overwrite the account in place, and
+hand the old and new identities to `cleanup_reprovisioned_pool_health`, so a
+reprovision that changes the upstream identity does not strand the replaced
+one's health entry. The
+button therefore only primes the existing add form — it fills in the account
+name, clears any half-finished flow (including the `currentName` /
+`currentCodexName` handle the completion POST interpolates into its URL, so a
+code cannot be completed against the wrong account), and scrolls the form into
+view. The Claude button additionally preselects the login method matching that
+row's current kind, since re-provisioning under the other mode would silently
+convert the account between refreshable and inference-only; the Codex form has
+no such choice, ChatGPT OAuth being the only way into that store.
+
+Clearing the form is not sufficient on its own. A start or completion request
+already in flight writes its result back when it lands, restoring the flow that
+was just cleared. The late *start* is the damaging one: it reopens the previous
+account's authorize step and restores that account's handle while the name field
+already reads the newly picked one, so following the reopened link stores the
+freshly authorized credential under the *old* account's name — silently
+overwriting a different pool account. A late completion is milder, blanking the
+just-primed name and reporting success for the wrong account. Each request
+therefore captures a per-form flow epoch (`claudeFlowEpoch` / `codexFlowEpoch`,
+bumped by a re-login and by every new start or completion) and discards its own
+response once superseded. Claude and Codex count separately, so re-priming one
+form never discards the other's live flow.
+
+The epoch orders *starts*, where the later click is the live one, and must not
+be extended to order two completions of the same flow: a completion consumes the
+pending login, so there the **first** click is the one that stores the
+credential and a second finds the entry already consumed and fails. Superseding
+by epoch would silence the successful response and surface the failed one,
+reporting an error over an account that was in fact stored. Each completion
+handler therefore refuses re-entry while its own request is in flight
+(`claudeCompleting` / `codexCompleting`), disabling the button for the duration.
+
+That marker is deliberately not released by a newer start, tempting as that is
+for a page whose Complete button is closed. `PendingStore::attempt` does not
+consume the entry and `complete_account` removes it only after the store, so a
+start issued during an in-flight exchange replaces the entry and lets a second
+completion pass its own state check — both exchanges then reach the store in an
+order nothing constrains, and the older one landing last leaves the account
+holding the superseded credential. Serializing the page's completions is what
+keeps that sequence out of reach.
+
+Nothing else may release the marker, so the completion request carries its own
+120-second `AbortController` bound, cleared in a `finally`: a connection that
+never settles must not close the button for the life of the page. Whether the
+account was stored is unknown once a completion is abandoned, so that path
+refreshes the tables and says so, rather than reporting a failure the server may
+not agree with.
+
+The marker is a per-page-load convenience, not an enforceable lock: it is a
+`let` in the inline script, so reloading the dashboard clears it and permits the
+same retry the bound does. Being page-local it also cannot see a second tab or a
+direct API call, and the server orders nothing. Its job is only to keep one
+page's own two clicks from racing; ordering concurrent completions is
+server-side work, tracked in
+[issue #440](https://github.com/pleaseai/shunt/issues/440).
+
+Both are deliberately confined to the managed store tables: the observed rows in
+the top-level **Accounts and usage** table are unchanged, since those credentials
+are owned and refreshed by the provider client itself and shunt never invokes a
+refresh/writeback store for them.
+
 The optional `plan` field is derived from credential data already held by
 shunt: Claude reads `claudeAiOauth.subscriptionType`, and Codex reads the
 `chatgpt_plan_type` claim from its stored JWT. Whenever an imported Claude
