@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
@@ -37,6 +37,69 @@ pub(crate) enum AccountStateIdentity {
 pub(crate) struct AccountKey {
     pub(crate) store_family: StoreFamily,
     pub(crate) identity: AccountStateIdentity,
+}
+
+/// One store account as the admin paths know it: a store family plus the name
+/// and uuid its credential file carries. This is *not* an [`AccountKey`] — it
+/// is the pair the admin routes actually have (`POST
+/// /admin/accounts/claude/{name}/refresh` knows a name and, when the file
+/// carries one, a `shuntAccountUuid`), and deliberately stays outside the key
+/// space so nothing here has to invent an [`AccountKey`] the selection path
+/// never produced.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct StoreAccountRef {
+    store_family: StoreFamily,
+    name: String,
+    uuid: Option<String>,
+}
+
+impl StoreAccountRef {
+    /// Build a ref with the store's blank-uuid normalization applied: a
+    /// whitespace-only uuid means the same as a missing one, matching
+    /// `read_account_uuid`, [`account_identity`] and the `snapshot` reader.
+    ///
+    /// Normalized here rather than at each call site so a later caller cannot
+    /// skip it. Today every caller sources its uuid from the store, which
+    /// already filters, but a ref carrying `Some("")` would cross-match a
+    /// *different* blank-uuid account through the uuid arm of
+    /// [`store_relogin_ref_matches`] — the set is the only place such a ref
+    /// would persist to be compared against later.
+    fn new(store_family: StoreFamily, name: &str, uuid: Option<&str>) -> Self {
+        Self {
+            store_family,
+            name: name.to_string(),
+            uuid: uuid
+                .filter(|uuid| !uuid.trim().is_empty())
+                .map(str::to_string),
+        }
+    }
+
+    /// Whether one pool entry is backed by this store account. The three
+    /// [`AccountStateIdentity`] variants are keyed differently and a store
+    /// account can land in any of them, so a `Verified` entry is matched on the
+    /// uuid while the two name-keyed variants are matched on the name — all
+    /// [`AccountKey`] carries there.
+    ///
+    /// This is the single copy of the predicate every path that matches a *pool
+    /// entry* uses ([`AccountPool::set_needs_relogin_for_store_account`],
+    /// [`AccountPool::store_account_needs_relogin`], and
+    /// [`AccountPool::clear_grant_relogin_for_store_account`]), so a set and its
+    /// mirroring clear can never drift.
+    ///
+    /// Not used where an [`AccountConfig`] is in hand — the snapshot's
+    /// side-table lookup and [`purge_store_relogin`] go through
+    /// [`store_relogin_ref_matches`] instead. An [`AccountKey`] keeps no name on
+    /// its `Verified` variant, so matching through the key alone is uuid-only
+    /// there; the account carries both, and using it keeps those two paths as
+    /// wide as the set that recorded the verdict.
+    fn matches(&self, key: &AccountKey) -> bool {
+        self.store_family == key.store_family
+            && match &key.identity {
+                AccountStateIdentity::Verified { id } => self.uuid.as_deref() == Some(id.as_str()),
+                AccountStateIdentity::StoreEntry { name }
+                | AccountStateIdentity::UpstreamInline { name, .. } => name == &self.name,
+            }
+    }
 }
 
 type RefreshLock = Arc<AsyncMutex<()>>;
@@ -345,8 +408,12 @@ pub struct AccountSnapshot {
 }
 
 impl AccountSnapshot {
-    /// A clean slot for an account the pool has never selected.
-    fn unseen(account: &AccountConfig) -> Self {
+    /// A clean slot for an account the pool has never selected. `needs_relogin`
+    /// is passed in rather than defaulted to `false`: the admin refresh probe
+    /// records a terminal verdict by store name in the pool's side table, and
+    /// such an account has no health entry to carry it (see
+    /// [`AccountPool::store_relogin`]).
+    fn unseen(account: &AccountConfig, needs_relogin: bool) -> Self {
         Self {
             name: account.name.clone(),
             has_state: false,
@@ -364,7 +431,7 @@ impl AccountSnapshot {
             utilization_7d_oi: None,
             reset_7d_oi: None,
             status: None,
-            needs_relogin: false,
+            needs_relogin,
         }
     }
 }
@@ -395,6 +462,23 @@ pub struct AccountPool {
     /// mark (every setter raises it first), while `true` may outlive the last
     /// mark and cost one extra scan. Never the reverse, so no clear is missed.
     any_needs_relogin: AtomicBool,
+    /// Needs-re-login verdicts recorded by store account rather than by
+    /// [`AccountKey`]. The admin refresh probe knows an account by its store
+    /// name and uuid, and an account the pool has never selected has no health
+    /// entry at all — so a terminal verdict on it used to update nothing and the
+    /// dashboard kept reporting the row `unseen` (issue #439). This table is the
+    /// durable record: entries come and go (`forget_identity`,
+    /// `cleanup_reprovisioned_pool_health`), the ref does not.
+    ///
+    /// A `HashSet`, not a map of [`ReloginCause`]: only the admin probe writes
+    /// here and its verdict is always [`ReloginCause::RefreshGrant`], so
+    /// membership already carries the cause.
+    ///
+    /// **Lock ordering: acquire `entries` first, then this — never the reverse.**
+    /// Most sites that touch it already hold the entries lock, so nesting is the
+    /// only pattern needed; `forget_identity` takes this one alone, after it has
+    /// released `entries`, which is still consistent with that order.
+    store_relogin: Mutex<HashSet<StoreAccountRef>>,
 }
 
 #[derive(Debug)]
@@ -1172,6 +1256,14 @@ impl AccountPool {
                 health.needs_relogin = None;
             }
         }
+        purge_store_relogin(
+            &mut self
+                .store_relogin
+                .lock()
+                .expect("store relogin lock poisoned"),
+            &key,
+            account,
+        );
     }
 
     /// Set or clear the needs-re-login mark on every pool entry backed by one
@@ -1202,10 +1294,24 @@ impl AccountPool {
     /// success, a wrong clear is re-established by its next terminal failure —
     /// so this is preferred over leaving the ordinary configuration unreachable.
     ///
-    /// Only entries the pool already holds are updated — an account the pool
-    /// has never selected has no health entry, and the dashboard reports it as
-    /// `unseen` rather than carrying any mark. Inventing an entry here would
-    /// mean synthesizing an [`AccountKey`] the selection path never produced.
+    /// The verdict is recorded in **two** places, because neither alone covers
+    /// the accounts an operator can click Refresh on. Every health entry the
+    /// pool already holds is updated, and the `(family, name, uuid)` ref itself
+    /// is recorded in [`Self::store_relogin`]. An account the pool has never
+    /// selected has no health entry at all, so the entry loop would update
+    /// nothing and the dashboard would keep reporting it `unseen` — the defect
+    /// in issue #439 — while inventing an entry here would mean synthesizing an
+    /// [`AccountKey`] the selection path never produced. The side table is also
+    /// the *durable* record even when entries did match: `forget_identity` and
+    /// `cleanup_reprovisioned_pool_health` drop entries, and every path that
+    /// clears the mark purges both, so keeping the ref costs nothing and
+    /// survives an entry that does not.
+    ///
+    /// The clear arm purges by `(family, name-or-uuid)` rather than by ref
+    /// equality, so it strips at least as much as this sets — a re-login that
+    /// signs a different subscription in under the same store name changes the
+    /// uuid, and an equality-removal would strand the old verdict on the fresh
+    /// account. See [`purge_store_relogin_ref`].
     pub fn set_needs_relogin_for_store_account(
         &self,
         store_family: StoreFamily,
@@ -1213,17 +1319,18 @@ impl AccountPool {
         account_uuid: Option<&str>,
         needs_relogin: bool,
     ) {
+        let marked = StoreAccountRef::new(store_family, account_name, account_uuid);
         let mut entries = self.entries.lock().expect("account health lock poisoned");
+        // Raised unconditionally, not from inside the entry loop: a never-selected
+        // account matches no entry, and the flag gates the only path that clears
+        // the mark ([`Self::mark_healthy_scoped`]). Leaving it down for a verdict
+        // that lives only in the side table would mean nothing ever clears it.
+        if needs_relogin {
+            self.any_needs_relogin.store(true, Ordering::Relaxed);
+        }
         for (key, health) in entries.iter_mut() {
-            let matches = key.store_family == store_family
-                && match &key.identity {
-                    AccountStateIdentity::Verified { id } => account_uuid == Some(id.as_str()),
-                    AccountStateIdentity::StoreEntry { name }
-                    | AccountStateIdentity::UpstreamInline { name, .. } => name == account_name,
-                };
-            if matches {
+            if marked.matches(key) {
                 if needs_relogin {
-                    self.any_needs_relogin.store(true, Ordering::Relaxed);
                     // `snapshot` reports an unobserved entry as `unseen` and
                     // drops every field on it, and `select_order` leaves exactly
                     // such an entry behind for a row it considered but that
@@ -1238,6 +1345,16 @@ impl AccountPool {
                 });
             }
         }
+        // Nested under the entries lock, per the ordering on `store_relogin`.
+        let mut store_relogin = self
+            .store_relogin
+            .lock()
+            .expect("store relogin lock poisoned");
+        if needs_relogin {
+            store_relogin.insert(marked);
+        } else {
+            purge_store_relogin_ref(&mut store_relogin, store_family, account_name, account_uuid);
+        }
     }
 
     /// Whether any pool entry backed by one store account still carries the
@@ -1247,23 +1364,36 @@ impl AccountPool {
     /// entry that selected it.
     ///
     /// The refresh probe reports this *after* its own clear, so its response
-    /// cannot claim recovery for an account the pool still considers dead.
+    /// cannot claim recovery for an account the pool still considers dead. The
+    /// side table is consulted alongside the entries, or an account nothing has
+    /// ever selected would be reported alive by the probe while `/admin/pool`
+    /// shows it as needing a re-login.
+    ///
+    /// The side table is read through the same `(family, name-or-uuid)`
+    /// predicate the clears strip with ([`store_relogin_ref_matches`]), not by
+    /// ref equality: a recorded ref carries whatever uuid the credential file
+    /// reported when the probe ran, and demanding all three fields be equal
+    /// would report a login alive while `/admin/pool` still renders the verdict
+    /// — the contradiction this read-back exists to prevent.
     pub fn store_account_needs_relogin(
         &self,
         store_family: StoreFamily,
         account_name: &str,
         account_uuid: Option<&str>,
     ) -> bool {
+        let marked = StoreAccountRef::new(store_family, account_name, account_uuid);
         let entries = self.entries.lock().expect("account health lock poisoned");
-        entries.iter().any(|(key, health)| {
-            health.needs_relogin.is_some()
-                && key.store_family == store_family
-                && match &key.identity {
-                    AccountStateIdentity::Verified { id } => account_uuid == Some(id.as_str()),
-                    AccountStateIdentity::StoreEntry { name }
-                    | AccountStateIdentity::UpstreamInline { name, .. } => name == account_name,
-                }
-        })
+        entries
+            .iter()
+            .any(|(key, health)| health.needs_relogin.is_some() && marked.matches(key))
+            || self
+                .store_relogin
+                .lock()
+                .expect("store relogin lock poisoned")
+                .iter()
+                .any(|recorded| {
+                    store_relogin_ref_matches(recorded, store_family, account_name, account_uuid)
+                })
     }
 
     /// Clear the mark on every pool entry backed by one store account, but only
@@ -1277,30 +1407,49 @@ impl AccountPool {
     /// would hide that until the next real request re-established it. Such a
     /// mark is cleared only by a served response, in
     /// [`Self::mark_healthy_scoped`].
+    ///
+    /// The side table is purged unconditionally, without the `RefreshGrant`
+    /// guard the entry loop carries: only the admin probe writes there and its
+    /// verdict is always grant-caused, so membership *is* the guard. It is
+    /// purged by `(family, name-or-uuid)` rather than by ref equality, so the
+    /// clear is at least as wide as the set — see [`purge_store_relogin_ref`].
     pub fn clear_grant_relogin_for_store_account(
         &self,
         store_family: StoreFamily,
         account_name: &str,
         account_uuid: Option<&str>,
     ) {
+        let marked = StoreAccountRef::new(store_family, account_name, account_uuid);
         let mut entries = self.entries.lock().expect("account health lock poisoned");
         for (key, health) in entries.iter_mut() {
             if health.needs_relogin != Some(ReloginCause::RefreshGrant) {
                 continue;
             }
-            let matches = key.store_family == store_family
-                && match &key.identity {
-                    AccountStateIdentity::Verified { id } => account_uuid == Some(id.as_str()),
-                    AccountStateIdentity::StoreEntry { name }
-                    | AccountStateIdentity::UpstreamInline { name, .. } => name == account_name,
-                };
-            if matches {
+            if marked.matches(key) {
                 health.needs_relogin = None;
             }
         }
+        purge_store_relogin_ref(
+            &mut self
+                .store_relogin
+                .lock()
+                .expect("store relogin lock poisoned"),
+            store_family,
+            account_name,
+            account_uuid,
+        );
     }
 
-    /// Whether this account currently carries the needs-re-login mark.
+    /// Whether this account's own health entry currently carries the
+    /// needs-re-login mark.
+    ///
+    /// Entry-scoped on purpose, and therefore **narrower** than
+    /// [`Self::store_account_needs_relogin`]: it does not consult the
+    /// store-name side table, so an account the pool has never selected reports
+    /// `false` here while `/admin/pool` and the probe's own read-back report the
+    /// verdict. Ask this when the question really is about one keyed row; ask
+    /// the store-scoped reader when the question is "does the pool consider this
+    /// credential dead".
     pub fn needs_relogin(&self, provider: &str, account: &AccountConfig) -> bool {
         let entries = self.entries.lock().expect("account health lock poisoned");
         entries
@@ -1349,6 +1498,19 @@ impl AccountPool {
                 }
                 still_marked |= health.needs_relogin.is_some();
             }
+            // The same evidence disproves a verdict the admin probe recorded by
+            // store name, so the side table is purged here too — and then folded
+            // into the recomputed flag *after* the purge. Without that fold the
+            // flag would drop to `false` while a never-selected account's side
+            // mark is still live, and this scan — the only thing that ever
+            // clears it — would never run again.
+            let mut store_relogin = self
+                .store_relogin
+                .lock()
+                .expect("store relogin lock poisoned");
+            purge_store_relogin(&mut store_relogin, &key, account);
+            still_marked |= !store_relogin.is_empty();
+            drop(store_relogin);
             // The entry for `key` is cleared unconditionally just below, so it
             // is deliberately excluded from the recomputed flag.
             self.any_needs_relogin
@@ -1450,7 +1612,22 @@ impl AccountPool {
 
     /// Forget pool health and refresh state for one physical store identity.
     /// Removing persisted quota marks the pool dirty so the next flush removes it.
-    pub fn forget_identity(&self, store_family: StoreFamily, identity: &str) {
+    ///
+    /// `identity` is whichever of the uuid or the store name the caller's store
+    /// resolved (`account_uuid(name).unwrap_or(name)` at the admin call sites),
+    /// which is all the *entries*/`refresh_locks`/`memberships` matcher below
+    /// needs — those are keyed by identity. `store_name` is for the side table
+    /// alone: a verdict recorded with no uuid is keyed by the store name, and
+    /// the delete may well resolve `identity` to a uuid the probe never saw
+    /// (the uuid read failed at probe time and succeeded here), leaving the ref
+    /// unpurgeable through `identity`. Pass `None` only where no name is
+    /// available.
+    pub fn forget_identity(
+        &self,
+        store_family: StoreFamily,
+        identity: &str,
+        store_name: Option<&str>,
+    ) {
         let matches = |key: &AccountKey| {
             key.store_family == store_family
                 && match &key.identity {
@@ -1482,9 +1659,53 @@ impl AccountPool {
             .expect("account membership lock poisoned")
             .values_mut()
             .for_each(|members| members.retain(|key, _| !matches(key)));
+        // A forgotten identity must not keep a store-name verdict alive either:
+        // `DELETE /admin/accounts/claude/{name}` reaches here through
+        // `forget_pool_health_if_absent`, and a ref left behind would re-condemn
+        // a same-named account added later — through the name fallback in
+        // `store_relogin_ref_condemns`, even when the re-add carries a different
+        // credential. Matched on either half of the ref, because `identity` is
+        // whichever of the two the store resolved, *and* on `store_name`,
+        // because the two need not be the same half: a uuid-less verdict is
+        // keyed by name while a delete that reads the uuid successfully arrives
+        // here with the uuid, and neither ref field would equal it.
+        self.store_relogin
+            .lock()
+            .expect("store relogin lock poisoned")
+            .retain(|marked| {
+                !(marked.store_family == store_family
+                    && (marked.uuid.as_deref() == Some(identity)
+                        || marked.name == identity
+                        || Some(marked.name.as_str()) == store_name))
+            });
         if removed_quota {
             self.mark_dirty();
         }
+    }
+
+    /// Drop a store-name verdict for `name` in `store_family`, leaving every
+    /// other pool state untouched.
+    ///
+    /// Split out of [`Self::forget_identity`] because that method purges two
+    /// kinds of state under one predicate: `entries`/`refresh_locks`/
+    /// `memberships` are keyed by *identity*, while [`Self::store_relogin`] is
+    /// keyed by the store *name*. `forget_pool_health_if_absent` must preserve
+    /// the identity-keyed half whenever another alias still resolves to the
+    /// same identity — but the deleted name's verdict has to go regardless,
+    /// because the caller has already removed (or re-provisioned) that name and
+    /// a ref left behind would condemn whatever is added under it next through
+    /// the name fallback in [`store_relogin_ref_condemns`].
+    ///
+    /// Matched on `(family, name)` alone, which is deliberately wider than the
+    /// accept side: a store name is unique within its family, so it cannot
+    /// reach another account's verdict, and a sibling alias's own verdict is a
+    /// separate ref keyed by that alias's own name. Over-stripping is fail-safe
+    /// — the next terminal refresh probe re-marks.
+    pub fn forget_store_relogin_name(&self, store_family: StoreFamily, name: &str) {
+        self.store_relogin
+            .lock()
+            .expect("store relogin lock poisoned")
+            .retain(|marked| !(marked.store_family == store_family && marked.name == name));
     }
 
     /// Read-only per-account health snapshot for the admin dashboard, in the
@@ -1507,16 +1728,74 @@ impl AccountPool {
         let is_fable = is_fable_model(model);
         let (snapshots, quota_expired) = {
             let mut entries = self.entries.lock().expect("account health lock poisoned");
+            // Taken once for the whole sweep, nested under the entries lock per
+            // the ordering on `store_relogin`. Empty in the steady state, which
+            // is why the unseen branch tests that before matching anything.
+            let store_relogin = self
+                .store_relogin
+                .lock()
+                .expect("store relogin lock poisoned");
+            let store_marked = !store_relogin.is_empty();
             let mut quota_expired = false;
             let snapshots = accounts
                 .iter()
                 .map(|account| {
                     let key = account_key(provider, account);
+                    // Whether the side table condemns *this* account, computed
+                    // once for both branches below — a verdict the admin refresh
+                    // probe recorded by store name (issue #439) has to reach the
+                    // row whether or not the pool has an entry for it.
+                    //
+                    // Matched exactly as the purge matches, through the *account*
+                    // rather than through `key`. A `Verified` key carries a uuid
+                    // and no name, so `StoreAccountRef::matches` can only reach it
+                    // by uuid — and the probe records whatever
+                    // `claude_store::account_uuid` returned, which is `None` both
+                    // when the credential file carries no `shuntAccountUuid` and
+                    // when that read failed (`unwrap_or(None)`,
+                    // `admin::refresh_claude_account`). An operator may also set
+                    // `uuid` on the provider entry directly
+                    // (`AccountConfig::uuid` is a config key), so the two need not
+                    // agree even without a race. Keying off the account gives the
+                    // name back, which is what makes the accept side as wide as
+                    // the set that recorded the verdict — otherwise a recorded
+                    // verdict is silently never shown, which is issue #439 all
+                    // over again.
+                    //
+                    // Narrowed exactly as the purge is, too: an account carrying
+                    // its own `credentials` path or `token_env` is a different
+                    // credential that merely shares the store account's name, and
+                    // serving on it never purges the verdict
+                    // (`purge_store_relogin`), so accepting it here would condemn
+                    // an unrelated credential with nothing able to clear it.
+                    //
+                    // `store_marked` short-circuits first, so the steady state
+                    // (an empty side table) scans nothing.
+                    let store_backed = account.credentials.is_none() && account.token_env.is_none();
+                    let account_uuid = account
+                        .uuid
+                        .as_deref()
+                        .filter(|uuid| !uuid.trim().is_empty());
+                    let store_condemned = store_marked
+                        && store_backed
+                        && store_relogin.iter().any(|marked| {
+                            store_relogin_ref_condemns(
+                                marked,
+                                key.store_family,
+                                &account.name,
+                                account_uuid,
+                            )
+                        });
                     let Some(health) = entries.get_mut(&key).filter(|health| health.observed)
                     else {
                         // Never selected, or selected but not yet answered (a default
-                        // entry from `select_order`): report a clean, available slot.
-                        return AccountSnapshot::unseen(account);
+                        // entry from `select_order`): report a clean, available slot —
+                        // except for the one thing that can be known about an account
+                        // with no entry at all, the side table's verdict. `has_state`
+                        // stays `false`, which is still true and which both dashboard
+                        // tables already read *after* `needs_relogin`, so the row
+                        // renders "needs re-login" rather than "unseen".
+                        return AccountSnapshot::unseen(account, store_condemned);
                     };
                     quota_expired |= expire_stale_quota(&mut health.quota, unix_now);
                     let quota = assess_quota(&health.quota, account, is_fable, pool, unix_now);
@@ -1548,7 +1827,25 @@ impl AccountPool {
                         utilization_7d_oi: health.quota.utilization_7d_oi,
                         reset_7d_oi: health.quota.reset_7d_oi,
                         status: health.quota.status.clone(),
-                        needs_relogin: health.needs_relogin.is_some(),
+                        // The entry's own mark *or* the side table's, because
+                        // the set cannot always reach the entry: a verdict
+                        // recorded with no uuid — the credential file carried no
+                        // `shuntAccountUuid`, or that read failed into `None` —
+                        // matches a `Verified` entry through
+                        // `StoreAccountRef::matches` by uuid alone and so never
+                        // stamps it, while this row's own `uuid` config key still
+                        // keys the entry. Reporting only the entry there would
+                        // answer `false` here while `store_account_needs_relogin`
+                        // answers `true` for the same account, which is issue #439
+                        // wearing an observed entry.
+                        //
+                        // Safe to OR in because every clear purges the side table
+                        // too (`mark_healthy_scoped` and `clear_needs_relogin`
+                        // call `purge_store_relogin`, which strips by the wide
+                        // `(family, name-or-uuid)` predicate), so one served
+                        // response on any row backed by that store account lifts
+                        // it here as well.
+                        needs_relogin: health.needs_relogin.is_some() || store_condemned,
                     }
                 })
                 .collect();
@@ -1822,6 +2119,120 @@ fn backed_by_same_store_account(
             AccountStateIdentity::StoreEntry { name }
             | AccountStateIdentity::UpstreamInline { name, .. } => *name == account.name,
         }
+}
+
+/// Drop every store-name verdict this served-or-authenticated account
+/// disproves. Reproduces `backed_by_same_store_account` on purpose, in *both*
+/// directions:
+///
+/// - Its narrowing: an account carrying its own `credentials` path or
+///   `token_env` is a different credential that merely shares a name with the
+///   store account, so serving on it proves nothing about the store file and
+///   must not clear its verdict.
+/// - Its width: the fan-out reaches a name-keyed sibling from a `Verified`
+///   account through the *name*, so the purge has to strip on the name or the
+///   uuid rather than on the key's own identity alone. Matching only
+///   [`StoreAccountRef::matches`] would leave a verdict recorded with no uuid
+///   (the credential file carried no `shuntAccountUuid` when the probe ran, or
+///   the admin path's uuid read failed into `None`) standing forever once the
+///   account is only ever reached through a uuid-keyed row — every name-keyed
+///   row the pool has not selected would keep rendering "needs re-login" for an
+///   account that is demonstrably serving.
+fn purge_store_relogin(
+    store_relogin: &mut HashSet<StoreAccountRef>,
+    key: &AccountKey,
+    account: &AccountConfig,
+) {
+    if account.credentials.is_some() || account.token_env.is_some() {
+        return;
+    }
+    purge_store_relogin_ref(
+        store_relogin,
+        key.store_family,
+        &account.name,
+        account
+            .uuid
+            .as_deref()
+            .filter(|uuid| !uuid.trim().is_empty()),
+    );
+}
+
+/// Drop every store-name verdict the admin paths' own `(family, name, uuid)`
+/// identifies, for the two clears that speak that language rather than
+/// [`AccountKey`] ([`AccountPool::set_needs_relogin_for_store_account`]'s clear
+/// arm and [`AccountPool::clear_grant_relogin_for_store_account`]).
+///
+/// Deliberately wider than removing the equal ref: the set side matches an
+/// entry on the uuid **or** the name ([`StoreAccountRef::matches`]), so a clear
+/// that demanded all three fields be equal would strip less than the set
+/// accepts. A re-login under the same store name that signs a *different*
+/// subscription in is exactly that case — the store file now reports a new
+/// uuid, the recorded ref still carries the old one, and an equality-removal
+/// would leave the fresh account condemned on every name-keyed row. A store
+/// name is unique within its family (it *is* the credential file's name), so
+/// matching on it cannot reach another account's verdict.
+///
+/// The `is_some` guard on the uuid arm is load-bearing: without it a caller
+/// with no uuid would match every uuid-less ref in the family, whatever its
+/// name.
+fn purge_store_relogin_ref(
+    store_relogin: &mut HashSet<StoreAccountRef>,
+    store_family: StoreFamily,
+    account_name: &str,
+    account_uuid: Option<&str>,
+) {
+    store_relogin.retain(|marked| {
+        !store_relogin_ref_matches(marked, store_family, account_name, account_uuid)
+    });
+}
+
+/// Whether a recorded verdict condemns this account — the **accept** side, used
+/// by the snapshot's side-table lookup.
+///
+/// Deliberately narrower than [`store_relogin_ref_matches`], because the two
+/// sides fail in opposite directions. Over-stripping only drops a verdict the
+/// account's next terminal failure re-establishes, so the clear is wide. Over-
+/// accepting renders "needs re-login" against a credential the verdict is not
+/// about, which nothing on that row can lift — so the accept side takes the uuid
+/// as the stronger identity whenever *both* sides carry one, and falls back to
+/// the store name only when at most one does:
+///
+/// - Both carry a uuid and they agree → the same credential.
+/// - Both carry a uuid and they disagree → different credentials that merely
+///   share a store name; the verdict does not travel.
+/// - At most one carries a uuid → the name is all there is to go on, and within
+///   a family it is unique (it *is* the credential file's name). This is the
+///   reachable case: the probe records whatever `claude_store::account_uuid`
+///   returned — `None` when the file carries no `shuntAccountUuid` and `None`
+///   again when that read failed — while `AccountConfig::uuid` is a config key
+///   an operator can set on the provider entry directly.
+///
+/// Every pair this accepts, [`store_relogin_ref_matches`] also strips, so the
+/// clear stays at least as wide as the display.
+fn store_relogin_ref_condemns(
+    marked: &StoreAccountRef,
+    store_family: StoreFamily,
+    account_name: &str,
+    account_uuid: Option<&str>,
+) -> bool {
+    marked.store_family == store_family
+        && ((marked.uuid.is_some() && marked.uuid.as_deref() == account_uuid)
+            || ((marked.uuid.is_none() || account_uuid.is_none()) && marked.name == account_name))
+}
+
+/// The single copy of the `(family, name-or-uuid)` predicate the store-account
+/// clears speak — shared by [`purge_store_relogin_ref`] and
+/// [`AccountPool::store_account_needs_relogin`]'s side-table read so the strip
+/// and the read can never be narrower than the set that recorded the verdict.
+fn store_relogin_ref_matches(
+    marked: &StoreAccountRef,
+    store_family: StoreFamily,
+    account_name: &str,
+    account_uuid: Option<&str>,
+) -> bool {
+    marked.store_family == store_family
+        && (marked.name == account_name
+            || (marked.uuid.is_some() && marked.uuid.as_deref() == account_uuid))
 }
 
 pub(crate) fn account_key(upstream: &str, account: &AccountConfig) -> AccountKey {
@@ -2869,6 +3280,579 @@ mod tests {
             row.has_state && row.needs_relogin,
             "the admin probe recorded a terminal verdict the dashboard still \
              hides, so the Refresh button reports a dead credential nowhere"
+        );
+    }
+
+    /// The defect in issue #439: an account the pool has never selected has no
+    /// health entry at all, so the admin probe's terminal verdict updated
+    /// nothing and `/admin/pool` kept reporting the row `unseen`. The verdict is
+    /// recorded by store name in the side table instead, and the snapshot's
+    /// unseen branch reads it. `has_state` stays `false` — nothing was ever
+    /// observed — and both dashboard tables check `needs_relogin` before it, so the
+    /// row still renders "needs re-login".
+    #[test]
+    fn an_admin_verdict_reaches_an_account_the_pool_has_never_selected() {
+        let pool = AccountPool::new();
+        let accounts = [account("a")];
+        assert!(
+            !pool.snapshot("anthropic", &accounts, None, None)[0].needs_relogin,
+            "precondition: nothing is marked yet"
+        );
+
+        pool.set_needs_relogin_for_store_account(StoreFamily::Claude, "a", None, true);
+
+        let row = &pool.snapshot("anthropic", &accounts, None, None)[0];
+        assert!(
+            row.needs_relogin,
+            "the probe's terminal verdict is lost for an account no provider \
+             table has ever selected"
+        );
+        assert!(
+            !row.has_state,
+            "nothing was ever observed for this account, so `has_state` must \
+             stay false — the dashboard reads `needs_relogin` before it"
+        );
+        assert!(
+            pool.store_account_needs_relogin(StoreFamily::Claude, "a", None),
+            "the probe's own read-back must see the verdict it just recorded"
+        );
+    }
+
+    /// The two clears that answer the verdict above. A re-login
+    /// (`set(.., false)`) and a successful refresh probe
+    /// (`clear_grant_relogin_for_store_account`) both have to purge the side
+    /// table, or a revived account stays condemned with no entry to clear.
+    #[test]
+    fn both_admin_clears_purge_a_never_selected_account_verdict() {
+        let accounts = [account("a")];
+        for (label, clear) in [
+            (
+                "re-login",
+                &(|pool: &AccountPool| {
+                    pool.set_needs_relogin_for_store_account(StoreFamily::Claude, "a", None, false);
+                }) as &dyn Fn(&AccountPool),
+            ),
+            ("successful probe", &|pool: &AccountPool| {
+                pool.clear_grant_relogin_for_store_account(StoreFamily::Claude, "a", None);
+            }),
+        ] {
+            let pool = AccountPool::new();
+            pool.set_needs_relogin_for_store_account(StoreFamily::Claude, "a", None, true);
+            assert!(pool.snapshot("anthropic", &accounts, None, None)[0].needs_relogin);
+
+            clear(&pool);
+
+            assert!(
+                !pool.snapshot("anthropic", &accounts, None, None)[0].needs_relogin,
+                "a {label} left the verdict standing on a never-selected account"
+            );
+            assert!(
+                !pool.store_account_needs_relogin(StoreFamily::Claude, "a", None),
+                "a {label} left the verdict standing for the probe's read-back"
+            );
+        }
+    }
+
+    /// The accept side has to be as wide as the set, too. The probe records
+    /// whatever `claude_store::account_uuid` returned — `None` when the
+    /// credential file carries no `shuntAccountUuid`, and `None` again when that
+    /// read failed (`unwrap_or(None)`). Meanwhile `AccountConfig::uuid` is a
+    /// config key an operator can set on the provider entry directly, which keys
+    /// the row as `Verified`. Matching the recorded ref against that key alone is
+    /// uuid-only, so the verdict would never reach the dashboard and the row
+    /// would render `unseen` — issue #439 again, one layer in.
+    #[test]
+    fn a_uuidless_verdict_reaches_a_uuid_keyed_row_for_the_same_store_name() {
+        let pool = AccountPool::new();
+        pool.set_needs_relogin_for_store_account(StoreFamily::Claude, "a", None, true);
+
+        let uuid_keyed = [account_with_uuid("a", "acct-a")];
+        assert!(
+            pool.snapshot("anthropic", &uuid_keyed, None, None)[0].needs_relogin,
+            "a verdict recorded without a uuid never reached the uuid-keyed row for \
+             the same store account, so the dashboard still reports it unseen"
+        );
+
+        // The narrowing still holds in the other direction: a *different* store
+        // account that happens to be uuid-keyed is not condemned by it.
+        let bystander = [account_with_uuid("b", "acct-b")];
+        assert!(
+            !pool.snapshot("anthropic", &bystander, None, None)[0].needs_relogin,
+            "an unrelated store account inherited the verdict"
+        );
+
+        // Nor does a uuid-less bystander. Both sides carry `None` here, so an
+        // accept rule that compared the uuids alone would read `None == None` as
+        // agreement and condemn every uuid-less account in the family.
+        let uuidless_bystander = [account("b")];
+        assert!(
+            !pool.snapshot("anthropic", &uuidless_bystander, None, None)[0].needs_relogin,
+            "a uuid-less bystander was condemned — `None == None` is not identity"
+        );
+    }
+
+    /// A clear has to strip at least as much as a set accepts. The set matches a
+    /// pool entry on the uuid **or** the name, so removing only the ref that is
+    /// equal on all three fields strips less — and a re-login under the same
+    /// store name that signs a *different* subscription in is exactly that gap:
+    /// the store file reports a new uuid, the recorded verdict still carries the
+    /// old one, and the fresh account stays condemned on every name-keyed row.
+    #[test]
+    fn a_clear_carrying_a_rotated_uuid_still_purges_the_verdict() {
+        let accounts = [account("a")];
+        for (label, clear) in [
+            (
+                "re-login",
+                &(|pool: &AccountPool| {
+                    pool.set_needs_relogin_for_store_account(
+                        StoreFamily::Claude,
+                        "a",
+                        Some("acct-new"),
+                        false,
+                    );
+                }) as &dyn Fn(&AccountPool),
+            ),
+            ("successful probe", &|pool: &AccountPool| {
+                pool.clear_grant_relogin_for_store_account(
+                    StoreFamily::Claude,
+                    "a",
+                    Some("acct-new"),
+                );
+            }),
+        ] {
+            let pool = AccountPool::new();
+            // The verdict was recorded while the store file still carried the
+            // dead subscription's uuid.
+            pool.set_needs_relogin_for_store_account(
+                StoreFamily::Claude,
+                "a",
+                Some("acct-old"),
+                true,
+            );
+            assert!(pool.snapshot("anthropic", &accounts, None, None)[0].needs_relogin);
+
+            // The operator re-adds `a`, and the new credential file carries a
+            // different uuid.
+            clear(&pool);
+
+            assert!(
+                !pool.snapshot("anthropic", &accounts, None, None)[0].needs_relogin,
+                "a {label} under a rotated uuid left the old verdict standing, so the \
+                 freshly signed-in account is condemned before it is ever used"
+            );
+            assert!(
+                !pool.store_account_needs_relogin(StoreFamily::Claude, "a", Some("acct-new")),
+                "a {label} under a rotated uuid left the old verdict for the read-back"
+            );
+        }
+    }
+
+    /// The widening above must not reach across store accounts. A clear that
+    /// carries no uuid matches uuid-less refs only through the *name*: without
+    /// that guard `None == None` would strip every uuid-less verdict in the
+    /// family, whatever account recorded it.
+    #[test]
+    fn a_uuidless_clear_does_not_strip_another_accounts_verdict() {
+        let pool = AccountPool::new();
+        pool.set_needs_relogin_for_store_account(StoreFamily::Claude, "a", None, true);
+        pool.set_needs_relogin_for_store_account(StoreFamily::Claude, "b", None, true);
+
+        pool.clear_grant_relogin_for_store_account(StoreFamily::Claude, "a", None);
+
+        assert!(
+            !pool.store_account_needs_relogin(StoreFamily::Claude, "a", None),
+            "the cleared account kept its verdict"
+        );
+        assert!(
+            pool.store_account_needs_relogin(StoreFamily::Claude, "b", None),
+            "clearing one uuid-less account stripped a bystander's verdict"
+        );
+    }
+
+    /// The side table is keyed the same way the entry loop is: a `Verified` row
+    /// is reached through the uuid alone. A same-named account carrying a
+    /// *different* uuid is a different credential and must not inherit the
+    /// verdict — nor may an account in another store family, or one with
+    /// another name.
+    ///
+    /// Regression test: a blank uuid is not an identity. Every production caller
+    /// sources its uuid from the store, which already folds a whitespace-only
+    /// `shuntAccountUuid` to `None`, so this cannot happen today — but a ref that
+    /// reached the set as `Some("")` would match any *other* blank-uuid account
+    /// through the uuid arm of `store_relogin_ref_matches`, condemning a
+    /// credential that was never probed. `StoreAccountRef::new` normalizes at
+    /// construction so no future caller can introduce one.
+    #[test]
+    fn a_blank_uuid_verdict_does_not_condemn_a_different_account() {
+        let pool = AccountPool::new();
+        pool.set_needs_relogin_for_store_account(StoreFamily::Claude, "a", Some(""), true);
+
+        assert!(
+            pool.store_account_needs_relogin(StoreFamily::Claude, "a", Some("")),
+            "the probed account must still carry its own verdict, by name"
+        );
+        assert!(
+            !pool.store_account_needs_relogin(StoreFamily::Claude, "b", Some("")),
+            "a blank uuid must not carry one account's verdict onto another"
+        );
+    }
+
+    /// another name.
+    #[test]
+    fn a_never_selected_verdict_is_keyed_by_uuid_family_and_name() {
+        let pool = AccountPool::new();
+        pool.set_needs_relogin_for_store_account(StoreFamily::Claude, "a", Some("acct-a"), true);
+
+        let marked = vec![account_with_uuid("a", "acct-a")];
+        assert!(
+            pool.snapshot("anthropic", &marked, None, None)[0].needs_relogin,
+            "the uuid-keyed account the probe marked was not reported"
+        );
+
+        let other_uuid = vec![account_with_uuid("a", "acct-other")];
+        assert!(
+            !pool.snapshot("anthropic", &other_uuid, None, None)[0].needs_relogin,
+            "a same-named account carrying a different uuid is a different \
+             credential and must not inherit the verdict"
+        );
+
+        let other_family = vec![AccountConfig {
+            name: "a".to_string(),
+            store_family: Some(StoreFamily::Chatgpt),
+            ..Default::default()
+        }];
+        assert!(
+            !pool.snapshot("codex", &other_family, None, None)[0].needs_relogin,
+            "a same-named account in another store family was condemned"
+        );
+
+        let bystander = vec![account("b")];
+        assert!(
+            !pool.snapshot("anthropic", &bystander, None, None)[0].needs_relogin,
+            "an unrelated account was condemned"
+        );
+    }
+
+    /// `mark_healthy_scoped` recomputes `any_needs_relogin` from the entries it
+    /// scanned, and that flag gates the only path that ever clears the mark. A
+    /// never-selected account has no entry in that scan, so unless the side
+    /// table is folded into the recomputed flag, a success on an *unrelated*
+    /// account drops the flag to `false` while the verdict is still live — and
+    /// no later clear ever runs.
+    #[test]
+    fn an_unrelated_success_neither_clears_nor_strands_a_never_selected_verdict() {
+        let pool = AccountPool::new();
+        let marked = vec![account("a")];
+        pool.set_needs_relogin_for_store_account(StoreFamily::Claude, "a", None, true);
+
+        let unrelated = account("b");
+        pool.mark_healthy("anthropic", &unrelated, true);
+
+        assert!(
+            pool.snapshot("anthropic", &marked, None, None)[0].needs_relogin,
+            "a success on an unrelated account cleared a verdict it disproves \
+             nothing about"
+        );
+        // The flag has to survive with it: it gates the clear below, so a flag
+        // dropped here would strand the verdict forever. Read back through the
+        // probe's own predicate rather than the snapshot alone — serving the
+        // account creates an observed entry for the row, and the snapshot then
+        // answers from that entry whether or not the side table was purged.
+        pool.mark_healthy("anthropic", &marked[0], true);
+        assert!(
+            !pool.store_account_needs_relogin(StoreFamily::Claude, "a", None),
+            "`any_needs_relogin` was dropped by the unrelated success, so the \
+             clear that should answer the verdict never ran and the probe still \
+             reports a dead account the pool just saw serve"
+        );
+        assert!(
+            !pool.snapshot("anthropic", &marked, None, None)[0].needs_relogin,
+            "the row the account actually served on still reports needs-re-login"
+        );
+    }
+
+    /// Serving the marked account itself is the evidence that answers the
+    /// verdict, and it has to reach both records — the snapshot row *and* the
+    /// probe's read-back, which is what the Refresh button reports.
+    #[test]
+    fn serving_the_marked_account_purges_the_verdict() {
+        let pool = AccountPool::new();
+        let accounts = [account("a")];
+        pool.set_needs_relogin_for_store_account(StoreFamily::Claude, "a", None, true);
+
+        pool.mark_healthy("anthropic", &accounts[0], true);
+
+        assert!(
+            !pool.snapshot("claude-b", &accounts, None, None)[0].needs_relogin,
+            "a row with no entry of its own still reports the verdict a response \
+             served through another provider row already disproved"
+        );
+        assert!(
+            !pool.snapshot("anthropic", &accounts, None, None)[0].needs_relogin,
+            "a response the account actually served left the verdict standing"
+        );
+        assert!(
+            !pool.store_account_needs_relogin(StoreFamily::Claude, "a", None),
+            "the probe would still report a dead account the pool just saw serve"
+        );
+    }
+
+    /// The narrow clear reaches the side table too. A relayed non-401 4xx proves
+    /// the credential authenticated, which disproves a grant-caused verdict just
+    /// as much for an account the pool has no entry for as for one it has.
+    #[test]
+    fn the_narrow_clear_purges_a_never_selected_account_verdict() {
+        let pool = AccountPool::new();
+        let accounts = [account("a")];
+        pool.set_needs_relogin_for_store_account(StoreFamily::Claude, "a", None, true);
+
+        pool.clear_needs_relogin("anthropic", &accounts[0]);
+
+        assert!(
+            !pool.store_account_needs_relogin(StoreFamily::Claude, "a", None),
+            "a response that proved the credential authenticated left the \
+             verdict standing on an account with no health entry"
+        );
+    }
+
+    /// `DELETE /admin/accounts/claude/{name}` reaches `forget_identity` through
+    /// `forget_pool_health_if_absent`. It drops the health entries; the store
+    /// verdict has to go with them, or an account re-added under the same name
+    /// would be reported dead the moment it appears, with nothing having failed.
+    #[test]
+    fn forgetting_an_identity_purges_its_store_verdict() {
+        let pool = AccountPool::new();
+        let accounts = [account("a")];
+        pool.set_needs_relogin_for_store_account(StoreFamily::Claude, "a", None, true);
+        assert!(pool.snapshot("anthropic", &accounts, None, None)[0].needs_relogin);
+
+        // Another family first: the purge is family-scoped like every other
+        // store-account path, so this must leave the verdict standing.
+        pool.forget_identity(StoreFamily::Chatgpt, "a", Some("a"));
+        assert!(
+            pool.snapshot("anthropic", &accounts, None, None)[0].needs_relogin,
+            "forgetting a same-named identity in another store family dropped \
+             this family's verdict"
+        );
+
+        pool.forget_identity(StoreFamily::Claude, "a", Some("a"));
+        assert!(
+            !pool.snapshot("anthropic", &accounts, None, None)[0].needs_relogin,
+            "a deleted account left its verdict behind, so a re-add under the \
+             same name is condemned before it is ever used"
+        );
+    }
+
+    /// A delete resolves `identity` to whichever of the uuid or the name the
+    /// store gave it, and that need not be the half the verdict was recorded
+    /// under: the probe's uuid read can fail into `None` (recording
+    /// `(Claude, "a", None)`) while the delete's succeeds (`identity =
+    /// "acct-a"`). Without the store name the retain compares both ref fields
+    /// against `"acct-a"` alone, the ref survives the delete, and a later
+    /// re-add of `"a"` is condemned through `store_relogin_ref_condemns`' name
+    /// fallback with nothing having failed.
+    #[test]
+    fn forgetting_a_uuid_resolved_identity_purges_a_uuidless_verdict_by_name() {
+        let pool = AccountPool::new();
+        pool.set_needs_relogin_for_store_account(StoreFamily::Claude, "a", None, true);
+        // A bystander whose verdict the delete must not touch — the purge is
+        // per store account, not per family.
+        pool.set_needs_relogin_for_store_account(StoreFamily::Claude, "b", None, true);
+
+        pool.forget_identity(StoreFamily::Claude, "acct-a", Some("a"));
+
+        assert!(
+            !pool.store_account_needs_relogin(StoreFamily::Claude, "a", None),
+            "a delete that resolved the uuid left the name-keyed verdict behind, \
+             so a re-add under the same name is condemned before it is ever used"
+        );
+        assert!(
+            pool.store_account_needs_relogin(StoreFamily::Claude, "b", None),
+            "deleting one store account dropped a different account's verdict"
+        );
+    }
+
+    /// The observed branch has to consult the side table too. A verdict
+    /// recorded with no uuid reaches a `Verified`-keyed entry through
+    /// `StoreAccountRef::matches`, which is uuid-only there — so the set marks
+    /// nothing, and reporting the entry alone would answer `false` here while
+    /// `store_account_needs_relogin` answers `true` for the same account.
+    #[test]
+    fn an_observed_row_reports_a_uuidless_store_verdict_the_set_could_not_reach() {
+        let pool = AccountPool::new();
+        let configured = vec![account_with_uuid("a", "acct-a")];
+        pool.set_needs_relogin_for_store_account(StoreFamily::Claude, "a", None, true);
+        // Observed through `cooldown`, which stamps `observed` without touching
+        // the side table. `mark_healthy` would purge the very verdict under
+        // test and leave this vacuous.
+        pool.cooldown("anthropic", &configured[0], Duration::from_secs(60), "test");
+        assert!(
+            pool.store_account_needs_relogin(StoreFamily::Claude, "a", None),
+            "precondition: the verdict must still be recorded"
+        );
+        assert!(
+            pool.entries
+                .lock()
+                .expect("account health lock poisoned")
+                .get(&account_key("anthropic", &configured[0]))
+                .is_some_and(|health| health.observed && health.needs_relogin.is_none()),
+            "precondition: the entry is observed and the set never reached it, \
+             so only the side table can carry the verdict"
+        );
+
+        let snapshot = pool.snapshot("anthropic", &configured, None, None);
+
+        assert!(
+            snapshot[0].has_state,
+            "the row is observed, so it must still report its entry's state"
+        );
+        assert!(
+            snapshot[0].needs_relogin,
+            "an observed row hid a verdict the pool still holds, so \
+             `/admin/pool` and the refresh probe contradict each other"
+        );
+    }
+
+    /// The observed branch carries the same narrowing as the unseen one: an
+    /// account with its own `credentials` path is a different credential that
+    /// merely shares the store account's name, and serving on it never purges
+    /// the verdict — so condemning it here would render "needs re-login" with
+    /// nothing able to lift it.
+    #[test]
+    fn an_observed_row_with_its_own_credentials_is_not_condemned() {
+        let pool = AccountPool::new();
+        pool.set_needs_relogin_for_store_account(StoreFamily::Claude, "a", None, true);
+        let impostor = vec![AccountConfig {
+            name: "a".to_string(),
+            credentials: Some("/nonexistent/a.json".to_string()),
+            ..Default::default()
+        }];
+        pool.cooldown("claude-b", &impostor[0], Duration::from_secs(60), "test");
+
+        let snapshot = pool.snapshot("claude-b", &impostor, None, None);
+
+        assert!(
+            snapshot[0].has_state,
+            "precondition: the impostor row is observed"
+        );
+        assert!(
+            !snapshot[0].needs_relogin,
+            "an observed row carrying its own credentials was condemned by a \
+             store account's verdict it can never clear"
+        );
+    }
+
+    /// The narrowing `backed_by_same_store_account` already applies to the
+    /// fan-out, mirrored onto the side table: an account carrying its own
+    /// `credentials` path merely shares a name with the store account. It is a
+    /// different credential, so serving on it proves nothing about the store
+    /// file and must not clear the store account's verdict.
+    ///
+    /// The impostor sits in a *second* provider table on purpose. A name-only
+    /// entry is keyed `UpstreamInline`, which carries the upstream and the name
+    /// and nothing else — so within one table the two would share an
+    /// `AccountKey` outright and the entry, not the side table, would answer the
+    /// snapshot. Across tables the keys differ and the narrowing is the only
+    /// thing standing between the impostor's success and the store account's
+    /// verdict.
+    #[test]
+    fn a_same_named_account_with_its_own_credentials_does_not_purge_the_verdict() {
+        let pool = AccountPool::new();
+        let store_account = vec![account("a")];
+        pool.set_needs_relogin_for_store_account(StoreFamily::Claude, "a", None, true);
+
+        let impostor = AccountConfig {
+            name: "a".to_string(),
+            credentials: Some("/nonexistent/a.json".to_string()),
+            ..Default::default()
+        };
+        pool.mark_healthy("claude-b", &impostor, true);
+
+        assert!(
+            pool.snapshot("anthropic", &store_account, None, None)[0].needs_relogin,
+            "a different credential that merely shares the store account's name \
+             cleared its verdict by serving a response of its own"
+        );
+    }
+
+    /// The same narrowing on the *accept* side. `purge_store_relogin` refuses to
+    /// clear a store verdict from a response served by an account carrying its
+    /// own `credentials` path, so the snapshot must not condemn such a row in
+    /// the first place — nothing it can ever do would clear the mark, and the
+    /// dashboard would render "needs re-login" for a credential the verdict says
+    /// nothing about.
+    #[test]
+    fn an_account_with_its_own_credentials_is_not_condemned_by_a_store_verdict() {
+        let pool = AccountPool::new();
+        pool.set_needs_relogin_for_store_account(StoreFamily::Claude, "a", None, true);
+
+        let impostor = vec![AccountConfig {
+            name: "a".to_string(),
+            credentials: Some("/nonexistent/a.json".to_string()),
+            ..Default::default()
+        }];
+
+        assert!(
+            !pool.snapshot("claude-b", &impostor, None, None)[0].needs_relogin,
+            "a different credential that merely shares the store account's name \
+             was condemned by the store account's verdict, and serving on it \
+             would never clear the mark"
+        );
+        assert!(
+            pool.store_account_needs_relogin(StoreFamily::Claude, "a", None),
+            "the store account's own verdict was lost"
+        );
+    }
+
+    /// A served response has to strip at least as much as the probe's verdict
+    /// accepts, exactly as `backed_by_same_store_account` already does for the
+    /// entry fan-out: a `Verified`-keyed account reaches its name-keyed siblings
+    /// through the *name*. The probe records `(family, name, uuid)`, and the
+    /// uuid is `None` whenever the credential file carried no `shuntAccountUuid`
+    /// when the probe ran (or the uuid read failed — the admin path swallows
+    /// that into `None`). If the purge matched only the key's own identity, such
+    /// a verdict would survive the account serving through a uuid-keyed row and
+    /// every name-keyed row would stay condemned forever.
+    #[test]
+    fn a_uuid_keyed_success_purges_a_uuidless_verdict_for_the_same_store_name() {
+        let pool = AccountPool::new();
+        let name_only = vec![account("a")];
+        pool.set_needs_relogin_for_store_account(StoreFamily::Claude, "a", None, true);
+
+        // The same store account, reached through a row whose config carries the
+        // uuid — `account_key` keys it `Verified`, not by name.
+        pool.mark_healthy("claude-b", &account_with_uuid("a", "acct-a"), true);
+
+        assert!(
+            !pool.store_account_needs_relogin(StoreFamily::Claude, "a", None),
+            "a response the store account actually served left its verdict \
+             standing because the row that served was uuid-keyed"
+        );
+        assert!(
+            !pool.snapshot("anthropic", &name_only, None, None)[0].needs_relogin,
+            "a name-keyed row of an account that just served is still condemned"
+        );
+    }
+
+    /// The probe's read-back has to answer the same question `/admin/pool` does.
+    /// The set matches a pool entry on the uuid **or** the name and the clears
+    /// strip on either half, so a read that demanded all three fields be equal
+    /// is narrower than both: `/admin/pool` renders "needs re-login" while the
+    /// Refresh button reports the login alive.
+    #[test]
+    fn the_read_back_matches_a_verdict_recorded_under_a_different_uuid() {
+        let pool = AccountPool::new();
+        let accounts = [account("a")];
+        pool.set_needs_relogin_for_store_account(StoreFamily::Claude, "a", Some("acct-a"), true);
+
+        assert!(
+            pool.snapshot("anthropic", &accounts, None, None)[0].needs_relogin,
+            "precondition: the name-keyed row reports the verdict"
+        );
+        assert!(
+            pool.store_account_needs_relogin(StoreFamily::Claude, "a", None),
+            "the read-back reported the login alive for a verdict `/admin/pool` \
+             still renders"
         );
     }
 
@@ -4296,7 +5280,7 @@ mod tests {
         let old_codex_lock = pool.refresh_lock("codex", &codex);
         let anthropic_lock = pool.refresh_lock("anthropic", &anthropic);
 
-        pool.forget_identity(StoreFamily::Chatgpt, "main");
+        pool.forget_identity(StoreFamily::Chatgpt, "main", Some("main"));
 
         let new_codex_lock = pool.refresh_lock("codex", &codex);
         assert!(!Arc::ptr_eq(&old_codex_lock, &new_codex_lock));
@@ -4368,7 +5352,7 @@ mod tests {
             "sync should have recorded the account in the membership map"
         );
 
-        pool.forget_identity(StoreFamily::Chatgpt, "main");
+        pool.forget_identity(StoreFamily::Chatgpt, "main", Some("main"));
 
         assert!(
             !pool
@@ -7118,7 +8102,7 @@ mod tests {
         assert!(!pool.take_dirty(), "restored quota starts clean");
         assert_eq!(pool.export_quotas().len(), 1);
 
-        pool.forget_identity(StoreFamily::Claude, "a");
+        pool.forget_identity(StoreFamily::Claude, "a", Some("a"));
 
         assert!(pool.take_dirty(), "removing persisted quota marks dirty");
         assert!(pool.export_quotas().is_empty());
@@ -7132,7 +8116,7 @@ mod tests {
         stored.store_family = Some(StoreFamily::Claude);
         pool.cooldown("anthropic", &stored, Duration::from_secs(60), "test");
 
-        pool.forget_identity(StoreFamily::Claude, "a");
+        pool.forget_identity(StoreFamily::Claude, "a", Some("a"));
 
         assert!(!pool.take_dirty(), "cooldowns are not persisted");
     }

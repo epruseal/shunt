@@ -331,6 +331,7 @@ pub(super) fn forget_pool_health_if_absent(
     state: &AppState,
     auth: AuthMode,
     identity: &str,
+    store_name: Option<&str>,
     store_scan_others: Option<&HashSet<String>>,
 ) {
     let mut uncertain = false;
@@ -357,15 +358,25 @@ pub(super) fn forget_pool_health_if_absent(
             }
         }
     });
-    if still_present || uncertain {
-        return;
-    }
     let family = match auth {
         AuthMode::ClaudeOauth => crate::accounts::StoreFamily::Claude,
         AuthMode::ChatgptOauth => crate::accounts::StoreFamily::Chatgpt,
         _ => return,
     };
-    state.accounts.forget_identity(family, identity);
+    // The two purges are keyed differently, so they are gated differently. The
+    // side table is keyed by store *name*, and the caller has already removed
+    // or re-provisioned that name — a fact that does not depend on the store
+    // scan succeeding or on a sibling alias still resolving to the same
+    // identity — so the name-keyed verdict goes unconditionally. Only the
+    // identity-keyed state below stays gated: preserving it is what keeps a
+    // shared identity's health alive for the alias that still uses it.
+    if let Some(store_name) = store_name {
+        state.accounts.forget_store_relogin_name(family, store_name);
+    }
+    if still_present || uncertain {
+        return;
+    }
+    state.accounts.forget_identity(family, identity, store_name);
 }
 
 pub(super) async fn remaining_account_identities(
@@ -391,12 +402,13 @@ pub(super) fn cleanup_reprovisioned_pool_health(
     auth: AuthMode,
     old_identity: Option<&str>,
     new_identity: &str,
+    store_name: Option<&str>,
     other_identities: Option<&HashSet<String>>,
 ) {
     if let Some(old_identity) = old_identity.filter(|old| *old != new_identity) {
-        forget_pool_health_if_absent(state, auth, old_identity, other_identities);
+        forget_pool_health_if_absent(state, auth, old_identity, store_name, other_identities);
     }
-    forget_pool_health_if_absent(state, auth, new_identity, other_identities);
+    forget_pool_health_if_absent(state, auth, new_identity, store_name, other_identities);
 }
 
 /// Same-origin check: prefer Fetch Metadata (`Sec-Fetch-Site`), fall back to
@@ -1346,6 +1358,7 @@ async fn complete_account(
         AuthMode::ClaudeOauth,
         old_identity.as_deref(),
         &new_identity,
+        Some(name.as_str()),
         other_identities.as_ref(),
     );
     // A fresh login provably produced a live credential, so the needs-re-login
@@ -1622,6 +1635,7 @@ async fn remove_account_handler(
         &state,
         AuthMode::ClaudeOauth,
         &identity,
+        Some(name.as_str()),
         store_scan_others.as_ref(),
     );
     json_secure(json!({ "name": name, "removed": removed }))
@@ -1893,7 +1907,7 @@ mod tests {
             .accounts
             .cooldown("anthropic", &account, Duration::from_secs(60), "transport");
 
-        forget_pool_health_if_absent(&state, AuthMode::ClaudeOauth, "alice", None);
+        forget_pool_health_if_absent(&state, AuthMode::ClaudeOauth, "alice", Some("alice"), None);
 
         let snapshot = state.accounts.snapshot("anthropic", &[account], None, None);
         assert!(
@@ -1921,6 +1935,7 @@ mod tests {
             &state,
             AuthMode::ClaudeOauth,
             "stored-uuid",
+            Some("stored"),
             Some(&stored_identities),
         );
 
@@ -1928,6 +1943,64 @@ mod tests {
         assert!(
             snapshot[0].has_state,
             "a scoped store identity must preserve shared health when inline accounts also exist"
+        );
+    }
+
+    // Regression test: two store aliases can resolve to the same uuid, so
+    // deleting one of them leaves `still_present` true and the identity-keyed
+    // health rightly intact — but the deleted *name*'s store verdict must go
+    // anyway, or a differently backed account re-added under that name is
+    // condemned by the name fallback in `store_relogin_ref_condemns`.
+    #[test]
+    fn deleting_one_alias_drops_its_store_verdict_but_keeps_the_shared_identity() {
+        use crate::accounts::StoreFamily;
+
+        let surviving = explicit_account("b", Some("shared-uuid"));
+        let state = state_with_explicit_provider(
+            "anthropic",
+            AuthMode::ClaudeOauth,
+            Vec::new(),
+            vec!["team-*".to_string()],
+        );
+        // Recorded before any entry exists, exactly as a probe on an account
+        // the pool has never selected records it: the verdict lives only in the
+        // side table, so the assertions below cannot be answered by an entry.
+        state.accounts.set_needs_relogin_for_store_account(
+            StoreFamily::Claude,
+            "a",
+            Some("shared-uuid"),
+            true,
+        );
+        state.accounts.cooldown(
+            "anthropic",
+            &surviving,
+            Duration::from_secs(60),
+            "transport",
+        );
+        // Alias `b` still resolves to the shared uuid, so the delete of `a`
+        // sees the identity as still present.
+        let remaining = HashSet::from(["shared-uuid".to_string()]);
+
+        forget_pool_health_if_absent(
+            &state,
+            AuthMode::ClaudeOauth,
+            "shared-uuid",
+            Some("a"),
+            Some(&remaining),
+        );
+
+        assert!(
+            !state
+                .accounts
+                .store_account_needs_relogin(StoreFamily::Claude, "a", None),
+            "the deleted store name's verdict must not condemn a uuid-less account re-added under that name"
+        );
+        let snapshot = state
+            .accounts
+            .snapshot("anthropic", &[surviving], None, None);
+        assert!(
+            snapshot[0].has_state,
+            "the shared identity's health must survive while another alias still resolves to it"
         );
     }
 
@@ -1980,7 +2053,13 @@ mod tests {
             .accounts
             .cooldown("anthropic", &live, Duration::from_secs(60), "transport");
 
-        forget_pool_health_if_absent(&state, AuthMode::ClaudeOauth, "orphan-uuid", None);
+        forget_pool_health_if_absent(
+            &state,
+            AuthMode::ClaudeOauth,
+            "orphan-uuid",
+            Some("orphan"),
+            None,
+        );
 
         let orphan_snapshot = state.accounts.snapshot("anthropic", &[orphan], None, None);
         assert!(
