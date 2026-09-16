@@ -50,6 +50,32 @@ const SWITCH_THRESHOLD: f64 = 0.98;
 const WINDOW_5H_SECS: u64 = 5 * 60 * 60;
 const WINDOW_7D_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// Default opportunistic-reprobe interval when `[server.pool]` is configured
+/// but `reprobe_seconds` is unset. See [`reprobe_interval`].
+const REPROBE_DEFAULT_SECS: u64 = 900;
+/// Minimum positive opportunistic-reprobe interval.
+pub(crate) const REPROBE_FLOOR_SECS: u64 = 60;
+
+/// The effective opportunistic-reprobe interval, or `None` when re-probing is
+/// disabled. Disabled when `[server.pool]` itself is absent (preserves the
+/// documented pre-#135 behavior: no pool config, no probing), or when
+/// `reprobe_seconds` is explicitly `0`. Unset with a pool present defaults to
+/// [`REPROBE_DEFAULT_SECS`]. The outbound Responses pool separately suppresses
+/// re-probing when WebSocket transport is enabled for the provider.
+fn reprobe_interval(pool: Option<&PoolConfig>) -> Option<Duration> {
+    match pool?.reprobe_seconds {
+        Some(0) => None,
+        // Positive values below 60 are clamped up to a 60-second floor, same
+        // as `usage_refresh_seconds`. This is the single read site for
+        // `reprobe_seconds` (`select_order_inner` calls this every request),
+        // so the clamp lives only here; the operator-facing warning about it
+        // lives in `Config::validate` instead, which runs once at load, not
+        // once per request.
+        Some(seconds) => Some(Duration::from_secs(seconds.max(REPROBE_FLOOR_SECS))),
+        None => Some(Duration::from_secs(REPROBE_DEFAULT_SECS)),
+    }
+}
+
 /// One quota window for per-window threshold resolution. `Weekly` is the
 /// shared `7d` bucket; `Fable` is the fable-only `7d_oi` bucket.
 #[derive(Debug, Clone, Copy)]
@@ -61,8 +87,12 @@ enum QuotaWindow {
 
 /// Dashboard bucket for one Codex rate-limit window. Codex identifies these by
 /// duration, not by the primary/secondary header position.
+///
+/// `pub(crate)`: also the bucket type `crate::auth::codex::usage`'s wham/usage
+/// parser resolves via [`codex_window_bucket`], so the JSON poller's window
+/// identification cannot drift from the header parser's.
 #[derive(Debug, Clone, Copy)]
-enum CodexWindow {
+pub(crate) enum CodexWindow {
     FiveHour,
     Weekly,
 }
@@ -89,12 +119,40 @@ pub struct QuotaState {
     pub status_7d: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_7d_oi: Option<String>,
+    /// Unix time this window's utilization or per-window status was last
+    /// recorded. Bounds a reset-less mark's lifetime: without a reset instant
+    /// to key expiry on, `expire_stale_quota` falls back to
+    /// `observed_at_X + window_len`, so a mark can never outlive the longest
+    /// span it could plausibly still describe. Never feeds `window_headroom`
+    /// or `assess_quota` — it exists purely to bound stale-mark lifetime, not
+    /// to influence which account looks healthier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_5h: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_7d: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_7d_oi: Option<u64>,
+    /// Unix time the aggregate `status` was last recorded. Stamped
+    /// independently of the per-window `observed_at_*` fields: aggregate
+    /// `status` is the only signal `assess_quota`'s `has_window_status`
+    /// fallback reads when no per-window status is present, so it needs its
+    /// own unconditional lifetime cap in `expire_stale_quota` — otherwise a
+    /// window signal kept fresh by something else (e.g. a usage poller that
+    /// never touches `status`) could keep a stale aggregate rejection from
+    /// ever expiring on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_at_status: Option<u64>,
 }
 
 impl QuotaState {
     /// Whether any persisted quota field carries a recorded signal. Utilization,
     /// reset metadata, and aggregate or per-window status all affect selection or
     /// diagnostics, so only an entirely default quota is omitted from persistence.
+    /// The `observed_at_*` fields are deliberately not checked here: normally
+    /// each is cleared alongside the window or aggregate signal it stamps (see
+    /// `expire_stale_quota`). Import can briefly leave a clamped future stamp
+    /// as the sole live field on a signal-free quota; that account is
+    /// intentionally omitted from persistence.
     pub(crate) fn has_signal(&self) -> bool {
         self.utilization_5h.is_some()
             || self.reset_5h.is_some()
@@ -137,6 +195,19 @@ pub struct UsageSnapshot {
     pub seven_day_oi: Option<UsageWindow>,
 }
 
+impl UsageSnapshot {
+    /// True when the fetch succeeded but reported no window at all. A usage
+    /// poller must not call [`AccountPool::note_usage`] on an empty snapshot:
+    /// doing so would mark the account observed and dedup it (see the poller
+    /// call sites in `usage_poll.rs`) on the strength of a response that
+    /// carried no actual signal — e.g. a brand-new account with no
+    /// consumption yet, which both the Codex and Claude usage parsers
+    /// legitimately report as `Ok` with every window `None`.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.five_hour.is_none() && self.seven_day.is_none() && self.seven_day_oi.is_none()
+    }
+}
+
 /// How long an identity must sit with no in-flight requests before storm
 /// control drops its admission allowance back to the initial value. An account
 /// that was idle this long (typically because the pool's traffic was sticky on
@@ -167,6 +238,11 @@ struct AccountHealth {
     ramp_allowance: u32,
     /// Instant of the last admission or release, for the idle-reset rule.
     ramp_last_activity: Option<Instant>,
+    /// Instant this identity was last promoted for an opportunistic re-probe
+    /// (see [`AccountPool::select_order_inner`]). Memory-only, like
+    /// `cooldown_until`: a restart just means the next stale-check treats the
+    /// account as never probed, which is the safe default.
+    last_probe_at: Option<Instant>,
 }
 
 /// Token-free, serializable view of one account's pool health for the admin
@@ -277,7 +353,42 @@ impl AccountPool {
         model: Option<&str>,
         pool: Option<&PoolConfig>,
     ) -> Vec<usize> {
-        self.select_order_inner(provider, accounts, session_id, model, pool)
+        self.select_order_inner(provider, accounts, session_id, model, pool, true)
+    }
+
+    /// Return account indices without opportunistic re-probing.
+    ///
+    /// Responses pools use this entry point when WebSocket transport is
+    /// enabled. An in-stream rate-limit error arrives as a normal event, so
+    /// the pool does not rotate; the streaming path then calls `mark_healthy`,
+    /// which clears the cooldown and, when the turn is treated as successful
+    /// and the account already has a positive ramp allowance, doubles that
+    /// allowance. That contamination predates re-probing, and this entry point
+    /// only removes re-probing as its new trigger while the deeper fix remains
+    /// deferred. The provider-labelled re-probe metric therefore counts only
+    /// inbound probes for providers with WebSocket enabled.
+    pub(crate) fn select_order_without_reprobe(
+        &self,
+        provider: &str,
+        accounts: &[AccountConfig],
+        session_id: Option<&str>,
+        model: Option<&str>,
+        pool: Option<&PoolConfig>,
+    ) -> Vec<usize> {
+        self.select_order_inner(provider, accounts, session_id, model, pool, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_probe_at_for_test(
+        &self,
+        provider: &str,
+        account: &AccountConfig,
+    ) -> Option<Instant> {
+        self.entries
+            .lock()
+            .expect("account health lock poisoned")
+            .get(&account_key(provider, account))
+            .and_then(|health| health.last_probe_at)
     }
 
     fn select_order_inner(
@@ -287,6 +398,7 @@ impl AccountPool {
         session_id: Option<&str>,
         model: Option<&str>,
         pool: Option<&PoolConfig>,
+        allow_reprobe: bool,
     ) -> Vec<usize> {
         if accounts.is_empty() {
             return Vec::new();
@@ -307,13 +419,26 @@ impl AccountPool {
             }
         };
 
+        // The sticky/round-robin slot is computed over distinct identities so
+        // adding or removing an alias cannot move an existing session. Disabled
+        // aliases yield to an enabled representative; fully disabled identities
+        // are then dropped from the rotation entirely. `collapse_representatives`
+        // and `rotation` need no lock, so both are computed before the entries
+        // lock below — the opportunistic re-probe candidate (Change B) is
+        // selected only from these final representatives.
+        let rotation = (0..distinct)
+            .map(|offset| ident_reps[(start_slot + offset) % distinct])
+            .filter(|&index| !accounts[index].disabled)
+            .collect::<Vec<_>>();
+
         let now = Instant::now();
         let unix_now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         let is_fable = is_fable_model(model);
-        let snapshots = {
+        let reprobe = allow_reprobe.then(|| reprobe_interval(pool)).flatten();
+        let (snapshots, probe_selection) = {
             let mut entries = self.entries.lock().expect("account health lock poisoned");
             let mut snapshots = Vec::with_capacity(accounts.len());
             for account in accounts {
@@ -327,24 +452,113 @@ impl AccountPool {
                 let cooldown_until = governing_cooldown(health, is_fable);
                 snapshots.push((cooldown_until, assessment, weekly_reset));
             }
-            snapshots
+
+            // Opportunistic re-probe (Change B): among the final rotation
+            // representatives, find the single stale near-quota ChatGPT-family
+            // account and stamp it as probed, all inside this same lock
+            // acquisition as the snapshot pass above. Splitting the lock
+            // between selection and stamping would let two concurrent
+            // requests both observe "not yet probed" and double-probe within
+            // one interval, voiding the single-flight guarantee.
+            let probe_selection = reprobe.and_then(|interval| {
+                let mut candidate: Option<(usize, Option<u64>)> = None;
+                for &index in &rotation {
+                    let account = &accounts[index];
+                    // Family is read from the stamped field directly, never
+                    // through `account_key`'s name-heuristic fallback: an
+                    // unstamped account (`None`) is fail-safe ineligible, and
+                    // only the codex/ChatGPT family tolerates a probe request
+                    // landing on an account that turns out still exhausted
+                    // (`classify_codex` rotates immediately on every 429;
+                    // Claude/Kimi can `PauseSame` a probe for up to 300s).
+                    if account.store_family != Some(StoreFamily::Chatgpt) {
+                        continue;
+                    }
+                    let (cooldown_until, ref assessment, _) = snapshots[index];
+                    if cooldown_until.is_some_and(|until| until > now) || !assessment.near {
+                        continue;
+                    }
+                    let health = entries
+                        .get(&account_key(&provider, account))
+                        .expect("snapshot pass above just inserted this entry");
+                    if health
+                        .last_probe_at
+                        .is_some_and(|at| now.saturating_duration_since(at) < interval)
+                    {
+                        continue;
+                    }
+                    // Freshness is the newest of all four observation stamps;
+                    // an account with no stamps at all has never been observed
+                    // and is treated as infinitely old, i.e. always eligible.
+                    let freshness = [
+                        health.quota.observed_at_5h,
+                        health.quota.observed_at_7d,
+                        health.quota.observed_at_7d_oi,
+                        health.quota.observed_at_status,
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .max();
+                    if let Some(at) = freshness {
+                        if at.saturating_add(interval.as_secs()) > unix_now {
+                            continue;
+                        }
+                    }
+                    // `None` sorts before every `Some`, so this naturally
+                    // prefers a never-observed account over any stale one.
+                    if candidate.is_none_or(|(_, current)| freshness < current) {
+                        candidate = Some((index, freshness));
+                    }
+                }
+                candidate.map(|(index, _)| index)
+            });
+
+            if let Some(index) = probe_selection {
+                let account = &accounts[index];
+                let health = entries
+                    .get_mut(&account_key(&provider, account))
+                    .expect("snapshot pass above just inserted this entry");
+                health.last_probe_at = Some(now);
+            }
+
+            (snapshots, probe_selection)
         };
 
-        // The sticky/round-robin slot is computed over distinct identities so
-        // adding or removing an alias cannot move an existing session. Disabled
-        // aliases yield to an enabled representative; fully disabled identities
-        // are then dropped from the rotation entirely.
-        let rotation = (0..distinct)
-            .map(|offset| ident_reps[(start_slot + offset) % distinct])
-            .filter(|&index| !accounts[index].disabled)
-            .collect::<Vec<_>>();
+        if let Some(probe) = probe_selection {
+            let account = &accounts[probe];
+            tracing::info!(
+                provider = %provider,
+                account = %account.name,
+                "opportunistically re-probing a stale near-quota account"
+            );
+            crate::metrics::record_pool_reprobe(&provider);
+        }
+
+        // Promotes the re-probe candidate, if any, to the front of a final
+        // selection order — including the sticky fast path below, so a probe
+        // is never starved by a healthy sticky account.
+        let promote = |mut order: Vec<usize>| -> Vec<usize> {
+            if let Some(probe) = probe_selection {
+                let position = order.iter().position(|&index| index == probe);
+                debug_assert!(
+                    position.is_some(),
+                    "probe candidate must be present in the selection order"
+                );
+                if let Some(position) = position {
+                    order.remove(position);
+                    order.insert(0, probe);
+                }
+            }
+            order
+        };
+
         let sticky = ident_reps[start_slot];
         let (sticky_cooldown, ref sticky_quota, _) = snapshots[sticky];
         if !accounts[sticky].disabled
             && sticky_cooldown.is_none_or(|until| until <= now)
             && !sticky_quota.near
         {
-            return rotation;
+            return promote(rotation);
         }
 
         let is_available =
@@ -419,12 +633,14 @@ impl AccountPool {
             .collect::<Vec<_>>();
         cooled.sort_by_key(|&index| snapshots[index].0);
 
-        available_under
-            .into_iter()
-            .chain(near_soft)
-            .chain(over_hard)
-            .chain(cooled)
-            .collect()
+        promote(
+            available_under
+                .into_iter()
+                .chain(near_soft)
+                .chain(over_hard)
+                .chain(cooled)
+                .collect(),
+        )
     }
 
     pub fn note_quota(&self, provider: &str, account: &AccountConfig, headers: &HeaderMap) {
@@ -433,8 +649,9 @@ impl AccountPool {
             let health = entries.entry(account_key(provider, account)).or_default();
             health.observed = true;
             let quota = &mut health.quota;
+            let now = unix_now();
 
-            update_header(
+            let wrote_utilization_5h = update_header(
                 headers,
                 "anthropic-ratelimit-unified-5h-utilization",
                 &mut quota.utilization_5h,
@@ -444,7 +661,7 @@ impl AccountPool {
                 "anthropic-ratelimit-unified-5h-reset",
                 &mut quota.reset_5h,
             );
-            update_header(
+            let wrote_utilization_7d = update_header(
                 headers,
                 "anthropic-ratelimit-unified-7d-utilization",
                 &mut quota.utilization_7d,
@@ -454,7 +671,7 @@ impl AccountPool {
                 "anthropic-ratelimit-unified-7d-reset",
                 &mut quota.reset_7d,
             );
-            update_header(
+            let wrote_utilization_7d_oi = update_header(
                 headers,
                 "anthropic-ratelimit-unified-7d_oi-utilization",
                 &mut quota.utilization_7d_oi,
@@ -464,15 +681,35 @@ impl AccountPool {
                 "anthropic-ratelimit-unified-7d_oi-reset",
                 &mut quota.reset_7d_oi,
             );
-            update_string_header(headers, QUOTA_STATUS_HEADERS[0], &mut quota.status_5h);
-            update_string_header(headers, QUOTA_STATUS_HEADERS[1], &mut quota.status_7d);
-            update_string_header(headers, QUOTA_STATUS_HEADERS[2], &mut quota.status_7d_oi);
-            update_string_header(
+            let wrote_status_5h =
+                update_string_header(headers, QUOTA_STATUS_HEADERS[0], &mut quota.status_5h);
+            let wrote_status_7d =
+                update_string_header(headers, QUOTA_STATUS_HEADERS[1], &mut quota.status_7d);
+            let wrote_status_7d_oi =
+                update_string_header(headers, QUOTA_STATUS_HEADERS[2], &mut quota.status_7d_oi);
+            let wrote_status = update_string_header(
                 headers,
                 "anthropic-ratelimit-unified-status",
                 &mut quota.status,
             );
-            let utilization = self.pool_utilization_for(provider, &mut entries, unix_now());
+
+            // Stamp a window's observation time when this call recorded either its
+            // utilization or its per-window status; the aggregate stamp is
+            // independent (see `QuotaState::observed_at_status`).
+            if wrote_utilization_5h || wrote_status_5h {
+                quota.observed_at_5h = Some(now);
+            }
+            if wrote_utilization_7d || wrote_status_7d {
+                quota.observed_at_7d = Some(now);
+            }
+            if wrote_utilization_7d_oi || wrote_status_7d_oi {
+                quota.observed_at_7d_oi = Some(now);
+            }
+            if wrote_status {
+                quota.observed_at_status = Some(now);
+            }
+
+            let utilization = self.pool_utilization_for(provider, &mut entries, now);
             record_pool_utilization(provider, utilization);
         }
         self.mark_dirty();
@@ -488,6 +725,7 @@ impl AccountPool {
             let health = entries.entry(account_key(provider, account)).or_default();
             health.observed = true;
             let quota = &mut health.quota;
+            let now = unix_now();
 
             for (minutes_header, utilization_header, reset_header) in [
                 (
@@ -509,16 +747,23 @@ impl AccountPool {
                 else {
                     continue;
                 };
+                // The reset header can be blank (issue: a deployed multi-account
+                // codex pool observed empty `x-codex-*-reset-at` groups), so
+                // `reset` is best-effort while the utilization/status observation
+                // below is unconditional — `observed_at_X` must not depend on
+                // whether the reset happened to be present this time.
                 let reset = header_value::<u64>(headers, reset_header);
                 match window {
                     CodexWindow::FiveHour => {
                         quota.utilization_5h = Some(utilization / 100.0);
+                        quota.observed_at_5h = Some(now);
                         if let Some(reset) = reset {
                             quota.reset_5h = Some(reset);
                         }
                     }
                     CodexWindow::Weekly => {
                         quota.utilization_7d = Some(utilization / 100.0);
+                        quota.observed_at_7d = Some(now);
                         if let Some(reset) = reset {
                             quota.reset_7d = Some(reset);
                         }
@@ -531,40 +776,92 @@ impl AccountPool {
                 .and_then(|value| value.to_str().ok())
             {
                 quota.status = Some(status.to_string());
+                quota.observed_at_status = Some(now);
             }
-            let utilization = self.pool_utilization_for(provider, &mut entries, unix_now());
+            let utilization = self.pool_utilization_for(provider, &mut entries, now);
             record_pool_utilization(provider, utilization);
         }
         self.mark_dirty();
     }
 
     /// Apply an authoritative usage snapshot from the Anthropic OAuth usage API
-    /// to an account's quota state. Each reported window overwrites the matching
-    /// utilization/reset pair — the usage API is authoritative and reconciles the
-    /// header-derived state with out-of-band consumption — while a window the API
-    /// omits leaves any prior header value untouched. Status fields are not
-    /// modified here: the usage API has no equivalent of the headers' `rejected`
-    /// signals, so they stay header-driven. Marks the account observed, so the
-    /// admin dashboard reports its usage even before the first proxied request.
+    /// to an account's quota state. Each reported window's utilization always
+    /// overwrites the stored value — the usage API is authoritative and
+    /// reconciles the header-derived state with out-of-band consumption. The
+    /// window's `resets_at` overwrites the stored reset when present; when the
+    /// poll omits it, the stored reset survives only if still in the future
+    /// (see [`preserve_future_reset`]) — a past stored reset is cleared instead
+    /// of kept, so it cannot suppress the utilization this same call just
+    /// wrote at the next `expire_stale_quota` sweep. A window the snapshot
+    /// omits entirely leaves any prior value (utilization, reset, and
+    /// observation time) untouched. Status fields are not modified here: the
+    /// usage API has no equivalent of the headers' `rejected` signals, so they
+    /// stay header-driven. Marks the account observed, so the admin dashboard
+    /// reports its usage even before the first proxied request.
     pub fn note_usage(&self, provider: &str, account: &AccountConfig, usage: &UsageSnapshot) {
+        self.note_usage_inner(provider, account, usage, false, false);
+    }
+
+    /// Apply one successfully parsed, non-empty Codex `wham/usage` report.
+    /// Unlike Claude's partial usage response, wham enumerates the account's
+    /// 5h/7d windows, so the Codex parser can mark a bucket as authoritatively
+    /// absent. Such a bucket is cleared completely before reported windows are
+    /// applied. The parser withholds both clear flags when any non-null window
+    /// has an unknown duration, and the poller never calls this method for an
+    /// empty snapshot or a failed fetch.
+    pub(crate) fn note_codex_usage(
+        &self,
+        provider: &str,
+        account: &AccountConfig,
+        usage: &UsageSnapshot,
+        clear_five_hour: bool,
+        clear_seven_day: bool,
+    ) {
+        self.note_usage_inner(provider, account, usage, clear_five_hour, clear_seven_day);
+    }
+
+    fn note_usage_inner(
+        &self,
+        provider: &str,
+        account: &AccountConfig,
+        usage: &UsageSnapshot,
+        clear_five_hour: bool,
+        clear_seven_day: bool,
+    ) {
         {
             let mut entries = self.entries.lock().expect("account health lock poisoned");
             let health = entries.entry(account_key(provider, account)).or_default();
             health.observed = true;
             let quota = &mut health.quota;
+            let now = unix_now();
+            if clear_five_hour {
+                quota.utilization_5h = None;
+                quota.reset_5h = None;
+                quota.status_5h = None;
+                quota.observed_at_5h = None;
+            }
+            if clear_seven_day {
+                quota.utilization_7d = None;
+                quota.reset_7d = None;
+                quota.status_7d = None;
+                quota.observed_at_7d = None;
+            }
             if let Some(window) = &usage.five_hour {
                 quota.utilization_5h = Some(window.utilization);
-                quota.reset_5h = window.resets_at;
+                quota.reset_5h = preserve_future_reset(quota.reset_5h, window.resets_at, now);
+                quota.observed_at_5h = Some(now);
             }
             if let Some(window) = &usage.seven_day {
                 quota.utilization_7d = Some(window.utilization);
-                quota.reset_7d = window.resets_at;
+                quota.reset_7d = preserve_future_reset(quota.reset_7d, window.resets_at, now);
+                quota.observed_at_7d = Some(now);
             }
             if let Some(window) = &usage.seven_day_oi {
                 quota.utilization_7d_oi = Some(window.utilization);
-                quota.reset_7d_oi = window.resets_at;
+                quota.reset_7d_oi = preserve_future_reset(quota.reset_7d_oi, window.resets_at, now);
+                quota.observed_at_7d_oi = Some(now);
             }
-            let utilization = self.pool_utilization_for(provider, &mut entries, unix_now());
+            let utilization = self.pool_utilization_for(provider, &mut entries, now);
             record_pool_utilization(provider, utilization);
         }
         self.mark_dirty();
@@ -839,14 +1136,39 @@ impl AccountPool {
             .collect()
     }
 
-    /// Seed the pool with quotas restored from disk at boot.
-    pub(crate) fn import_quotas(&self, quotas: impl IntoIterator<Item = (AccountKey, QuotaState)>) {
+    /// Seed the pool with quotas restored from disk at boot. Returns whether
+    /// any observation timestamp was corrected. A restored
+    /// window or aggregate signal with no `observed_at` (a legacy state file
+    /// predating this field) is stamped with the boot time rather than left
+    /// unstamped: `expire_stale_quota` reads `None` as "never observed," which
+    /// for a reset-less mark means "expire immediately" — the opposite of the
+    /// intended warm start. Backdating to boot time instead gives a restored
+    /// reset-less mark the same one-window-length grace period a freshly
+    /// recorded mark would get. Future observation timestamps are clamped to
+    /// boot time, which likewise gives the mark a fresh window-length
+    /// lifetime. This correction runs only at import, so a future timestamp
+    /// created at runtime by a backwards clock remains until the next restart.
+    pub(crate) fn import_quotas(
+        &self,
+        quotas: impl IntoIterator<Item = (AccountKey, QuotaState)>,
+    ) -> bool {
         let mut entries = self.entries.lock().expect("account health lock poisoned");
-        for (key, quota) in quotas {
+        let now = unix_now();
+        let mut corrected = false;
+        for (key, mut quota) in quotas {
+            corrected |= stamp_legacy_observation(&mut quota, now);
+            corrected |= clamp_future_observation(&mut quota.observed_at_5h, now);
+            corrected |= clamp_future_observation(&mut quota.observed_at_7d, now);
+            corrected |= clamp_future_observation(&mut quota.observed_at_7d_oi, now);
+            corrected |= clamp_future_observation(&mut quota.observed_at_status, now);
             let health = entries.entry(key).or_default();
             health.observed = true;
             health.quota = quota;
         }
+        // A signal-free quota with a future stamp can set this flag, but
+        // `has_signal` filters that account from export; the dirty flush may
+        // still rewrite the file and any other exported accounts.
+        corrected
     }
 
     fn pool_utilization_for(
@@ -1020,19 +1342,46 @@ fn header_value<T: std::str::FromStr>(headers: &HeaderMap, name: &str) -> Option
         .and_then(|value| value.parse::<T>().ok())
 }
 
-fn update_header<T: std::str::FromStr>(headers: &HeaderMap, name: &str, field: &mut Option<T>) {
+/// Records the header's value into `field` when present. Returns whether a
+/// value was recorded, so callers can stamp a window's observation time only
+/// when this call actually wrote something.
+fn update_header<T: std::str::FromStr>(
+    headers: &HeaderMap,
+    name: &str,
+    field: &mut Option<T>,
+) -> bool {
     if let Some(parsed) = header_value(headers, name) {
         *field = Some(parsed);
+        true
+    } else {
+        false
     }
 }
 
-fn update_string_header(headers: &HeaderMap, name: &str, field: &mut Option<String>) {
+/// String counterpart of [`update_header`]; same observed-write contract.
+fn update_string_header(headers: &HeaderMap, name: &str, field: &mut Option<String>) -> bool {
     if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
         *field = Some(value.to_string());
+        true
+    } else {
+        false
     }
 }
 
-fn codex_window_bucket(minutes: i64) -> Option<CodexWindow> {
+/// Reset to store for a usage-API window: the poll's own `resets_at` wins
+/// outright when present; otherwise the previously stored reset survives
+/// only if it is still in the future. A past stored reset is cleared rather
+/// than kept, because keeping it would let the next `expire_stale_quota`
+/// sweep erase the utilization this same call just wrote, and the next poll
+/// would write it again — an indefinite write/expire/rewrite cycle. Once
+/// cleared, `observed_at_X` alone governs this window's expiry.
+fn preserve_future_reset(stored: Option<u64>, polled: Option<u64>, now: u64) -> Option<u64> {
+    polled.or_else(|| stored.filter(|&reset| reset > now))
+}
+
+/// `pub(crate)`: shared with `crate::auth::codex::usage`'s wham/usage parser —
+/// see [`CodexWindow`].
+pub(crate) fn codex_window_bucket(minutes: i64) -> Option<CodexWindow> {
     if within_five_percent(minutes, 300) {
         Some(CodexWindow::FiveHour)
     } else if within_five_percent(minutes, 10_080) {
@@ -1242,29 +1591,101 @@ fn record_pool_utilization(provider: &str, utilization: [Option<f64>; 3]) {
     }
 }
 
+/// Clears a window (and aggregate `status`, if any window expired) once it is
+/// no longer trustworthy, plus an unconditional cap on the aggregate status
+/// alone. Window expiry: the upstream reset has passed, or — for a window
+/// that has never carried a reset instant (a deployed multi-account codex
+/// pool has been observed sending blank `x-codex-*-reset-at` groups; a
+/// synthesized reset was rejected during design because it corrupts
+/// `window_headroom`) — the window's last observation is older than the
+/// window's own length. A mark can never outlive the longest span it could
+/// plausibly still describe.
 fn expire_stale_quota(quota: &mut QuotaState, now: u64) {
+    let stale = |reset: Option<u64>, observed: Option<u64>, len: u64| match reset {
+        Some(reset) => reset <= now,
+        None => observed.is_some_and(|at| at.saturating_add(len) <= now),
+    };
     let mut expired = false;
-    if quota.reset_5h.is_some_and(|reset| reset <= now) {
+    if stale(quota.reset_5h, quota.observed_at_5h, WINDOW_5H_SECS) {
         quota.utilization_5h = None;
         quota.reset_5h = None;
         quota.status_5h = None;
+        quota.observed_at_5h = None;
         expired = true;
     }
-    if quota.reset_7d.is_some_and(|reset| reset <= now) {
+    if stale(quota.reset_7d, quota.observed_at_7d, WINDOW_7D_SECS) {
         quota.utilization_7d = None;
         quota.reset_7d = None;
         quota.status_7d = None;
+        quota.observed_at_7d = None;
         expired = true;
     }
-    if quota.reset_7d_oi.is_some_and(|reset| reset <= now) {
+    if stale(quota.reset_7d_oi, quota.observed_at_7d_oi, WINDOW_7D_SECS) {
         quota.utilization_7d_oi = None;
         quota.reset_7d_oi = None;
         quota.status_7d_oi = None;
+        quota.observed_at_7d_oi = None;
         expired = true;
     }
     if expired {
         quota.status = None;
+        quota.observed_at_status = None;
     }
+    // Unconditional aggregate cap, independent of the per-window sweep above.
+    // `assess_quota`'s `has_window_status` fallback reads the aggregate
+    // `status` only when no per-window status is present, so an
+    // aggregate-only rejection needs its own lifetime bound regardless of
+    // whether a window signal is still alive. Without this, a window kept
+    // fresh by something that never touches `status` (e.g. a usage poller)
+    // would leave a stale aggregate rejection with no expiry path at all —
+    // the poller writes utilization/reset every cycle, so the per-window
+    // sweep above never fires, and `status` would never clear on its own.
+    if quota
+        .observed_at_status
+        .is_some_and(|at| at.saturating_add(WINDOW_7D_SECS) <= now)
+    {
+        quota.status = None;
+        quota.observed_at_status = None;
+    }
+}
+
+/// Stamps a restored legacy mark's observation time. See
+/// [`AccountPool::import_quotas`] for why a missing `observed_at` on a
+/// restored window or aggregate signal is backdated to boot time rather than
+/// left `None`.
+fn stamp_legacy_observation(quota: &mut QuotaState, now: u64) -> bool {
+    let mut corrected = false;
+    if (quota.utilization_5h.is_some() || quota.status_5h.is_some())
+        && quota.observed_at_5h.is_none()
+    {
+        quota.observed_at_5h = Some(now);
+        corrected = true;
+    }
+    if (quota.utilization_7d.is_some() || quota.status_7d.is_some())
+        && quota.observed_at_7d.is_none()
+    {
+        quota.observed_at_7d = Some(now);
+        corrected = true;
+    }
+    if (quota.utilization_7d_oi.is_some() || quota.status_7d_oi.is_some())
+        && quota.observed_at_7d_oi.is_none()
+    {
+        quota.observed_at_7d_oi = Some(now);
+        corrected = true;
+    }
+    if quota.status.is_some() && quota.observed_at_status.is_none() {
+        quota.observed_at_status = Some(now);
+        corrected = true;
+    }
+    corrected
+}
+
+fn clamp_future_observation(observed_at: &mut Option<u64>, now: u64) -> bool {
+    if observed_at.is_some_and(|at| at > now) {
+        *observed_at = Some(now);
+        return true;
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2019,6 +2440,7 @@ mod tests {
             ]),
         );
 
+        let before_second_call = unix_now();
         pool.note_codex_quota(
             "codex",
             &accounts[0],
@@ -2031,6 +2453,54 @@ mod tests {
         let snaps = pool.snapshot("codex", &accounts, None, None);
         assert_eq!(snaps[0].utilization_5h, Some(0.41));
         assert_eq!(snaps[0].reset_5h, Some(reset));
+
+        let entries = pool.entries.lock().unwrap();
+        let observed_at_5h = entries
+            .get(&account_key("codex", &accounts[0]))
+            .unwrap()
+            .quota
+            .observed_at_5h;
+        assert!(
+            observed_at_5h.is_some_and(|at| at >= before_second_call),
+            "the second call's utilization-only headers still stamp observed_at_5h"
+        );
+    }
+
+    #[test]
+    fn codex_missing_reset_stamps_observation_time() {
+        // Both bucket arms stamp their observed_at unconditionally, even when
+        // neither carries a reset header at all — not just on a later call
+        // that already has a prior reset to preserve (that's
+        // `codex_missing_reset_preserves_prior_reset`).
+        let pool = AccountPool::new();
+        let accounts = [account("pro")];
+        let before = unix_now();
+        pool.note_codex_quota(
+            "codex",
+            &accounts[0],
+            &quota_headers(&[
+                ("x-codex-primary-used-percent", "10".to_string()),
+                ("x-codex-primary-window-minutes", "300".to_string()),
+                ("x-codex-secondary-used-percent", "20".to_string()),
+                ("x-codex-secondary-window-minutes", "10080".to_string()),
+            ]),
+        );
+
+        let entries = pool.entries.lock().unwrap();
+        let quota = &entries
+            .get(&account_key("codex", &accounts[0]))
+            .unwrap()
+            .quota;
+        assert!(quota.reset_5h.is_none());
+        assert!(quota.reset_7d.is_none());
+        assert!(
+            quota.observed_at_5h.is_some_and(|at| at >= before),
+            "the 5h bucket stamps observed_at even without a reset header"
+        );
+        assert!(
+            quota.observed_at_7d.is_some_and(|at| at >= before),
+            "the 7d bucket stamps observed_at even without a reset header"
+        );
     }
 
     #[test]
@@ -2109,6 +2579,108 @@ mod tests {
         assert_eq!(
             pool.select_order("codex", &accounts, Some(session), None, None),
             initial
+        );
+    }
+
+    #[test]
+    fn account_reenters_selection_after_reset_passes() {
+        // Regression: a sticky account exhausted with a future reset must
+        // rejoin the head of selection once that reset has actually passed —
+        // the pre-fix bug left reset-carrying marks stuck too, not just
+        // reset-less ones, whenever the mark outlived its own reset.
+        let pool = AccountPool::new();
+        let accounts = vec![account("a"), account("b")];
+        let session = "reenter-reset-passes";
+        let initial = pool.select_order("codex", &accounts, Some(session), None, None);
+        let sticky = initial[0];
+        let reset = unix_now() + 3_600;
+        pool.note_codex_quota(
+            "codex",
+            &accounts[sticky],
+            &quota_headers(&[
+                ("x-codex-primary-used-percent", "100".to_string()),
+                ("x-codex-primary-window-minutes", "300".to_string()),
+                ("x-codex-primary-reset-at", reset.to_string()),
+            ]),
+        );
+        let yielded = pool.select_order("codex", &accounts, Some(session), None, None);
+        assert_ne!(
+            yielded[0], sticky,
+            "an exhausted account yields while its reset is still future"
+        );
+
+        // Rewind the reset into the past directly — this is the state the
+        // account would be in once upstream's window has actually reset, with
+        // no need to sleep in the test.
+        {
+            let mut entries = pool.entries.lock().expect("account health lock poisoned");
+            let health = entries
+                .get_mut(&account_key("codex", &accounts[sticky]))
+                .unwrap();
+            health.quota.reset_5h = Some(unix_now() - 1);
+        }
+
+        let recovered = pool.select_order("codex", &accounts, Some(session), None, None);
+        assert_eq!(
+            recovered[0], sticky,
+            "the account re-enters selection once its reset has passed"
+        );
+        let snaps = pool.snapshot("codex", &accounts, None, None);
+        let sticky_snap = snaps
+            .iter()
+            .find(|snap| snap.name == accounts[sticky].name)
+            .unwrap();
+        assert!(
+            sticky_snap.available,
+            "the recovered account is available again"
+        );
+    }
+
+    #[test]
+    fn account_reenters_selection_after_reset_less_mark_ages_out() {
+        // Reproduces the incident this change fixes: a deployed multi-account
+        // codex pool recorded a valid window-minutes group with utilization
+        // above threshold but a blank reset-at header, so no reset instant was
+        // ever captured and the near-quota mark never expired on its own.
+        let pool_cfg = PoolConfig {
+            default_threshold: Some(0.80),
+            ..Default::default()
+        };
+        let pool = AccountPool::new();
+        let accounts = vec![account("a"), account("b")];
+        let session = "reenter-reset-less";
+        let initial = pool.select_order("codex", &accounts, Some(session), None, Some(&pool_cfg));
+        let sticky = initial[0];
+        pool.note_codex_quota(
+            "codex",
+            &accounts[sticky],
+            &quota_headers(&[
+                ("x-codex-primary-used-percent", "84".to_string()),
+                ("x-codex-primary-window-minutes", "300".to_string()),
+                ("x-codex-primary-reset-at", String::new()),
+            ]),
+        );
+        let yielded = pool.select_order("codex", &accounts, Some(session), None, Some(&pool_cfg));
+        assert_ne!(
+            yielded[0], sticky,
+            "the near-quota account yields immediately"
+        );
+
+        // Rewind the observation past the 5h window length — no restart and no
+        // real time passage needed, just the state one window length later
+        // would look like.
+        {
+            let mut entries = pool.entries.lock().expect("account health lock poisoned");
+            let health = entries
+                .get_mut(&account_key("codex", &accounts[sticky]))
+                .unwrap();
+            health.quota.observed_at_5h = Some(unix_now() - WINDOW_5H_SECS);
+        }
+
+        let recovered = pool.select_order("codex", &accounts, Some(session), None, Some(&pool_cfg));
+        assert_eq!(
+            recovered[0], sticky,
+            "the reset-less mark ages out and the account re-enters selection"
         );
     }
 
@@ -2661,6 +3233,10 @@ mod tests {
             status_5h: Some("rejected".to_string()),
             status_7d: Some("allowed".to_string()),
             status_7d_oi: Some("rejected".to_string()),
+            observed_at_5h: None,
+            observed_at_7d: None,
+            observed_at_7d_oi: None,
+            observed_at_status: None,
         };
         expire_stale_quota(&mut quota, now);
         assert_eq!(quota.status_5h, None);
@@ -2673,6 +3249,80 @@ mod tests {
         assert_eq!(quota.status_7d_oi.as_deref(), Some("rejected"));
         expire_stale_quota(&mut quota, now + 120);
         assert_eq!(quota.status_7d_oi, None);
+    }
+
+    #[test]
+    fn reset_less_window_expires_one_window_length_after_observation() {
+        let now = unix_now();
+        let mut quota = QuotaState {
+            utilization_7d: Some(0.9),
+            observed_at_7d: Some(now - WINDOW_7D_SECS + 1),
+            status: Some("rejected".to_string()),
+            observed_at_status: Some(now),
+            ..Default::default()
+        };
+        // One second short of the boundary: the reset-less mark is still alive.
+        expire_stale_quota(&mut quota, now);
+        assert_eq!(quota.utilization_7d, Some(0.9));
+        assert_eq!(quota.observed_at_7d, Some(now - WINDOW_7D_SECS + 1));
+
+        // At the boundary (observed_at + window_len == now): the window and the
+        // legacy aggregate it drags down with it are both cleared.
+        quota.observed_at_7d = Some(now - WINDOW_7D_SECS);
+        expire_stale_quota(&mut quota, now);
+        assert_eq!(quota.utilization_7d, None);
+        assert_eq!(quota.observed_at_7d, None);
+        assert_eq!(quota.status, None);
+    }
+
+    #[test]
+    fn aggregate_only_status_expires_after_longest_window() {
+        let now = unix_now();
+        let mut quota = QuotaState {
+            status: Some("rejected".to_string()),
+            observed_at_status: Some(now - WINDOW_7D_SECS + 1),
+            ..Default::default()
+        };
+        expire_stale_quota(&mut quota, now);
+        assert_eq!(
+            quota.status.as_deref(),
+            Some("rejected"),
+            "not yet at the boundary"
+        );
+
+        quota.observed_at_status = Some(now - WINDOW_7D_SECS);
+        expire_stale_quota(&mut quota, now);
+        assert_eq!(quota.status, None);
+        assert_eq!(quota.observed_at_status, None);
+    }
+
+    #[test]
+    fn aggregate_cap_clears_status_even_with_live_window_signal() {
+        // Revision 3 (P2-1): a usage poller (or any other path) can keep a
+        // window's utilization/reset fresh indefinitely without ever touching
+        // `status`, so a stale aggregate-only rejection needs an unconditional
+        // lifetime cap independent of whether a window signal is still alive —
+        // otherwise it would never expire on its own.
+        let now = unix_now();
+        let mut quota = QuotaState {
+            utilization_7d: Some(0.5),
+            reset_7d: Some(now + WINDOW_7D_SECS),
+            status: Some("rejected".to_string()),
+            observed_at_status: Some(now - WINDOW_7D_SECS),
+            ..Default::default()
+        };
+        expire_stale_quota(&mut quota, now);
+        assert_eq!(
+            quota.status, None,
+            "the aggregate cap fires regardless of window health"
+        );
+        assert_eq!(quota.observed_at_status, None);
+        assert_eq!(
+            quota.utilization_7d,
+            Some(0.5),
+            "the live window signal is untouched"
+        );
+        assert_eq!(quota.reset_7d, Some(now + WINDOW_7D_SECS));
     }
 
     #[test]
@@ -2758,6 +3408,63 @@ mod tests {
     }
 
     #[test]
+    fn note_quota_stamps_observation_per_window_and_aggregate() {
+        // Utilization-only, status-only, and aggregate-only writes each stamp
+        // their own observation time independently of one another.
+        let pool = AccountPool::new();
+        let account = account("a");
+        let before = unix_now();
+
+        pool.note_quota(
+            "anthropic",
+            &account,
+            &quota_headers(&[(
+                "anthropic-ratelimit-unified-5h-utilization",
+                "0.3".to_string(),
+            )]),
+        );
+        {
+            let entries = pool.entries.lock().unwrap();
+            let quota = &entries
+                .get(&account_key("anthropic", &account))
+                .unwrap()
+                .quota;
+            assert!(quota.observed_at_5h.is_some_and(|at| at >= before));
+            assert!(quota.observed_at_7d.is_none());
+            assert!(quota.observed_at_status.is_none());
+        }
+
+        pool.note_quota(
+            "anthropic",
+            &account,
+            &quota_headers(&[(QUOTA_STATUS_HEADERS[1], "rejected".to_string())]),
+        );
+        {
+            let entries = pool.entries.lock().unwrap();
+            let quota = &entries
+                .get(&account_key("anthropic", &account))
+                .unwrap()
+                .quota;
+            assert!(quota.observed_at_7d.is_some_and(|at| at >= before));
+            assert!(quota.observed_at_status.is_none());
+        }
+
+        pool.note_quota(
+            "anthropic",
+            &account,
+            &quota_headers(&[("anthropic-ratelimit-unified-status", "rejected".to_string())]),
+        );
+        {
+            let entries = pool.entries.lock().unwrap();
+            let quota = &entries
+                .get(&account_key("anthropic", &account))
+                .unwrap()
+                .quota;
+            assert!(quota.observed_at_status.is_some_and(|at| at >= before));
+        }
+    }
+
+    #[test]
     fn note_usage_applies_snapshot_and_drives_selection() {
         let pool = AccountPool::new();
         let accounts = vec![account("a"), account("b")];
@@ -2840,6 +3547,174 @@ mod tests {
         assert_eq!(quota.utilization_5h, Some(0.1));
         assert_eq!(quota.utilization_7d, Some(0.2));
         assert_eq!(quota.utilization_7d_oi, Some(0.5));
+    }
+
+    #[test]
+    fn claude_usage_omitted_window_preserves_all_prior_bucket_and_aggregate_fields() {
+        let pool = AccountPool::new();
+        let account = account("a");
+        let future = unix_now() + 3_600;
+        pool.note_quota(
+            "anthropic",
+            &account,
+            &quota_headers(&[
+                (
+                    "anthropic-ratelimit-unified-7d-utilization",
+                    "0.6".to_string(),
+                ),
+                ("anthropic-ratelimit-unified-7d-reset", future.to_string()),
+                (QUOTA_STATUS_HEADERS[1], "rejected".to_string()),
+                ("anthropic-ratelimit-unified-status", "rejected".to_string()),
+            ]),
+        );
+        {
+            let mut entries = pool.entries.lock().unwrap();
+            let quota = &mut entries
+                .get_mut(&account_key("anthropic", &account))
+                .unwrap()
+                .quota;
+            quota.observed_at_7d = Some(123);
+            quota.observed_at_status = Some(456);
+        }
+
+        pool.note_usage(
+            "anthropic",
+            &account,
+            &UsageSnapshot {
+                five_hour: Some(UsageWindow {
+                    utilization: 0.2,
+                    resets_at: None,
+                }),
+                seven_day: None,
+                seven_day_oi: None,
+            },
+        );
+
+        let entries = pool.entries.lock().unwrap();
+        let quota = &entries
+            .get(&account_key("anthropic", &account))
+            .unwrap()
+            .quota;
+        assert_eq!(quota.utilization_7d, Some(0.6));
+        assert_eq!(quota.reset_7d, Some(future));
+        assert_eq!(quota.status_7d.as_deref(), Some("rejected"));
+        assert_eq!(quota.observed_at_7d, Some(123));
+        assert_eq!(quota.status.as_deref(), Some("rejected"));
+        assert_eq!(quota.observed_at_status, Some(456));
+    }
+
+    #[test]
+    fn note_usage_stamps_observation() {
+        let pool = AccountPool::new();
+        let accounts = [account("a")];
+        let before = unix_now();
+        pool.note_usage(
+            "anthropic",
+            &accounts[0],
+            &UsageSnapshot {
+                five_hour: Some(UsageWindow {
+                    utilization: 0.1,
+                    resets_at: None,
+                }),
+                seven_day: Some(UsageWindow {
+                    utilization: 0.2,
+                    resets_at: None,
+                }),
+                seven_day_oi: Some(UsageWindow {
+                    utilization: 0.3,
+                    resets_at: None,
+                }),
+            },
+        );
+        let entries = pool.entries.lock().unwrap();
+        let quota = &entries
+            .get(&account_key("anthropic", &accounts[0]))
+            .unwrap()
+            .quota;
+        assert!(quota.observed_at_5h.is_some_and(|at| at >= before));
+        assert!(quota.observed_at_7d.is_some_and(|at| at >= before));
+        assert!(quota.observed_at_7d_oi.is_some_and(|at| at >= before));
+    }
+
+    #[test]
+    fn usage_without_reset_preserves_header_reset() {
+        let pool = AccountPool::new();
+        let accounts = [account("a")];
+        let future = unix_now() + 3_600;
+        // A prior header records a future 5h reset.
+        pool.note_quota(
+            "anthropic",
+            &accounts[0],
+            &quota_headers(&[
+                (
+                    "anthropic-ratelimit-unified-5h-utilization",
+                    "0.5".to_string(),
+                ),
+                ("anthropic-ratelimit-unified-5h-reset", future.to_string()),
+            ]),
+        );
+        // The usage poll applies without a resets_at — the future header reset
+        // must survive.
+        pool.note_usage(
+            "anthropic",
+            &accounts[0],
+            &UsageSnapshot {
+                five_hour: Some(UsageWindow {
+                    utilization: 0.6,
+                    resets_at: None,
+                }),
+                seven_day: None,
+                seven_day_oi: None,
+            },
+        );
+        let entries = pool.entries.lock().unwrap();
+        let quota = &entries
+            .get(&account_key("anthropic", &accounts[0]))
+            .unwrap()
+            .quota;
+        assert_eq!(quota.utilization_5h, Some(0.6));
+        assert_eq!(quota.reset_5h, Some(future));
+    }
+
+    #[test]
+    fn usage_without_reset_clears_past_stored_reset() {
+        // Revision-3 fix (P2-3): a past stored reset must not survive an
+        // omitted resets_at, or the next expire_stale_quota sweep would erase
+        // the utilization this same call just wrote, and the next poll would
+        // write it right back — an indefinite write/expire/rewrite cycle.
+        let pool = AccountPool::new();
+        let accounts = [account("a")];
+        let past = unix_now().saturating_sub(1);
+        pool.note_quota(
+            "anthropic",
+            &accounts[0],
+            &quota_headers(&[
+                (
+                    "anthropic-ratelimit-unified-7d-utilization",
+                    "0.5".to_string(),
+                ),
+                ("anthropic-ratelimit-unified-7d-reset", past.to_string()),
+            ]),
+        );
+        pool.note_usage(
+            "anthropic",
+            &accounts[0],
+            &UsageSnapshot {
+                five_hour: None,
+                seven_day: Some(UsageWindow {
+                    utilization: 0.7,
+                    resets_at: None,
+                }),
+                seven_day_oi: None,
+            },
+        );
+        let entries = pool.entries.lock().unwrap();
+        let quota = &entries
+            .get(&account_key("anthropic", &accounts[0]))
+            .unwrap()
+            .quota;
+        assert_eq!(quota.utilization_7d, Some(0.7));
+        assert_eq!(quota.reset_7d, None);
     }
 
     #[test]
@@ -3093,6 +3968,36 @@ mod tests {
         // ~160s away but the reset is 16200s away → deeply negative.
         let headroom = window_headroom(0.9, Some(now + 16_200), WINDOW_5H_SECS, 0.98, now);
         assert!(headroom < -15_000.0, "got {headroom}");
+    }
+
+    #[test]
+    fn observation_time_never_feeds_headroom() {
+        // F2 (a reset synthesized from observed_at) was rejected during design
+        // because it would corrupt window_headroom's burn-rate math.
+        // observed_at_5h must have zero effect on headroom or `near`: this
+        // holds reset at None and utilization under threshold, with
+        // burn_rate_avoidance on, so any headroom leak from observed_at would
+        // flip `near` to true.
+        let quota = QuotaState {
+            utilization_5h: Some(0.3),
+            reset_5h: None,
+            observed_at_5h: Some(unix_now().saturating_sub(60)),
+            ..Default::default()
+        };
+        let pool_cfg = PoolConfig {
+            burn_rate_avoidance: true,
+            ..Default::default()
+        };
+        let assessment = assess_quota(&quota, &account("a"), false, Some(&pool_cfg), unix_now());
+        assert!(
+            !assessment.near,
+            "a reset-less window under threshold is never near, regardless of observed_at"
+        );
+        assert_eq!(
+            assessment.headroom,
+            f64::INFINITY,
+            "observed_at must not feed headroom"
+        );
     }
 
     #[test]
@@ -3516,6 +4421,33 @@ mod tests {
     }
 
     #[test]
+    fn import_stamps_observation_for_legacy_reset_less_quota() {
+        // A state file written before observed_at_* existed has a window and
+        // an aggregate signal but no observation timestamps at all. Importing
+        // it must backdate both to boot time rather than leave them None,
+        // which for a reset-less mark would mean "expire immediately" on the
+        // very next sweep — the opposite of the intended warm start.
+        let before = unix_now();
+        let pool = AccountPool::new();
+        pool.import_quotas([(
+            account_key("anthropic", &account("a")),
+            QuotaState {
+                utilization_7d: Some(0.9),
+                status: Some("rejected".to_string()),
+                ..Default::default()
+            },
+        )]);
+
+        let entries = pool.entries.lock().unwrap();
+        let quota = &entries
+            .get(&account_key("anthropic", &account("a")))
+            .unwrap()
+            .quota;
+        assert!(quota.observed_at_7d.is_some_and(|at| at >= before));
+        assert!(quota.observed_at_status.is_some_and(|at| at >= before));
+    }
+
+    #[test]
     fn export_skips_accounts_without_quota_signal() {
         // A cooldown marks the account observed but records no quota, so there
         // is nothing worth persisting.
@@ -3573,5 +4505,462 @@ mod tests {
         );
         assert!(pool.take_dirty(), "a quota mutation marks the pool dirty");
         assert!(!pool.take_dirty(), "take_dirty clears the flag");
+    }
+
+    /// Stamp a near-quota utilization (0.9, comfortably under the hard 0.98
+    /// backstop but past the 0.5 `default_threshold` these tests use) with an
+    /// explicit `observed_at_5h`, bypassing the header-parsing path so the
+    /// exact observation time is under test control. Used by the
+    /// opportunistic re-probe (Change B) tests below.
+    fn stamp_near_quota(
+        pool: &AccountPool,
+        provider: &str,
+        account: &AccountConfig,
+        observed_at: u64,
+    ) {
+        let mut entries = pool.entries.lock().expect("account health lock poisoned");
+        let health = entries.entry(account_key(provider, account)).or_default();
+        health.quota.utilization_5h = Some(0.9);
+        health.quota.observed_at_5h = Some(observed_at);
+    }
+
+    #[test]
+    fn reprobe_interval_boundaries() {
+        let cases = [
+            ("pool absent", None, None),
+            ("zero", Some(Some(0)), None),
+            ("unset", Some(None), Some(REPROBE_DEFAULT_SECS)),
+            ("one", Some(Some(1)), Some(REPROBE_FLOOR_SECS)),
+            ("below floor", Some(Some(59)), Some(REPROBE_FLOOR_SECS)),
+            ("at floor", Some(Some(60)), Some(REPROBE_FLOOR_SECS)),
+            ("above floor", Some(Some(61)), Some(61)),
+        ];
+
+        for (label, configured, expected_seconds) in cases {
+            let pool = configured.map(|reprobe_seconds| PoolConfig {
+                reprobe_seconds,
+                ..Default::default()
+            });
+            assert_eq!(
+                reprobe_interval(pool.as_ref()),
+                expected_seconds.map(Duration::from_secs),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn stale_near_codex_account_probes_ahead_once() {
+        let pool_cfg = PoolConfig {
+            default_threshold: Some(0.5),
+            reprobe_seconds: Some(60),
+            ..Default::default()
+        };
+        let pool = AccountPool::new();
+        let mut a = account("codex-a");
+        a.store_family = Some(StoreFamily::Chatgpt);
+        let mut b = account("codex-b");
+        b.store_family = Some(StoreFamily::Chatgpt);
+        let accounts = vec![a, b];
+        let session = "reprobe-once";
+        let initial = pool.select_order("codex", &accounts, Some(session), None, Some(&pool_cfg));
+        let stale = initial[0];
+        stamp_near_quota(&pool, "codex", &accounts[stale], unix_now() - 61);
+
+        let order = pool.select_order("codex", &accounts, Some(session), None, Some(&pool_cfg));
+        assert_eq!(
+            order[0], stale,
+            "a stale near-quota account is promoted to the front for one probe"
+        );
+
+        let order = pool.select_order("codex", &accounts, Some(session), None, Some(&pool_cfg));
+        assert_ne!(
+            order[0], stale,
+            "the same account does not probe again inside the interval (single-flight)"
+        );
+    }
+
+    #[test]
+    fn fresh_near_observation_suppresses_probe() {
+        let pool_cfg = PoolConfig {
+            default_threshold: Some(0.5),
+            reprobe_seconds: Some(60),
+            ..Default::default()
+        };
+        let pool = AccountPool::new();
+        let mut a = account("codex-a");
+        a.store_family = Some(StoreFamily::Chatgpt);
+        let mut b = account("codex-b");
+        b.store_family = Some(StoreFamily::Chatgpt);
+        let accounts = vec![a, b];
+        let session = "fresh-observation";
+        let initial = pool.select_order("codex", &accounts, Some(session), None, Some(&pool_cfg));
+        let sticky = initial[0];
+        let other = initial[1];
+        stamp_near_quota(&pool, "codex", &accounts[sticky], unix_now());
+
+        let order = pool.select_order("codex", &accounts, Some(session), None, Some(&pool_cfg));
+        assert_eq!(
+            order,
+            vec![other, sticky],
+            "a freshly observed near-quota account sorts normally, with no promotion"
+        );
+    }
+
+    #[test]
+    fn recent_aggregate_rejection_suppresses_probe() {
+        let pool_cfg = PoolConfig {
+            default_threshold: Some(0.5),
+            reprobe_seconds: Some(60),
+            ..Default::default()
+        };
+        let pool = AccountPool::new();
+        let mut a = account("codex-a");
+        a.store_family = Some(StoreFamily::Chatgpt);
+        let mut b = account("codex-b");
+        b.store_family = Some(StoreFamily::Chatgpt);
+        let accounts = vec![a, b];
+        let session = "aggregate-rejection";
+        let initial = pool.select_order("codex", &accounts, Some(session), None, Some(&pool_cfg));
+        let sticky = initial[0];
+        let other = initial[1];
+
+        // Only the aggregate `status` is set (no per-window utilization or
+        // status), so `assess_quota`'s `has_window_status` fallback is what
+        // marks this account near -- and `observed_at_status` alone must
+        // govern this candidate's freshness.
+        {
+            let mut entries = pool.entries.lock().expect("account health lock poisoned");
+            let health = entries
+                .entry(account_key("codex", &accounts[sticky]))
+                .or_default();
+            health.quota.status = Some("rejected".to_string());
+            health.quota.observed_at_status = Some(unix_now());
+        }
+        let order = pool.select_order("codex", &accounts, Some(session), None, Some(&pool_cfg));
+        assert_eq!(
+            order,
+            vec![other, sticky],
+            "a freshly rejected aggregate status is not probed yet"
+        );
+
+        {
+            let mut entries = pool.entries.lock().expect("account health lock poisoned");
+            let health = entries
+                .get_mut(&account_key("codex", &accounts[sticky]))
+                .unwrap();
+            health.quota.observed_at_status = Some(unix_now() - 61);
+        }
+        let order = pool.select_order("codex", &accounts, Some(session), None, Some(&pool_cfg));
+        assert_eq!(
+            order[0], sticky,
+            "the stamp aging past the interval unblocks the probe"
+        );
+    }
+
+    /// X7 (verification-FAIL fix): concurrent `select_order` calls racing the
+    /// same stale near-quota account must promote it at most once per
+    /// interval. A single-shot two-thread race cannot catch a regression that
+    /// splits the select-then-stamp critical section (see the "Splitting the
+    /// lock..." comment above `probe_selection`) into two separate lock
+    /// acquisitions -- the race window such a split opens is nanoseconds
+    /// wide -- so this repeats the race 200 times, resetting `last_probe_at`
+    /// to `None` under the entries lock each round (same direct-field-access
+    /// pattern as `recent_aggregate_rejection_suppresses_probe` above) so
+    /// every round starts from an identical "never probed" state. Adoption
+    /// criterion (not "determinism"): mutating `select_order_inner` to
+    /// acquire the entries lock once to compute `probe_selection` and again,
+    /// separately, to write `last_probe_at`, was confirmed locally to make
+    /// this test fail within the 200 rounds below; that mutation was
+    /// reverted, not shipped. If this test cannot detect that mutation on a
+    /// given toolchain/host, drop it -- the single-flight invariant it guards
+    /// is independently documented at the "Splitting the lock..." comment.
+    #[test]
+    fn concurrent_stale_probe_selection_never_double_promotes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pool_cfg = PoolConfig {
+            default_threshold: Some(0.5),
+            reprobe_seconds: Some(60),
+            ..Default::default()
+        };
+        let pool = AccountPool::new();
+        let mut a = account("codex-a");
+        a.store_family = Some(StoreFamily::Chatgpt);
+        let mut b = account("codex-b");
+        b.store_family = Some(StoreFamily::Chatgpt);
+        let accounts = vec![a, b];
+        let session = "concurrent-probe-race";
+
+        let initial = pool.select_order("codex", &accounts, Some(session), None, Some(&pool_cfg));
+        let stale = initial[0];
+        // Observed once, 61s in the past -- same offset as
+        // `stale_near_codex_account_probes_ahead_once` above, and for the
+        // same two reasons: it clears the reprobe interval (60s) so the
+        // observation-freshness gate never suppresses eligibility across any
+        // of the 200 rounds below (only `last_probe_at`, reset every round,
+        // gates re-selection here), while staying far inside
+        // `expire_stale_quota`'s 5-hour window so the stamp survives every
+        // round. Unix epoch (0) was tried first and made the whole scenario
+        // degenerate silently: `expire_stale_quota` (accounts.rs:1493) wipes
+        // any observation older than `WINDOW_5H_SECS`, so the utilization
+        // this stamps was cleared back to `None` before the near-quota check
+        // ever ran, `assessment.near` stayed false for every racer, and the
+        // sticky-first early return then put `stale` at `order[0]`
+        // unconditionally -- the assertion below still passed, but it was no
+        // longer exercising `probe_selection`/`last_probe_at` at all.
+        stamp_near_quota(&pool, "codex", &accounts[stale], unix_now() - 61);
+
+        const ROUNDS: usize = 200;
+        const RACERS: usize = 8;
+        for round in 0..ROUNDS {
+            {
+                let mut entries = pool.entries.lock().expect("account health lock poisoned");
+                let health = entries
+                    .get_mut(&account_key("codex", &accounts[stale]))
+                    .expect("stamp_near_quota above already inserted this entry");
+                health.last_probe_at = None;
+            }
+            let promotions = AtomicUsize::new(0);
+            std::thread::scope(|scope| {
+                for _ in 0..RACERS {
+                    scope.spawn(|| {
+                        let order = pool.select_order(
+                            "codex",
+                            &accounts,
+                            Some(session),
+                            None,
+                            Some(&pool_cfg),
+                        );
+                        if order[0] == stale {
+                            promotions.fetch_add(1, Ordering::SeqCst);
+                        }
+                    });
+                }
+            });
+            assert_eq!(
+                promotions.load(Ordering::SeqCst),
+                1,
+                "round {round}: exactly one concurrent select_order call must promote \
+                 the stale account -- select and stamp happen inside the same lock \
+                 acquisition, so no other racing call in this round can still observe \
+                 it unprobed"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_family_accounts_are_never_probed() {
+        let pool_cfg = PoolConfig {
+            default_threshold: Some(0.5),
+            reprobe_seconds: Some(60),
+            ..Default::default()
+        };
+        let pool = AccountPool::new();
+        let mut a = account("claude-a");
+        a.store_family = Some(StoreFamily::Claude);
+        let mut b = account("claude-b");
+        b.store_family = Some(StoreFamily::Claude);
+        let accounts = vec![a, b];
+        let session = "claude-never-probed";
+        let initial =
+            pool.select_order("anthropic", &accounts, Some(session), None, Some(&pool_cfg));
+        let sticky = initial[0];
+        let other = initial[1];
+        stamp_near_quota(&pool, "anthropic", &accounts[sticky], unix_now() - 10_000);
+
+        let order = pool.select_order("anthropic", &accounts, Some(session), None, Some(&pool_cfg));
+        assert_eq!(
+            order,
+            vec![other, sticky],
+            "a stale near-quota Claude account is never promoted, no matter how stale"
+        );
+    }
+
+    #[test]
+    fn probe_candidates_come_from_rotation_representatives() {
+        let pool_cfg = PoolConfig {
+            default_threshold: Some(0.5),
+            reprobe_seconds: Some(60),
+            ..Default::default()
+        };
+        let pool = AccountPool::new();
+        let mut alias1 = account_with_uuid("codex-alias-1", "shared-uuid");
+        alias1.store_family = Some(StoreFamily::Chatgpt);
+        let mut alias2 = account_with_uuid("codex-alias-2", "shared-uuid");
+        alias2.store_family = Some(StoreFamily::Chatgpt);
+        let mut other = account("codex-other");
+        other.store_family = Some(StoreFamily::Chatgpt);
+        let accounts = vec![alias1, alias2, other];
+        let session = "shared-identity-probe";
+
+        // Both aliases resolve to the same `AccountKey` (identical uuid and
+        // store_family), so this single stamp covers whichever alias
+        // `collapse_representatives` picks as the representative too.
+        stamp_near_quota(&pool, "codex", &accounts[0], unix_now() - 61);
+
+        let order = pool.select_order("codex", &accounts, Some(session), None, Some(&pool_cfg));
+        assert_eq!(
+            order.len(),
+            2,
+            "the two aliases collapse to one rotation slot, plus the other account"
+        );
+        assert!(
+            !order.contains(&1),
+            "the non-representative alias never enters the rotation at all"
+        );
+        assert_eq!(
+            order[0], 0,
+            "the promoted index is the rotation representative (index 0 wins equal priority/disabled ties)"
+        );
+        let mut seen = HashSet::new();
+        for &index in &order {
+            assert!(seen.insert(index), "no index appears twice in the order");
+        }
+    }
+
+    #[test]
+    fn cooling_or_disabled_account_never_probes() {
+        let pool_cfg = PoolConfig {
+            default_threshold: Some(0.5),
+            reprobe_seconds: Some(60),
+            ..Default::default()
+        };
+
+        let pool = AccountPool::new();
+        let mut a = account("codex-a");
+        a.store_family = Some(StoreFamily::Chatgpt);
+        let mut b = account("codex-b");
+        b.store_family = Some(StoreFamily::Chatgpt);
+        let accounts = vec![a, b];
+        let session = "cooling-never-probes";
+        let initial = pool.select_order("codex", &accounts, Some(session), None, Some(&pool_cfg));
+        let sticky = initial[0];
+        stamp_near_quota(&pool, "codex", &accounts[sticky], unix_now() - 61);
+        pool.cooldown("codex", &accounts[sticky], Duration::from_secs(300), "test");
+
+        let order = pool.select_order("codex", &accounts, Some(session), None, Some(&pool_cfg));
+        assert_ne!(
+            order[0], sticky,
+            "a cooling-down account is never probed even when stale and near"
+        );
+
+        // A disabled account never enters `rotation` at all, so it is
+        // structurally unreachable as a probe candidate -- checked directly
+        // with an isolated pool.
+        let pool2 = AccountPool::new();
+        let mut disabled = account("codex-disabled");
+        disabled.store_family = Some(StoreFamily::Chatgpt);
+        disabled.disabled = true;
+        let mut enabled = account("codex-enabled");
+        enabled.store_family = Some(StoreFamily::Chatgpt);
+        let disabled_accounts = vec![disabled, enabled];
+        stamp_near_quota(&pool2, "codex", &disabled_accounts[0], unix_now() - 61);
+
+        let order2 = pool2.select_order(
+            "codex",
+            &disabled_accounts,
+            Some(session),
+            None,
+            Some(&pool_cfg),
+        );
+        assert!(
+            !order2.contains(&0),
+            "a disabled account is never a probe candidate"
+        );
+    }
+
+    #[test]
+    fn reprobe_zero_disables_probing() {
+        let pool_cfg = PoolConfig {
+            default_threshold: Some(0.5),
+            reprobe_seconds: Some(0),
+            ..Default::default()
+        };
+        let pool = AccountPool::new();
+        let mut a = account("codex-a");
+        a.store_family = Some(StoreFamily::Chatgpt);
+        let mut b = account("codex-b");
+        b.store_family = Some(StoreFamily::Chatgpt);
+        let accounts = vec![a, b];
+        let session = "reprobe-zero";
+        let initial = pool.select_order("codex", &accounts, Some(session), None, Some(&pool_cfg));
+        let sticky = initial[0];
+        let other = initial[1];
+        // Stale well past any reasonable reprobe interval, but still inside
+        // `WINDOW_5H_SECS` so `expire_stale_quota` does not wipe the mark
+        // itself before `assess_quota` ever sees it.
+        stamp_near_quota(&pool, "codex", &accounts[sticky], unix_now() - 3_600);
+
+        let order = pool.select_order("codex", &accounts, Some(session), None, Some(&pool_cfg));
+        assert_eq!(
+            order,
+            vec![other, sticky],
+            "reprobe_seconds = 0 disables probing entirely, however stale"
+        );
+    }
+
+    #[test]
+    fn absent_pool_config_disables_probing() {
+        let pool = AccountPool::new();
+        let mut a = account("codex-a");
+        a.store_family = Some(StoreFamily::Chatgpt);
+        let mut b = account("codex-b");
+        b.store_family = Some(StoreFamily::Chatgpt);
+        let accounts = vec![a, b];
+        let session = "no-pool-config";
+        let initial = pool.select_order("codex", &accounts, Some(session), None, None);
+        let sticky = initial[0];
+        let other = initial[1];
+        // Without `[server.pool]`, the legacy 0.98 hard threshold alone still
+        // marks very high utilization "near" (the pre-#135 contract), but
+        // that must never translate into a probe promotion. Stale well past
+        // any reasonable reprobe interval, but still inside `WINDOW_5H_SECS`
+        // so `expire_stale_quota` does not wipe the mark itself first.
+        {
+            let mut entries = pool.entries.lock().expect("account health lock poisoned");
+            let health = entries
+                .entry(account_key("codex", &accounts[sticky]))
+                .or_default();
+            health.quota.utilization_5h = Some(0.99);
+            health.quota.observed_at_5h = Some(unix_now() - 3_600);
+        }
+
+        let order = pool.select_order("codex", &accounts, Some(session), None, None);
+        assert_eq!(
+            order,
+            vec![other, sticky],
+            "an absent [server.pool] disables probing regardless of staleness (pre-#135 behavior)"
+        );
+    }
+
+    #[test]
+    fn probe_promotes_over_healthy_sticky_fast_path() {
+        let pool_cfg = PoolConfig {
+            default_threshold: Some(0.5),
+            reprobe_seconds: Some(60),
+            ..Default::default()
+        };
+        let pool = AccountPool::new();
+        let mut a = account("codex-a");
+        a.store_family = Some(StoreFamily::Chatgpt);
+        let mut b = account("codex-b");
+        b.store_family = Some(StoreFamily::Chatgpt);
+        let accounts = vec![a, b];
+        let session = "fast-path-promotion";
+        let initial = pool.select_order("codex", &accounts, Some(session), None, Some(&pool_cfg));
+        let sticky = initial[0];
+        let other = initial[1];
+        // The non-sticky account is stale and near; sticky itself stays
+        // healthy, so without Change B this takes the sticky fast path and
+        // returns `rotation` (sticky first) completely untouched.
+        stamp_near_quota(&pool, "codex", &accounts[other], unix_now() - 61);
+
+        let order = pool.select_order("codex", &accounts, Some(session), None, Some(&pool_cfg));
+        assert_eq!(
+            order,
+            vec![other, sticky],
+            "the stale near candidate is promoted even over a healthy sticky account"
+        );
     }
 }

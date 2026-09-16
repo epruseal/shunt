@@ -186,9 +186,9 @@ fn default_max_concurrent_requests() -> usize {
 pub(crate) const MAX_CONCURRENT_REQUESTS_LIMIT: usize = usize::MAX >> 3;
 
 /// `[server.pool]` — quota-aware load-balancing tuning and optional usage-API
-/// reconciliation for Claude (Anthropic) account pools (issue #135). Quota
-/// headers exist only on the Anthropic backend, so threshold/burn-rate knobs
-/// are inert for Codex pools; per-account `priority`/`disabled` apply to both.
+/// reconciliation for Claude (Anthropic) and Codex (ChatGPT) account pools
+/// (issue #135). Both backends supply quota windows used by threshold and
+/// burn-rate selection; per-account `priority`/`disabled` also apply to both.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PoolConfig {
     /// Safety backstop common to all quota windows.
@@ -206,9 +206,9 @@ pub struct PoolConfig {
     /// Avoid an account projected to exhaust a soft threshold before reset.
     #[serde(default)]
     pub burn_rate_avoidance: bool,
-    /// Poll `GET /api/oauth/usage` every N seconds for refreshable Claude
-    /// accounts. Unset or `0` disables polling; positive values below 60 are
-    /// clamped to 60 seconds.
+    /// Poll Claude's `/api/oauth/usage` and Codex's `/wham/usage` every N
+    /// seconds for refreshable accounts. Unset or `0` disables polling;
+    /// positive values below 60 are clamped to 60 seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_refresh_seconds: Option<u64>,
     /// Persist the pool's per-account quota state to this file so a restart
@@ -230,6 +230,19 @@ pub struct PoolConfig {
     /// request, and a single-identity pool only ever has a last candidate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ramp_initial_concurrency: Option<u32>,
+    /// Interval, in seconds, at which a stale near-quota Codex/ChatGPT-family
+    /// account is opportunistically promoted to the front of selection once,
+    /// so it takes live traffic and refreshes its observed quota (issue
+    /// #135's safety net for pools with no usage poller). Unset defaults to
+    /// 900 seconds when `[server.pool]` is configured; `0` disables
+    /// re-probing; a positive value below 60 is clamped up to a 60-second
+    /// floor. When `[server.pool]` itself is absent, re-probing is disabled
+    /// regardless of this value (pre-#135 behavior). The outbound Responses
+    /// pool also suppresses re-probing for providers with WebSocket enabled;
+    /// inbound HTTP selection continues to probe. Claude and Kimi accounts are
+    /// never probed (see `reprobe_interval`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reprobe_seconds: Option<u64>,
 }
 
 pub(crate) fn default_hard_threshold() -> f64 {
@@ -248,6 +261,7 @@ impl Default for PoolConfig {
             usage_refresh_seconds: None,
             state_path: None,
             ramp_initial_concurrency: None,
+            reprobe_seconds: None,
         }
     }
 }
@@ -2985,6 +2999,29 @@ impl Config {
         Ok(())
     }
 
+    /// Warns once at load when `[server.pool] reprobe_seconds` is a positive
+    /// value below the 60-second floor `reprobe_interval` (accounts.rs)
+    /// silently clamps up to. That function is the single read site for
+    /// `reprobe_seconds` and is called on every `select_order` request, so a
+    /// warning there would spam one line per request; surfacing it here
+    /// instead means it fires exactly once, at config load, mirroring how
+    /// `usage_refresh_seconds`'s own clamp is instead surfaced once per boot
+    /// (at poller spawn, since that value has no per-request read site).
+    fn warn_reprobe_seconds_below_floor(&self) {
+        let Some(pool) = &self.server.pool else {
+            return;
+        };
+        if let Some(configured) = pool.reprobe_seconds {
+            if configured > 0 && configured < crate::accounts::REPROBE_FLOOR_SECS {
+                tracing::warn!(
+                    configured_seconds = configured,
+                    effective_seconds = crate::accounts::REPROBE_FLOOR_SECS,
+                    "reprobe_seconds is below the floor; using the floor"
+                );
+            }
+        }
+    }
+
     /// Warns when a provider or route has an explicitly configured
     /// `service_tier` that resolves to the `xai`/`grok` Responses flavor:
     /// that flavor never sends `service_tier` on the wire (xAI's Responses
@@ -3165,6 +3202,7 @@ impl Config {
                 }
             }
         }
+        self.warn_reprobe_seconds_below_floor();
         // Fail closed at boot: [server.status] sources are polled unattended in
         // the background, so a malformed URL or a duplicate provider label
         // would otherwise surface only as a silent, permanently-failing poller

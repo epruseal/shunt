@@ -110,6 +110,14 @@ fn unique_temp_dir(tag: &str) -> PathBuf {
 /// A far-future expiry (year 2100) for tokens that must read as locally valid.
 const FAR_FUTURE_EXP: u64 = 4_102_444_800;
 
+fn future_exp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .saturating_add(3_600)
+}
+
 /// Build a fake ChatGPT access token carrying the `chatgpt_account_id` claim
 /// `codex::auth::jwt_account_id` reads (mirrors the `token()` helper in
 /// `src/auth/codex/auth.rs`'s own test module). A far-future `exp` keeps a
@@ -349,8 +357,9 @@ async fn refresh_retry_refreshes_then_succeeds_on_401() {
     let _env = REFRESH_ENV_LOCK.lock().await;
     // `stale` and `fresh` must differ so the BearerToken matchers below can
     // tell the pre-refresh and post-refresh requests apart.
-    let stale = chatgpt_token(FAR_FUTURE_EXP, "acct-a");
-    let fresh = chatgpt_token(FAR_FUTURE_EXP + 1, "acct-a");
+    let expires_at = future_exp();
+    let stale = chatgpt_token(expires_at, "acct-a");
+    let fresh = chatgpt_token(expires_at + 1, "acct-a");
 
     let accounts_dir = unique_temp_dir("succeeds");
     write_store_account(&accounts_dir, "account-a", &stale, "refresh-token-a");
@@ -418,8 +427,9 @@ async fn refresh_retry_non_success_rotates_to_next_account() {
     let _env = REFRESH_ENV_LOCK.lock().await;
     // `stale` and `fresh` must differ so the BearerToken matchers below can
     // tell the pre-refresh and post-refresh requests apart.
-    let stale = chatgpt_token(FAR_FUTURE_EXP, "acct-a");
-    let fresh = chatgpt_token(FAR_FUTURE_EXP + 1, "acct-a");
+    let expires_at = future_exp();
+    let stale = chatgpt_token(expires_at, "acct-a");
+    let fresh = chatgpt_token(expires_at + 1, "acct-a");
     let token_b = chatgpt_token(FAR_FUTURE_EXP, "acct-rotate-b");
     std::env::set_var("SHUNT_TEST_CODEX_ROTATE_B", &token_b);
 
@@ -491,8 +501,9 @@ async fn refresh_retry_and_rotation_reuse_the_identical_serialized_body() {
         return;
     }
     let _env = REFRESH_ENV_LOCK.lock().await;
-    let stale = chatgpt_token(FAR_FUTURE_EXP, "acct-body-a");
-    let fresh = chatgpt_token(FAR_FUTURE_EXP + 1, "acct-body-a");
+    let expires_at = future_exp();
+    let stale = chatgpt_token(expires_at, "acct-body-a");
+    let fresh = chatgpt_token(expires_at + 1, "acct-body-a");
     let token_b = chatgpt_token(FAR_FUTURE_EXP, "acct-body-b");
     std::env::set_var("SHUNT_TEST_CODEX_BODY_B", &token_b);
 
@@ -584,8 +595,9 @@ async fn refresh_retry_and_rotation_reuse_the_identical_compressed_body() {
         return;
     }
     let _env = REFRESH_ENV_LOCK.lock().await;
-    let stale = chatgpt_token(FAR_FUTURE_EXP, "acct-zbody-a");
-    let fresh = chatgpt_token(FAR_FUTURE_EXP + 1, "acct-zbody-a");
+    let expires_at = future_exp();
+    let stale = chatgpt_token(expires_at, "acct-zbody-a");
+    let fresh = chatgpt_token(expires_at + 1, "acct-zbody-a");
     let token_b = chatgpt_token(FAR_FUTURE_EXP, "acct-zbody-b");
     std::env::set_var("SHUNT_TEST_CODEX_ZBODY_B", &token_b);
 
@@ -702,8 +714,9 @@ async fn refresh_retry_still_unauthorized_cools_down_and_rotates() {
     let _env = REFRESH_ENV_LOCK.lock().await;
     // `stale` and `fresh` must differ so the BearerToken matchers below can
     // tell the pre-refresh and post-refresh requests apart.
-    let stale = chatgpt_token(FAR_FUTURE_EXP, "acct-a");
-    let fresh = chatgpt_token(FAR_FUTURE_EXP + 1, "acct-a");
+    let expires_at = future_exp();
+    let stale = chatgpt_token(expires_at, "acct-a");
+    let fresh = chatgpt_token(expires_at + 1, "acct-a");
     let token_b = chatgpt_token(FAR_FUTURE_EXP, "acct-still401-b");
     std::env::set_var("SHUNT_TEST_CODEX_STILL401_B", &token_b);
 
@@ -1257,6 +1270,11 @@ async fn codex_quota_headers_drive_proactive_rotation() {
     }
     let token_a = chatgpt_token(FAR_FUTURE_EXP, "acct-quota-a");
     let token_b = chatgpt_token(FAR_FUTURE_EXP, "acct-quota-b");
+    let reset_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .saturating_add(16_200);
     std::env::set_var("SHUNT_TEST_CODEX_QUOTA_A", &token_a);
     std::env::set_var("SHUNT_TEST_CODEX_QUOTA_B", &token_b);
 
@@ -1271,10 +1289,7 @@ async fn codex_quota_headers_drive_proactive_rotation() {
             ResponseTemplate::new(200)
                 .insert_header("x-codex-primary-window-minutes", "300")
                 .insert_header("x-codex-primary-used-percent", "99")
-                .insert_header(
-                    "x-codex-primary-reset-at",
-                    FAR_FUTURE_EXP.to_string().as_str(),
-                )
+                .insert_header("x-codex-primary-reset-at", reset_at.to_string().as_str())
                 .set_body_string(sse_body("account a served")),
         )
         .expect(1)
@@ -1471,4 +1486,77 @@ async fn storm_control_last_candidate_is_always_admitted() {
     upstream.verify().await;
 
     std::env::remove_var("SHUNT_TEST_CODEX_STORM_SOLO");
+}
+
+#[tokio::test]
+async fn codex_quota_rotation_with_empty_reset_header() {
+    // Reproduces the incident this change fixes: a deployed multi-account
+    // codex pool sent a valid window-minutes group with near-quota
+    // utilization but a blank `x-codex-primary-reset-at`. Proactive rotation
+    // must still trigger off the utilization alone — a missing reset must not
+    // suppress the recorded quota signal. (Re-entry once the mark ages out is
+    // covered by the unit tests `account_reenters_selection_after_reset_passes`
+    // and `account_reenters_selection_after_reset_less_mark_ages_out` in
+    // src/accounts.rs, not here, to avoid a sleep-based flaky wait in this
+    // integration test.)
+    if !can_bind_loopback() {
+        return;
+    }
+    let token_a = chatgpt_token(FAR_FUTURE_EXP, "acct-quota-noreset-a");
+    let token_b = chatgpt_token(FAR_FUTURE_EXP, "acct-quota-noreset-b");
+    std::env::set_var("SHUNT_TEST_CODEX_QUOTA_NORESET_A", &token_a);
+    std::env::set_var("SHUNT_TEST_CODEX_QUOTA_NORESET_B", &token_b);
+
+    let upstream = MockServer::start().await;
+    // Account-a succeeds but reports its 5h window at 99% used with an empty
+    // reset-at header — no reset instant is ever recorded for this window.
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .and(BearerToken(token_a.clone()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-codex-primary-window-minutes", "300")
+                .insert_header("x-codex-primary-used-percent", "99")
+                .insert_header("x-codex-primary-reset-at", "")
+                .set_body_string(sse_body("account a served")),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .and(BearerToken(token_b.clone()))
+        .respond_with(ResponseTemplate::new(200).set_body_string(sse_body("account b served")))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let gateway = start_gateway_with(test_config(
+        &upstream.uri(),
+        account("account-a", "SHUNT_TEST_CODEX_QUOTA_NORESET_A"),
+        account("account-b", "SHUNT_TEST_CODEX_QUOTA_NORESET_B"),
+    ))
+    .await;
+
+    // Both requests carry a session id that hashes to account-a, so absent the
+    // quota signal the pool would stay sticky on account-a for both.
+    let session_id = session_id_for_account(0, 2);
+    let response = post_messages(&gateway, Some(&session_id)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("x-shunt-account").unwrap(),
+        "account-a"
+    );
+
+    let response = post_messages(&gateway, Some(&session_id)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("x-shunt-account").unwrap(),
+        "account-b",
+        "a near-quota sticky account with an empty reset header should still rotate off"
+    );
+    upstream.verify().await;
+
+    std::env::remove_var("SHUNT_TEST_CODEX_QUOTA_NORESET_A");
+    std::env::remove_var("SHUNT_TEST_CODEX_QUOTA_NORESET_B");
 }

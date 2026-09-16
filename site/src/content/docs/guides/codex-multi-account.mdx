@@ -68,6 +68,8 @@ Store files live at `~/.shunt/accounts/codex/<name>.json`; set `SHUNT_CODEX_ACCO
 
 There is no `--long-lived` flag for `shunt login codex` — Codex has no setup-token concept, so every store-managed account is a refreshable OAuth login imported from an existing `codex login`.
 
+The import only accepts a **ChatGPT** login. A current `codex login` writes `"auth_mode": "chatgpt"` into `$CODEX_AUTH_FILE` (or `~/.codex/auth.json`); shunt matches that field case-insensitively, so a file from an older Codex version (`"ChatGPT"`) imports unchanged. An API-key login (`"auth_mode": "apikey"`) is rejected with `is not a ChatGPT login (auth_mode is not "chatgpt")` — re-run `codex login` and pick a ChatGPT account.
+
 ## Account fields
 
 | Field | Required | Meaning |
@@ -110,6 +112,7 @@ Deleting a store-managed account through the admin web surface clears that ident
 - Successful responses record usage from `x-codex-primary-*` and `x-codex-secondary-*` headers. shunt maps each group by `window-minutes`: about 300 minutes appears in 5h, about 10080 minutes appears in 7d, and other windows are ignored. Codex has no `7d_oi` analog.
 - Recorded usage feeds selection, exactly as in the [Anthropic pool](/guides/anthropic-multi-account/): a sticky account at or past its threshold (the built-in `0.98`, or the [`[server.pool]`](/reference/configuration/#serverpool-optional)/per-account soft thresholds) proactively yields to the account with the most headroom, and `burn_rate_avoidance` and priority/headroom ordering apply. The `x-codex-rate-limit-reached-type` value is recorded for display only.
 - With `[server.pool] ramp_initial_concurrency` set, a slow-start admission gate protects a freshly selected account from being stampeded after a failover; see [`[server.pool]`](/reference/configuration/#serverpool-optional).
+- With `[server.pool]` configured, a stale near-quota account with no other usage signal is opportunistically promoted to the front of selection once per `reprobe_seconds` (default 900s, `0` disables) so a live request refreshes its quota; see [`[server.pool]`](/reference/configuration/#serverpool-optional). This remains the fallback for non-WebSocket outbound selection and the optional inbound Codex HTTP endpoint when the usage poller (below) is off or between polls. A provider with WebSocket transport enabled suppresses outbound Responses re-probing because an in-stream rate-limit event does not rotate safely. For that provider, `shunt.pool.reprobes` counts inbound probes only. A configured poller provides early recovery only for imported, refreshable accounts; without it, or for an ineligible account, the outbound mark clears at its observation-time window bound.
 - A successful response clears that account's cooldown.
 
 | Trigger | Cooldown |
@@ -120,6 +123,14 @@ Deleting a store-managed account through the admin web surface clears that ident
 | 429 upstream response | numeric `retry-after`, clamped to 1–3600s, default 60s |
 | 401 from a `token_env` account | 5 minutes |
 | 401 from a `credentials`/store account, refresh fails or the retry is still 401 | 5 minutes |
+
+## Usage poller
+
+A positive [`usage_refresh_seconds`](/reference/configuration/#serverpool-optional) also polls every imported (refreshable) `chatgpt_oauth` account against `GET /wham/usage`, reconciling the pool's header-derived 5h/weekly quota state the same way it does for the Anthropic pool against `GET /api/oauth/usage`. It fills the same gap `reprobe_seconds` covers with a live request: an account the pool has excluded for being near quota never takes another proxied request, so its `x-codex-*` headers never refresh — even long after the account's window has actually reset. The poller reads ground-truth usage out of band instead.
+
+**This is not a documented OpenAI/ChatGPT API.** The evidence for its shape is the Codex CLI's own observed 60-second polling behavior, not published documentation, so it can change or disappear without notice. Parsing is deliberately lenient and fail-soft end to end. A successfully parsed, non-empty wham report is authoritative about the windows it enumerates: when at least one usable 5h or 7d window is present, a bucket with no candidate window clears its utilization, reset, per-window status, and observation stamp. A null window is absence, but an unrecognized-duration candidate is unknown and suppresses clearing. Fetch or parse errors, and empty snapshots with no usable recognized window, preserve prior state. This differs from Claude's `/api/oauth/usage` path, where an omitted window intentionally preserves the prior value. A single malformed window does not block its sibling window from applying, and no parse failure here marks an account unhealthy or affects request routing beyond leaving the header-derived state as the fallback.
+
+Eligibility mirrors the Claude side: only an imported login (a store-managed account, or an inline `credentials` path with a `tokens.refresh_token`) can be polled — a raw `token_env` bearer is static and skipped.
 
 ## Failover rules
 
@@ -173,7 +184,6 @@ A `chatgpt_oauth` provider with no `accounts` configured (the default `codex` pr
 
 ## Remaining follow-up
 
-- **Out-of-band usage reconciliation:** the Anthropic pool can poll an authoritative usage API (`usage_refresh_seconds`); Codex has no equivalent, so its quota state refreshes only from response headers.
 - **Admin web provisioning:** the opt-in [admin surface](/guides/admin-remote-provisioning/) can run ChatGPT OAuth in the browser, store a refreshable Codex account, show it in the shared pool table, and display reported 5h/7d usage (`7d_oi` remains empty because Codex has no analog).
 
 See the [M10 behavior specification](https://github.com/pleaseai/shunt/blob/main/docs/m10-codex-multi-account.md) for the full account-pool internals, and the [ChatGPT / Codex guide](/guides/codex/) for single-account setup, model routing, and effort/context configuration.

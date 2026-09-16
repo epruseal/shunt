@@ -6,7 +6,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use shunt::{
     auth::antigravity::{
-        antigravity_migration_error, routes_to_antigravity, routes_to_antigravity_cli,
+        routed_antigravity_credential_error, routes_to_antigravity, routes_to_antigravity_cli,
         warn_if_routes_to_antigravity_cli,
     },
     blueprints::{self, AddKind},
@@ -629,17 +629,17 @@ async fn serve(config: Config, path: Option<PathBuf>) -> anyhow::Result<()> {
     // The refresher is bounded, off the request path, and falls back to the
     // compiled-in version, so a manifest outage degrades the fingerprint
     // rather than the provider.
+    // `antigravity` changed meaning: it used to run the local `agy` binary, and
+    // now reaches the same service over HTTP under its own credential. A config
+    // that still means the old thing must fail loudly here rather than resolve
+    // quietly to a different transport, with different credentials, egress, and
+    // failure modes, behind a green startup. `check` runs this same predicate,
+    // so the two commands cannot disagree about a given config and credential
+    // state — not that `check` necessarily ran first.
+    if let Some(message) = routed_antigravity_credential_error(&config) {
+        anyhow::bail!(message);
+    }
     if routes_to_antigravity(&config) {
-        // `antigravity` changed meaning: it used to run the local `agy` binary,
-        // and now reaches the same service over HTTP under its own credential.
-        // A config that still means the old thing must fail loudly here rather
-        // than resolve quietly to a different transport, with different
-        // credentials, egress, and failure modes, behind a green startup.
-        if let Some(message) = antigravity_migration_error(
-            shunt::auth::antigravity::default_antigravity_auth_path().exists(),
-        ) {
-            anyhow::bail!(message);
-        }
         shunt::auth::antigravity::version::spawn_refresher(reqwest::Client::new());
     }
     let (router, shared, state) =
@@ -685,9 +685,23 @@ async fn serve(config: Config, path: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 fn check(config_path: Option<PathBuf>) -> anyhow::Result<()> {
-    Config::load(config_path.as_deref())
+    let config = Config::load(config_path.as_deref())
         .and_then(|config| config.validate())
         .context("config check failed")?;
+    // `Config::validate` never looks at the Antigravity credential store, so
+    // the routed-Antigravity guard is the one check `check` has to add
+    // explicitly — otherwise a migrated config that `serve()` refuses to boot
+    // still reports `config ok`, precisely to the CI and deploy scripts that
+    // gate a rollout on this command (issue #382). Offline like the rest of
+    // `check`: routing plus a credential-existence probe, never a refresh.
+    //
+    // Existence is the whole test. A present-but-empty or malformed credential
+    // satisfies it and fails later on the request path; parsing it here would
+    // change what `shunt run` accepts, which this command deliberately mirrors
+    // rather than tightens.
+    if let Some(message) = routed_antigravity_credential_error(&config) {
+        anyhow::bail!(message);
+    }
     println!("config ok");
     Ok(())
 }
@@ -1360,8 +1374,104 @@ mod tests {
         assert!(error.to_string().contains("invalid server bind address"));
     }
 
+    /// Restores the prior value on drop rather than removing the variable, so a
+    /// developer or CI environment that already sets it is handed back exactly
+    /// what it had. Mirrors `reload.rs`'s guard of the same name; duplicated
+    /// because that one is `#[cfg(test)]` inside the library crate and the
+    /// binary's tests link against the library's non-test build.
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
+    /// Serializes every test in this binary that **reads or writes** the
+    /// process environment — not just the writers.
+    ///
+    /// A writers-only lock does not exclude anything: the environment is
+    /// per-process, `cargo test` runs these tests on parallel threads, and the
+    /// hazard is a `set_var` racing another thread's *read*, which is why
+    /// `std::env::set_var` is `unsafe` from edition 2024 on.
+    /// `run_surfaces_serve_errors` reaches `Config::load` (`run`, above), whose
+    /// figment layers read the whole environment, so it takes this lock too.
+    ///
+    /// The library side learned this the expensive way: the note on
+    /// `ANTIGRAVITY_AUTH_FILE_ENV_LOCK` in `auth::antigravity` records a ~40%
+    /// flake rate caused by guarding the same environment with two independent
+    /// mutexes, which by construction do not exclude each other.
+    static PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn serve_refuses_a_routed_antigravity_provider_without_a_credential() {
+        // The `run` half of the check/run parity this PR exists to create.
+        // `tests/check_cli.rs` drives the `check` entry point and the
+        // `reload_routing_to_antigravity_*` tests drive `reload`; each proves
+        // only its own call site. Measured: deleting the guard from `serve()`
+        // alone left the entire workspace suite green, so without this test the
+        // claim that `shunt run` still refuses rested on reading the code.
+        let _lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A path that is never created — the guard probes existence only, so
+        // nothing has to be written or cleaned up.
+        let credential = std::env::temp_dir().join(format!(
+            "shunt-serve-antigravity-absent-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        assert!(
+            !credential.exists(),
+            "the probed credential must be absent for this test to mean anything"
+        );
+        let _env = EnvVarGuard::set("SHUNT_ANTIGRAVITY_AUTH_FILE", &credential);
+
+        let mut config = Config::default();
+        // `serve` binds before it reaches the guard, so give it a bindable
+        // ephemeral port; otherwise this would fail on the bind and pass for
+        // the wrong reason.
+        config.server.bind = "127.0.0.1:0".to_string();
+        config.server.default_provider = "antigravity".to_string();
+
+        let error = runtime()
+            .expect("runtime builds")
+            .block_on(serve(config, None))
+            .expect_err("a routed antigravity provider with no credential must refuse to boot");
+        let message = error.to_string();
+        // Assert on the guard's own wording, not merely on failure: a bind or
+        // router error would otherwise satisfy `expect_err` above.
+        assert!(
+            message.contains("provider `antigravity` is routed but has no credential"),
+            "{message}"
+        );
+        assert!(message.contains("shunt login antigravity"), "{message}");
+    }
+
     #[test]
     fn run_surfaces_serve_errors() {
+        // Reads the process environment through `Config::load`'s figment
+        // layers, so it shares the writers' lock — see `PROCESS_ENV_LOCK`.
+        let _lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Hold a loopback port so `serve` deterministically fails to bind it.
         let listener =
             std::net::TcpListener::bind("127.0.0.1:0").expect("reserve test bind address");
