@@ -423,3 +423,65 @@ codex = "gpt-5.2"
 ## 라우팅 우선순위
 
 일치하는 `[models.upstream_model]` 항목 → 정확한 `[[routes]]` 일치 → `[[route_prefixes]]` 프리픽스 일치 → `server.default_provider`.
+
+## `[server.weekly_fallback]` (선택 사항)
+
+이 정책은 Claude Code의 `/v1/messages` 요청에서 Claude OAuth와 ChatGPT OAuth 사이의 양방향 전환을 지원합니다.
+기본값은 비활성이며 선택한 활성 계정 전부의 공통 주간 한도 소진을 최신 증거로 확인한 경우에만 제공자를 바꿉니다.
+누락되거나 만료되거나 불완전한 관측은 소진 증거가 아닙니다. 5시간 한도, Fable 전용 한도, cooldown과 soft threshold도 근거로 쓰지 않습니다.
+관측은 300초 뒤 만료되며 같은 관측에 미래 초기화 시각이 있어야 합니다.
+
+잘못된 주간 값을 받으면 일반 사용량 스냅샷이 비어 있어도 이전 소진 증거를 지웁니다.
+Codex 사용량 응답의 서로 모순된 주간 창과 알 수 없는 duration도 소진 증거로 쓰지 않습니다.
+
+| 키 | 기본값 | 의미 |
+| --- | --- | --- |
+| `enabled` | `false` | 대응하는 단일 라우트에 정책을 적용합니다 |
+| `claude_provider` | 활성화 시 필수 | `claude_oauth`를 쓰는 기존 제공자입니다 |
+| `codex_provider` | 활성화 시 필수 | `chatgpt_oauth`와 ChatGPT backend를 쓰는 기존 제공자입니다 |
+| `models` | 빈 목록 | 명시한 backend 모델 쌍입니다 |
+| `models[].claude` | 필수 | Claude backend ID입니다 |
+| `models[].codex` | 필수 | Codex backend ID입니다 |
+| `models[].claude_fallback` | 미설정 | 해당 Claude 실패 시 같은 제공자에서 사용할 모델입니다 |
+
+```toml
+[server.weekly_fallback]
+enabled = true
+claude_provider = "anthropic"
+codex_provider = "codex"
+
+[[server.weekly_fallback.models]]
+claude = "claude-fable-5"
+codex = "gpt-6-astra"
+claude_fallback = "claude-opus-5"
+
+[[server.weekly_fallback.models]]
+claude = "claude-opus-5"
+codex = "gpt-5.6-sol"
+
+[[server.weekly_fallback.models]]
+claude = "claude-sonnet-5"
+codex = "gpt-5.6-terra"
+
+[[server.weekly_fallback.models]]
+claude = "claude-haiku-4-5-20251001"
+codex = "gpt-5.6-luna"
+```
+
+설정에 이미 있는 제공자 이름을 사용하세요. 활성화 전에 backend 접근 권한을 확인하세요.
+별칭과 context hint를 처리한 라우트의 제공자와 backend ID가 정확히 일치할 때만 모델 쌍을 적용합니다.
+정책을 활성화하면 두 제공자를 일반 다중 라우트 체인에 넣을 수 없습니다.
+
+설정한 Claude fallback은 upstream 4xx, 5xx 또는 헤더 이전 실패에 같은 제공자로 한 번 시도합니다.
+로컬 검증 오류와 성공 헤더 이후 오류는 즉시 반환하며 부분 출력이 있으면 요청을 다시 보내지 않습니다.
+계정 풀에서 upstream 요청을 한 번도 시도하지 못한 경우에도 즉시 종료합니다.
+
+Fable 요청이 Opus를 사용한 뒤 공통 주간 한도를 소진해도 Codex 대상은 Astra로 유지합니다.
+요청마다 제공자 전환은 한 번만 허용합니다. 두 계정 풀 모두 소진되면 Anthropic HTTP 429와 `rate_limit_error`를 반환합니다.
+
+대상 제공자는 자체 기본값과 자격 증명을 사용하며 managed model 권한 검사는 원래 요청한 별칭을 기준으로 합니다.
+fallback 테이블은 그 별칭으로 접근할 대체 backend를 정의합니다.
+
+`x-gateway-model`은 context hint를 포함한 원래 모델 문자열을 유지합니다.
+`x-gateway-upstream`과 `x-gateway-upstream-model`은 최종 제공자와 backend를 표시합니다.
+inbound Codex endpoint와 `count_tokens`는 기존 동작을 유지합니다.

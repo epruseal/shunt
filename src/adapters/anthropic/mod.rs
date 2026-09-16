@@ -180,6 +180,7 @@ async fn forward_claude_oauth(
     let ramp_initial = state.config.storm_ramp_initial();
     let candidates = order.len();
     let mut last_response = None;
+    let mut upstream_attempted = false;
 
     for (position, index) in order.into_iter().enumerate() {
         let account = &accounts[index];
@@ -246,6 +247,7 @@ async fn forward_claude_oauth(
         }
         let request_body = request_body.into_raw();
 
+        upstream_attempted = true;
         let upstream = match post_upstream(
             &state,
             &url,
@@ -566,7 +568,11 @@ async fn forward_claude_oauth(
             )
             .into_response(),
         ),
-        failure: Some(crate::adapters::AdapterFailure::BeforeHeaders),
+        failure: Some(if upstream_attempted {
+            crate::adapters::AdapterFailure::BeforeHeaders
+        } else {
+            crate::adapters::AdapterFailure::NoUpstreamAttempt
+        }),
     })
 }
 
@@ -657,6 +663,7 @@ async fn forward_kimi_oauth(
     let ramp_initial = state.config.storm_ramp_initial();
     let candidates = order.len();
     let mut last_response = None;
+    let mut upstream_attempted = false;
 
     for (position, index) in order.into_iter().enumerate() {
         let account = &accounts[index];
@@ -703,6 +710,7 @@ async fn forward_kimi_oauth(
         let request_headers = outbound_headers(headers, &credential);
         let request_body = base_body.clone().into_raw();
 
+        upstream_attempted = true;
         let upstream = match post_upstream(&state, &url, request_headers, request_body).await {
             Ok(response) => response,
             Err(error @ crate::upstream_timeout::SendError::Timeout) => {
@@ -789,7 +797,11 @@ async fn forward_kimi_oauth(
             )
             .into_response(),
         ),
-        failure: Some(crate::adapters::AdapterFailure::BeforeHeaders),
+        failure: Some(if upstream_attempted {
+            crate::adapters::AdapterFailure::BeforeHeaders
+        } else {
+            crate::adapters::AdapterFailure::NoUpstreamAttempt
+        }),
     })
 }
 
@@ -1222,6 +1234,9 @@ fn upstream_error(error: reqwest::Error) -> AdapterError {
         failure: Some(crate::adapters::AdapterFailure::BeforeHeaders),
     }
 }
+
+#[cfg(test)]
+mod provenance_tests;
 
 #[cfg(test)]
 mod tests {

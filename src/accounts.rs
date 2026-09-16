@@ -14,6 +14,9 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::{AccountConfig, PoolConfig};
 
+mod weekly;
+pub(crate) use weekly::WeeklyUsageEvidence;
+
 /// Credential-store namespace. Stable account ids only coalesce inside their
 /// own store family, so a Claude UUID can never collide with a ChatGPT account id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -220,6 +223,7 @@ struct AccountHealth {
     cooldown_until: Option<Instant>,
     cooldown_until_fable: Option<Instant>,
     quota: QuotaState,
+    strict_weekly: Option<weekly::Observation>,
     /// Latest configured selection state. Quota gauges exclude disabled accounts.
     enabled: bool,
     /// Whether the pool has processed at least one upstream response for this
@@ -644,10 +648,17 @@ impl AccountPool {
     }
 
     pub fn note_quota(&self, provider: &str, account: &AccountConfig, headers: &HeaderMap) {
+        let observed_at = Instant::now();
+        let observed_unix = unix_now();
         {
             let mut entries = self.entries.lock().expect("account health lock poisoned");
             let health = entries.entry(account_key(provider, account)).or_default();
             health.observed = true;
+            if let Some(observation) =
+                weekly::Observation::anthropic(headers, observed_at, observed_unix)
+            {
+                health.strict_weekly = Some(observation);
+            }
             let quota = &mut health.quota;
             let now = unix_now();
 
@@ -720,10 +731,17 @@ impl AccountPool {
     /// position does not. The recorded windows feed both the admin dashboard
     /// and Codex account selection via [`Self::select_order`] (issue #195).
     pub fn note_codex_quota(&self, provider: &str, account: &AccountConfig, headers: &HeaderMap) {
+        let observed_at = Instant::now();
+        let observed_unix = unix_now();
         {
             let mut entries = self.entries.lock().expect("account health lock poisoned");
             let health = entries.entry(account_key(provider, account)).or_default();
             health.observed = true;
+            if let Some(observation) =
+                weekly::Observation::codex(headers, observed_at, observed_unix)
+            {
+                health.strict_weekly = Some(observation);
+            }
             let quota = &mut health.quota;
             let now = unix_now();
 
@@ -799,7 +817,30 @@ impl AccountPool {
     /// stay header-driven. Marks the account observed, so the admin dashboard
     /// reports its usage even before the first proxied request.
     pub fn note_usage(&self, provider: &str, account: &AccountConfig, usage: &UsageSnapshot) {
-        self.note_usage_inner(provider, account, usage, false, false);
+        self.note_claude_usage(
+            provider,
+            account,
+            usage,
+            &WeeklyUsageEvidence::from_snapshot(usage),
+        );
+    }
+
+    /// Apply normalized Claude usage and strict evidence from the same response.
+    pub(crate) fn note_claude_usage(
+        &self,
+        provider: &str,
+        account: &AccountConfig,
+        usage: &UsageSnapshot,
+        weekly: &WeeklyUsageEvidence,
+    ) {
+        self.note_usage_inner(
+            provider,
+            account,
+            usage,
+            (false, false),
+            weekly::Source::AnthropicUsage,
+            weekly,
+        );
     }
 
     /// Apply one successfully parsed, non-empty Codex `wham/usage` report.
@@ -816,8 +857,16 @@ impl AccountPool {
         usage: &UsageSnapshot,
         clear_five_hour: bool,
         clear_seven_day: bool,
+        weekly: &WeeklyUsageEvidence,
     ) {
-        self.note_usage_inner(provider, account, usage, clear_five_hour, clear_seven_day);
+        self.note_usage_inner(
+            provider,
+            account,
+            usage,
+            (clear_five_hour, clear_seven_day),
+            weekly::Source::CodexUsage,
+            weekly,
+        );
     }
 
     fn note_usage_inner(
@@ -825,13 +874,32 @@ impl AccountPool {
         provider: &str,
         account: &AccountConfig,
         usage: &UsageSnapshot,
-        clear_five_hour: bool,
-        clear_seven_day: bool,
+        clear_windows: (bool, bool),
+        source: weekly::Source,
+        weekly: &WeeklyUsageEvidence,
     ) {
+        let (clear_five_hour, clear_seven_day) = clear_windows;
+        let observed_at = Instant::now();
+        let observed_unix = unix_now();
         {
             let mut entries = self.entries.lock().expect("account health lock poisoned");
             let health = entries.entry(account_key(provider, account)).or_default();
             health.observed = true;
+            if clear_seven_day {
+                health.strict_weekly = None;
+            }
+            match weekly {
+                WeeklyUsageEvidence::Unreported => {}
+                WeeklyUsageEvidence::Invalid => health.strict_weekly = None,
+                WeeklyUsageEvidence::Reported(window) => {
+                    health.strict_weekly = Some(weekly::Observation::usage(
+                        window,
+                        source,
+                        observed_at,
+                        observed_unix,
+                    ));
+                }
+            }
             let quota = &mut health.quota;
             let now = unix_now();
             if clear_five_hour {

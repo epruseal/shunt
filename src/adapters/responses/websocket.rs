@@ -150,7 +150,9 @@ async fn open_ws_turn(
     // the full input on a fresh connection, then evaluate that stream instead.
     if used_continuation && matches!(&first, Some(Err(error)) if error.previous_response_missing) {
         tracing::info!("codex previous_response_id rejected; retrying with full input");
-        let (events, _) = start_ws_turn(ctx, false).await?;
+        let (events, _) = start_ws_turn(ctx, false)
+            .await
+            .map_err(preserve_prior_ws_attempt)?;
         let (first, events) = peek_first_event(events).await;
         return commit_or_fallback(first, events);
     }
@@ -322,7 +324,7 @@ fn websocket_headers(
             AdapterError {
                 message,
                 response: Box::new(response),
-                failure: Some(crate::adapters::AdapterFailure::BeforeHeaders),
+                failure: Some(crate::adapters::AdapterFailure::NoUpstreamAttempt),
             }
         })?;
         headers.insert(name, value);
@@ -376,19 +378,35 @@ fn websocket_headers(
 }
 
 fn ws_transport_error(error: CodexWsError) -> AdapterError {
-    ws_before_headers_error(error.message)
+    let failure = if error.no_upstream_attempt {
+        crate::adapters::AdapterFailure::NoUpstreamAttempt
+    } else {
+        crate::adapters::AdapterFailure::BeforeHeaders
+    };
+    ws_failure_error(error.message, failure)
 }
 
 /// Every websocket failure before connection or the first event is safe to
 /// replay over HTTP. Failures after the first event remain unclassified so the
 /// fallback gates stop instead of duplicating an accepted turn.
 fn ws_before_headers_error(message: String) -> AdapterError {
+    ws_failure_error(message, crate::adapters::AdapterFailure::BeforeHeaders)
+}
+
+fn ws_failure_error(message: String, failure: crate::adapters::AdapterFailure) -> AdapterError {
     let response = ShuntError::bad_gateway(message.clone()).into_response();
     AdapterError {
         message,
         response: Box::new(response),
-        failure: Some(crate::adapters::AdapterFailure::BeforeHeaders),
+        failure: Some(failure),
     }
+}
+
+fn preserve_prior_ws_attempt(mut error: AdapterError) -> AdapterError {
+    if error.failure == Some(crate::adapters::AdapterFailure::NoUpstreamAttempt) {
+        error.failure = Some(crate::adapters::AdapterFailure::BeforeHeaders);
+    }
+    error
 }
 
 /// Map a websocket handshake failure to an [`AdapterError`]. A refused upgrade
@@ -513,6 +531,7 @@ mod tests {
             body: String::new(),
             message: "socket dropped before first event".to_string(),
             previous_response_missing: false,
+            no_upstream_attempt: false,
         };
         assert!(
             commit_or_fallback(Some(Err(error)), rx).is_err(),
@@ -698,8 +717,36 @@ mod tests {
         assert_eq!(error.response.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
             error.failure,
+            Some(crate::adapters::AdapterFailure::NoUpstreamAttempt)
+        );
+    }
+
+    #[test]
+    fn prior_websocket_attempt_preserves_transport_provenance() {
+        use super::{preserve_prior_ws_attempt, ws_connect_error, AuthMode, CodexWsError};
+
+        let local = ws_connect_error(
+            CodexWsError {
+                status: None,
+                retry_after: None,
+                body: String::new(),
+                message: "local retry failure".to_string(),
+                previous_response_missing: false,
+                no_upstream_attempt: true,
+            },
+            AuthMode::ChatgptOauth,
+        );
+        assert_eq!(
+            local.failure,
+            Some(crate::adapters::AdapterFailure::NoUpstreamAttempt)
+        );
+
+        let preserved = preserve_prior_ws_attempt(local);
+        assert_eq!(
+            preserved.failure,
             Some(crate::adapters::AdapterFailure::BeforeHeaders)
         );
+        assert_eq!(preserved.response.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[test]
@@ -715,9 +762,14 @@ mod tests {
                 body: String::new(),
                 message: "dns failure".to_string(),
                 previous_response_missing: false,
+                no_upstream_attempt: false,
             },
             AuthMode::ChatgptOauth,
         );
         assert_eq!(error.response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            error.failure,
+            Some(crate::adapters::AdapterFailure::BeforeHeaders)
+        );
     }
 }
