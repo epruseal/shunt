@@ -181,7 +181,8 @@ pub fn resolve_model_chain(config: &Config, model: &str) -> Vec<Route> {
     )]
 }
 
-fn route_for(
+/// Build a route with provider defaults for unspecified effort and service tier.
+pub(crate) fn route_for(
     config: &Config,
     provider: &str,
     model: &str,

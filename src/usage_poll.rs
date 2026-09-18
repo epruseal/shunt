@@ -5,9 +5,8 @@
 //! boot that periodically polls, for every imported (refreshable) account:
 //! `GET /api/oauth/usage` across all `claude_oauth` providers, and the private
 //! `GET /wham/usage` (see [`crate::auth::codex::usage`]) across all ChatGPT
-//! backend `chatgpt_oauth` providers — applying the returned utilization to the
-//! account pool via [`AccountPool::note_usage`] for Claude and the Codex-only
-//! [`AccountPool::note_codex_usage`] reconciliation path for wham.
+//! backend `chatgpt_oauth` providers. Both paths apply normalized quota and
+//! strict weekly evidence from the same response under one account health lock.
 //!
 //! Why: the pool's primary quota signal is the response headers on proxied
 //! traffic (`anthropic-ratelimit-unified-*` for Claude, `x-codex-*` for Codex),
@@ -208,17 +207,18 @@ async fn poll_account(
     let Credential::ClaudeOauth { access_token, .. } = credential else {
         return false;
     };
-    match claude::usage::fetch_usage(client, base_url, &access_token).await {
-        Ok(snapshot) => {
+    match claude::usage::fetch_usage_report(client, base_url, &access_token).await {
+        Ok(report) => {
             // The Claude parser intentionally accepts partial responses, but
             // an entirely unrecognizable 200 body also becomes an all-None
             // snapshot. Applying that would mark the account observed and let
             // `poll_all` dedup every other alias without any quota signal.
-            if snapshot.is_empty() {
+            if report.usage.is_empty() {
+                pool.invalidate_weekly_usage(provider, account, &report.weekly);
                 tracing::debug!(provider, account = %account.name, "usage poller: claude usage snapshot reported no windows, skipping");
                 return false;
             }
-            pool.note_usage(provider, account, &snapshot);
+            pool.note_claude_usage(provider, account, &report.usage, &report.weekly);
             tracing::debug!(provider, account = %account.name, "usage poller: applied usage snapshot");
             true
         }
@@ -275,6 +275,7 @@ async fn poll_codex_account(
             // let `poll_all`'s physical-account dedup skip every other alias,
             // permanently starving this account of a real observation.
             if report.usage.is_empty() {
+                pool.invalidate_weekly_usage(provider, account, &report.weekly);
                 tracing::debug!(provider, account = %account.name, "usage poller: codex wham usage snapshot reported no windows, skipping");
                 return false;
             }
@@ -284,6 +285,7 @@ async fn poll_codex_account(
                 &report.usage,
                 report.clear_five_hour,
                 report.clear_seven_day,
+                &report.weekly,
             );
             tracing::debug!(provider, account = %account.name, "usage poller: applied codex wham usage snapshot");
             true
@@ -365,6 +367,8 @@ fn codex_credential_file_has_refresh_token(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod weekly;
 
     fn write_temp(name: &str, contents: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
