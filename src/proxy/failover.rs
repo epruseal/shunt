@@ -166,6 +166,7 @@ pub(super) async fn forward(
                 body,
                 requested_model: &requested_model,
                 started_at,
+                stage_stamp,
             })
             .await;
     }

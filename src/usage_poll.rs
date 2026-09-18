@@ -5,9 +5,12 @@
 //! boot that periodically polls, for every imported (refreshable) account:
 //! `GET /api/oauth/usage` across all `claude_oauth` providers, and the private
 //! `GET /wham/usage` (see [`crate::auth::codex::usage`]) across all ChatGPT
-//! backend `chatgpt_oauth` providers — applying the returned utilization to the
-//! account pool via [`AccountPool::note_usage`] for Claude and the Codex-only
-//! [`AccountPool::note_codex_usage`] reconciliation path for wham.
+//! backend `chatgpt_oauth` providers — applying the returned utilization (and
+//! strict shared-weekly evidence) to the account pool via
+//! [`AccountPool::note_claude_usage`] for Claude and
+//! [`AccountPool::note_codex_usage`] for wham, and clearing stale weekly
+//! evidence with [`AccountPool::invalidate_weekly_usage`] when a recognizable
+//! report carries no windows.
 //!
 //! Why: the pool's primary quota signal is the response headers on proxied
 //! traffic (`anthropic-ratelimit-unified-*` for Claude, `x-codex-*` for Codex),

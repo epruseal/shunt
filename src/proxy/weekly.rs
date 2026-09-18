@@ -32,6 +32,10 @@ pub(super) struct Request<'a> {
     pub body: RequestBody,
     pub requested_model: &'a str,
     pub started_at: Instant,
+    /// The stage-router decision for this request, threaded through so the
+    /// final attempt still reports `x-gateway-routed-model` and
+    /// `x-gateway-route-source` exactly like the ordinary failover path.
+    pub stage_stamp: Option<failover::StageStamp<'a>>,
 }
 
 impl Policy {
@@ -257,7 +261,7 @@ impl Request<'_> {
                     &route.provider,
                     self.requested_model,
                     &route.upstream_model,
-                    None,
+                    self.stage_stamp,
                 );
                 Ok(failover::observe_response(
                     status,
@@ -273,7 +277,7 @@ impl Request<'_> {
                     &route.provider,
                     self.requested_model,
                     &route.upstream_model,
-                    None,
+                    self.stage_stamp,
                 );
                 Err(ForwardError {
                     message: error.message,
