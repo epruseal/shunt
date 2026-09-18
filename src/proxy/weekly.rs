@@ -405,4 +405,44 @@ mod tests {
         assert_eq!(policy.destination.service_tier.as_deref(), Some("flex"));
         assert_eq!(policy.auth_routes().len(), 3);
     }
+
+    /// The weekly policy is selected instead of the ordinary failover loop, so
+    /// it must reproduce that loop's stage-router headers. `finish` threads the
+    /// request's already-computed stamp into `stamp_gateway_headers`; dropping
+    /// it (passing `None`) silently loses `x-gateway-routed-model` and
+    /// `x-gateway-route-source` for every weekly-policy response.
+    #[tokio::test]
+    async fn finish_stamps_the_stage_router_headers_when_a_stamp_is_present() {
+        let config = config();
+        // `finish` never touches `state`; a default state avoids re-validating
+        // the test's enabled policy against the default passthrough providers.
+        let state = AppState::new(Config::default(), reqwest::Client::new()).unwrap();
+        let route = routing::resolve_model(&config, "claude-fable-5");
+        let uri: Uri = "/v1/messages".parse().unwrap();
+        let headers = HeaderMap::new();
+        let inbound = failover::InboundContext::for_test();
+        let request = Request {
+            state,
+            uri: &uri,
+            headers: &headers,
+            inbound: &inbound,
+            body: RequestBody::parse(b"{}".to_vec()).unwrap(),
+            requested_model: "claude-fable-5",
+            started_at: Instant::now(),
+            stage_stamp: Some(failover::StageStamp::for_test("claude-auto", "test-source")),
+        };
+        let result = Ok((
+            StatusCode::OK,
+            axum::response::Response::builder()
+                .status(StatusCode::OK)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        ));
+        let (_, response) = match request.finish(&route, result) {
+            Ok(ok) => ok,
+            Err(_) => panic!("finish on a successful attempt must return the response"),
+        };
+        assert_eq!(response.headers()["x-gateway-routed-model"], "claude-auto");
+        assert_eq!(response.headers()["x-gateway-route-source"], "test-source");
+    }
 }

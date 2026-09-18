@@ -593,6 +593,19 @@ pub(crate) struct InboundContext {
     static_client: bool,
 }
 
+impl InboundContext {
+    /// An unauthenticated context for tests that exercise downstream policy
+    /// paths without running the inbound-auth prelude.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            gateway_claims: None,
+            client: None,
+            static_client: false,
+        }
+    }
+}
+
 /// Authenticate once against the whole route chain. Client credential stripping
 /// is deferred to [`headers_for_route`] so a passthrough attempt retains the
 /// caller's upstream credential while credential-injecting attempts cannot leak
@@ -821,6 +834,18 @@ pub(super) struct StageStamp<'a> {
     /// router these differ whenever the target maps its own `upstream_model`.
     routed_model: &'a str,
     source: &'static str,
+}
+
+impl<'a> StageStamp<'a> {
+    /// A hand-built stamp for tests that assert the headers a stamped response
+    /// carries without driving a full stage-router request.
+    #[cfg(test)]
+    pub(super) fn for_test(routed_model: &'a str, source: &'static str) -> Self {
+        Self {
+            routed_model,
+            source,
+        }
+    }
 }
 
 pub(super) fn stamp_gateway_headers(
