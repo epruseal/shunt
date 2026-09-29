@@ -181,6 +181,11 @@ pub(super) async fn send_classified(context: &HttpSendContext) -> SendClassified
         context.upstream_body.as_ref(),
     )
     .await;
+    // The mark is consumed by the first send that reaches an upstream on
+    // either transport; the window it leaves is what the affinity headers
+    // carry, the same value a websocket handshake would.
+    let window =
+        super::codex_ws::window_for_turn(context.window_key.as_deref(), context.compact.take());
     let outcome = crate::retry::send_with_retry_with_safety(
         context.policy,
         &context.route.provider,
@@ -191,6 +196,8 @@ pub(super) async fn send_classified(context: &HttpSendContext) -> SendClassified
                 &context.route,
                 credential.clone(),
                 context.session_id.as_deref(),
+                context.delegation.as_ref(),
+                window,
                 body.clone(),
             )
         },
@@ -337,6 +344,15 @@ pub(super) struct HttpSendContext {
     /// stream before the send.
     pub(super) credential: Option<Credential>,
     pub(super) session_id: Option<String>,
+    /// The composed identity key the window counter keys on; `None` for an
+    /// unpoolable identity, which stays at window 0.
+    pub(super) window_key: Option<String>,
+    /// The request's one-shot compaction mark, consumed by this send when no
+    /// earlier dispatch of the turn reached an upstream.
+    pub(super) compact: crate::request::CompactionMark,
+    /// The delegated-turn subagent identity for the chatgpt arm's headers;
+    /// `None` for a non-delegated turn.
+    pub(super) delegation: Option<super::request::CodexDelegation>,
     /// The raw translated request; prepared (zstd admission + blocking-pool
     /// work) at send time inside the committed stream, so compression load
     /// cannot delay the committed response.

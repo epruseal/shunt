@@ -22,6 +22,7 @@ use crate::{
 };
 
 use super::body::{prepare_body, PreparedBody};
+use super::codex_ws::KEY_COMPONENT_SEPARATOR;
 use super::context::{CredentialSource, ForwardOptions, PoolForward, RelayOptions, TurnOptions};
 use super::early_stream::{
     bounded_input_estimate, estimated_machine_factory, http_events_stream, parsed_events,
@@ -88,6 +89,16 @@ pub(super) struct PoolStreamContext {
     pub(super) route: Route,
     pub(super) auth: AuthMode,
     pub(super) session_id: Option<String>,
+    /// The composed identity key the window counter keys on, so the HTTP
+    /// transports read (and, on the mark's consumption, bump) the same
+    /// counter the websocket path does.
+    pub(super) window_key: Option<String>,
+    /// The request's one-shot compaction mark, consumed by the first send
+    /// that reaches an upstream.
+    pub(super) compact: crate::request::CompactionMark,
+    /// The delegated-turn subagent identity for the chatgpt arm's headers;
+    /// `None` for a non-delegated turn.
+    pub(super) delegation: Option<super::request::CodexDelegation>,
     pub(super) upstream_body: std::sync::Arc<Value>,
     pub(super) accounts_config: std::sync::Arc<Vec<AccountConfig>>,
     pub(super) order: Vec<usize>,
@@ -116,6 +127,16 @@ pub(super) struct PoolStreamContext {
 /// translation inputs.
 pub(super) struct PoolForwardStream {
     pub session_id: Option<String>,
+    /// The composed identity key the window counter keys on, so the HTTP
+    /// transports read (and, on the mark's consumption, bump) the same
+    /// counter the websocket path does.
+    pub window_key: Option<String>,
+    /// The request's one-shot compaction mark, consumed by the first send
+    /// that reaches an upstream.
+    pub compact: crate::request::CompactionMark,
+    /// The delegated-turn subagent identity, derived once at the adapter from
+    /// the inbound headers; `None` for a non-delegated turn.
+    pub delegation: Option<super::request::CodexDelegation>,
     pub upstream_body: std::sync::Arc<Value>,
     pub turn: TurnOptions,
     pub estimate_input: Option<std::sync::Arc<Value>>,
@@ -138,6 +159,9 @@ pub(super) async fn forward_chatgpt_oauth_stream(
 ) -> Result<(StatusCode, axum::response::Response), AdapterError> {
     let PoolForwardStream {
         session_id,
+        window_key,
+        compact,
+        delegation,
         upstream_body,
         turn,
         estimate_input,
@@ -156,6 +180,9 @@ pub(super) async fn forward_chatgpt_oauth_stream(
             .unwrap_or(crate::retry::RetryPolicy::DISABLED),
         credential: None,
         session_id: session_id.clone(),
+        window_key: window_key.clone(),
+        compact: compact.clone(),
+        delegation: delegation.clone(),
         upstream_body: upstream_body.clone(),
         auth: AuthMode::ChatgptOauth,
         codex_quota_account: None,
@@ -203,6 +230,9 @@ pub(super) fn pool_or_single_events(
         state: AppState,
         route: Route,
         session_id: Option<String>,
+        window_key: Option<String>,
+        compact: crate::request::CompactionMark,
+        delegation: Option<super::request::CodexDelegation>,
         upstream_body: std::sync::Arc<Value>,
         single: HttpSendContext,
         single_credential: CredentialSource,
@@ -218,6 +248,9 @@ pub(super) fn pool_or_single_events(
             state,
             route,
             session_id,
+            window_key: single.window_key.clone(),
+            compact: single.compact.clone(),
+            delegation: single.delegation.clone(),
             upstream_body,
             single,
             single_credential,
@@ -231,6 +264,9 @@ pub(super) fn pool_or_single_events(
                         state,
                         route,
                         session_id,
+                        window_key,
+                        compact,
+                        delegation,
                         upstream_body,
                         single,
                         single_credential,
@@ -293,6 +329,9 @@ pub(super) fn pool_or_single_events(
                             route,
                             auth: AuthMode::ChatgptOauth,
                             session_id,
+                            window_key,
+                            compact,
+                            delegation,
                             upstream_body,
                             accounts_config,
                             order,
@@ -331,6 +370,9 @@ pub(super) fn pool_events_stream(
         route,
         auth,
         session_id,
+        window_key,
+        compact,
+        delegation,
         upstream_body,
         accounts_config,
         order,
@@ -364,6 +406,9 @@ pub(super) fn pool_events_stream(
             let route = route.clone();
             let accounts_config = accounts_config.clone();
             let session_id = session_id.clone();
+            let window_key = window_key.clone();
+            let compact = compact.clone();
+            let delegation = delegation.clone();
             let upstream_body = upstream_body.clone();
             async move {
                 let mut phase = phase;
@@ -545,11 +590,17 @@ pub(super) fn pool_events_stream(
                             // after admission, credential, and body preparation
                             // have all succeeded.
                             commit_reprobe_for_account(&mut reprobe, index);
+                            let window = super::codex_ws::window_for_turn(
+                                window_key.as_deref(),
+                                compact.take(),
+                            );
                             let upstream = match http_send(
                                 &state,
                                 &route,
                                 credential.clone(),
                                 session_id.as_deref(),
+                                delegation.as_ref(),
+                                window,
                                 body.clone(),
                             )
                             .await
@@ -692,11 +743,19 @@ pub(super) fn pool_events_stream(
                                             continue;
                                         }
                                     };
+                                    // The primary send consumed the mark; this
+                                    // reads the window it left.
+                                    let window = super::codex_ws::window_for_turn(
+                                        window_key.as_deref(),
+                                        compact.take(),
+                                    );
                                     let retry = match http_send(
                                         &state,
                                         &route,
                                         retry_credential,
                                         session_id.as_deref(),
+                                        delegation.as_ref(),
+                                        window,
                                         body.clone(),
                                     )
                                     .await
@@ -859,6 +918,8 @@ pub(super) async fn forward_chatgpt_oauth(
     let PoolForward {
         pool_key,
         session_id,
+        compact,
+        delegation,
         upstream_body,
         accounts_config,
         turn,
@@ -905,6 +966,9 @@ pub(super) async fn forward_chatgpt_oauth(
             route: route.clone(),
             auth: AuthMode::ChatgptOauth,
             session_id,
+            window_key: pool_key.clone(),
+            compact: compact.clone(),
+            delegation,
             upstream_body: upstream_body.clone(),
             accounts_config: std::sync::Arc::new(accounts_config),
             order,
@@ -979,20 +1043,34 @@ pub(super) async fn forward_chatgpt_oauth(
             continue;
         };
 
-        // Prefixing the pool key with the account name is the key point of
-        // this integration: without it, two accounts serving the same client
-        // session could reuse (and leak turn state across) one another's
-        // pooled websocket connection.
+        // Keying the pooled connection per account (and per turn identity, via
+        // the composed pool key) is the key point of this integration: without
+        // it, two accounts serving the same client session could reuse (and
+        // leak turn state across) one another's pooled websocket connection.
+        // The separator is [`KEY_COMPONENT_SEPARATOR`], the same one the pool
+        // key's own components use, so the bump sweep's suffix stays exact.
         let account_pool_key = pool_key
             .as_deref()
-            .map(|key| format!("{}::{key}", account.name));
+            .map(|key| format!("{}{KEY_COMPONENT_SEPARATOR}{key}", account.name));
 
         if ws_enabled {
             match forward_websocket(
                 &state,
                 &route,
-                account_pool_key.as_deref(),
-                session_id.as_deref(),
+                super::websocket::WsIdentity {
+                    pool_key: account_pool_key.as_deref(),
+                    window_key: pool_key.as_deref(),
+                    session_id: session_id.as_deref(),
+                    delegation: delegation.as_ref(),
+                    // The bump is once per TURN, on the first attempt that
+                    // actually reaches an upstream: the request's one-shot
+                    // mark is consumed by the first window computation, so an
+                    // admission failure on an earlier-ranked account (which
+                    // never reaches one) does not drop the mark, and every
+                    // later attempt — websocket or HTTP, any account — reads
+                    // the already-advanced window instead of bumping again.
+                    compact: compact.clone(),
+                },
                 ForwardOptions {
                     upstream_body: upstream_body.clone(),
                     auth,
@@ -1003,6 +1081,8 @@ pub(super) async fn forward_chatgpt_oauth(
                     // identical to the single-account path (see ForwardOptions).
                     estimate_input: estimate_input.clone(),
                     started_at: None,
+                    window_key: pool_key.clone(),
+                    compact: compact.clone(),
                 },
                 credential.clone(),
             )
@@ -1030,7 +1110,6 @@ pub(super) async fn forward_chatgpt_oauth(
                 Err(error) => return Err(error),
             }
         }
-
         // Prepared once per turn and reused by every later attempt: cloning it
         // is a refcount bump, whereas re-preparing would re-serialize and
         // re-compress the same body on each rotation. Borrow rather than clone
@@ -1058,11 +1137,17 @@ pub(super) async fn forward_chatgpt_oauth(
         // that never reaches this call is cancelled instead of consuming the
         // reprobe interval.
         commit_reprobe_for_account(&mut reprobe_reservation, index);
+        // The mark is consumed by the first send that reaches an upstream on
+        // either transport: a websocket attempt earlier in this dispatch
+        // already took it, so this reads the window it left.
+        let window = super::codex_ws::window_for_turn(pool_key.as_deref(), compact.take());
         let upstream = match http_send(
             &state,
             &route,
             credential.clone(),
             session_id.as_deref(),
+            delegation.as_ref(),
+            window,
             body.clone(),
         )
         .await
@@ -1151,11 +1236,16 @@ pub(super) async fn forward_chatgpt_oauth(
                             continue;
                         }
                     };
+                // The primary send consumed the mark; this reads the window
+                // it left.
+                let window = super::codex_ws::window_for_turn(pool_key.as_deref(), compact.take());
                 let retry = match http_send(
                     &state,
                     &route,
                     retry_credential,
                     session_id.as_deref(),
+                    delegation.as_ref(),
+                    window,
                     body.clone(),
                 )
                 .await
@@ -1816,6 +1906,522 @@ mod tests {
         }
     }
 
+    /// The pool path wires the window keys correctly end to end: the counter
+    /// keys on the unprefixed session key while the rotation evicts the
+    /// ACCOUNT-prefixed socket, so a compaction-marked turn always handshakes
+    /// with the advanced window id. The mock records each handshake's
+    /// `x-codex-window-id`; two marked turns must produce `sess-1:1` then
+    /// `sess-1:2` on two separate sockets (a surviving pooled socket would
+    /// mean the bump failed to rotate on this path).
+    #[tokio::test]
+    async fn pool_path_advances_the_window_and_rotates_the_socket() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+        use tungstenite::handshake::server::Request;
+        use tungstenite::protocol::WebSocketConfig;
+        use tungstenite::Message;
+
+        use crate::adapters::responses::codex_ws::{
+            clear_pool_for_tests, pool_contains_for_tests, window_for, POOL_TEST_LOCK,
+        };
+        use futures_util::{SinkExt, StreamExt};
+
+        let _env = ENV_LOCK.lock().await;
+        let _pool_guard = POOL_TEST_LOCK.lock().await;
+        let _token_a =
+            crate::auth::shared::EnvVarGuard::set("SHUNT_POOL_PROBE_A", probe_token("acc-a"));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let windows: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let server_windows = windows.clone();
+        let server_accepts = accepts.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (socket, _) = listener.accept().await.unwrap();
+                server_accepts.fetch_add(1, Ordering::SeqCst);
+                let recorder = {
+                    let server_windows = server_windows.clone();
+                    #[allow(clippy::result_large_err)]
+                    move |request: &Request,
+                          response: tungstenite::handshake::server::Response|
+                          -> Result<
+                        tungstenite::handshake::server::Response,
+                        tungstenite::handshake::server::ErrorResponse,
+                    > {
+                        server_windows.lock().unwrap().push(
+                            request
+                                .headers()
+                                .get("x-codex-window-id")
+                                .map(|value| value.to_str().unwrap().to_string())
+                                .unwrap_or_default(),
+                        );
+                        Ok(response)
+                    }
+                };
+                let mut ws = tokio_tungstenite::accept_hdr_async_with_config(
+                    socket,
+                    recorder,
+                    Some(WebSocketConfig::default()),
+                )
+                .await
+                .unwrap();
+                while let Some(message) = ws.next().await {
+                    match message.unwrap() {
+                        Message::Text(_) => {
+                            for event in [
+                                r#"{"type":"response.created","response":{"id":"resp_1"}}"#,
+                                r#"{"type":"response.output_text.delta","delta":"hi"}"#,
+                                r#"{"type":"response.completed","response":{}}"#,
+                            ] {
+                                ws.send(Message::Text(event.to_string().into()))
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                        Message::Ping(data) => ws.send(Message::Pong(data)).await.unwrap(),
+                        Message::Pong(_) => {}
+                        Message::Close(_) => break,
+                        other => panic!("unexpected frame: {other:?}"),
+                    }
+                }
+            }
+        });
+
+        let mut config = Config::default();
+        config.providers.get_mut("codex").unwrap().base_url = format!("http://{addr}");
+        config.providers.get_mut("codex").unwrap().websocket = true;
+        let state = AppState::new(config, reqwest::Client::new()).unwrap();
+        let accounts = vec![pool_account("acc-a", "SHUNT_POOL_PROBE_A")];
+
+        for expected in ["sess-1:1", "sess-1:2"] {
+            let turn = pool_turn(accounts.clone(), false);
+            let (status, _response) = forward_chatgpt_oauth(
+                state.clone(),
+                pool_route(),
+                PoolForward {
+                    pool_key: Some("sess-1".to_string()),
+                    session_id: Some("sess-1".to_string()),
+                    compact: crate::request::CompactionMark::armed(true),
+                    ..turn
+                },
+            )
+            .await
+            .expect("marked pool turn succeeds");
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                *windows.lock().unwrap().last().unwrap(),
+                expected,
+                "each marked turn handshakes with the advanced window"
+            );
+            let window_number: u64 = expected.rsplit(':').next().unwrap().parse().unwrap();
+            assert_eq!(
+                window_for("sess-1"),
+                window_number,
+                "the counter keys on the unprefixed session key, never the account key"
+            );
+            if window_number == 1 {
+                assert!(
+                    pool_contains_for_tests("acc-a\u{1f}sess-1"),
+                    "the socket pools under the account-prefixed connection key"
+                );
+            }
+        }
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "each turn handshook afresh"
+        );
+        clear_pool_for_tests();
+        server.abort();
+    }
+
+    /// A compaction-marked turn bumps the counter ONCE per turn, never once
+    /// per account attempt: when the first account's WS handshake is refused
+    /// and its HTTP fallback dies, the failover to the second account must
+    /// handshake with the SAME advanced window, not bump again. The mock
+    /// serves three connections: A's refused WS upgrade, A's killed HTTP
+    /// fallback, B's recorded WS turn.
+    #[tokio::test]
+    async fn pool_path_bumps_once_across_a_failover() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tungstenite::handshake::server::Request;
+        use tungstenite::protocol::WebSocketConfig;
+        use tungstenite::Message;
+
+        use crate::adapters::responses::codex_ws::{
+            clear_pool_for_tests, window_for, POOL_TEST_LOCK,
+        };
+        use futures_util::{SinkExt, StreamExt};
+
+        let _env = ENV_LOCK.lock().await;
+        let _pool_guard = POOL_TEST_LOCK.lock().await;
+        let _token_a =
+            crate::auth::shared::EnvVarGuard::set("SHUNT_POOL_PROBE_A", probe_token("acc-a"));
+        let _token_b =
+            crate::auth::shared::EnvVarGuard::set("SHUNT_POOL_PROBE_B", probe_token("acc-b"));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let windows: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let server_windows = windows.clone();
+        let server_accepts = accepts.clone();
+        let server = tokio::spawn(async move {
+            // 1: A's WS handshake, refused with 429.
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0_u8; 2048];
+            let _ = socket.read(&mut buffer).await;
+            socket
+                .write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            // 2: A's HTTP fallback, killed (a transport error rotates).
+            let (socket, _) = listener.accept().await.unwrap();
+            drop(socket);
+            // 3: B's WS turn, handshake recorded and turn served.
+            let (socket, _) = listener.accept().await.unwrap();
+            server_accepts.fetch_add(3, Ordering::SeqCst);
+            let recorder = {
+                let server_windows = server_windows.clone();
+                #[allow(clippy::result_large_err)]
+                move |request: &Request,
+                      response: tungstenite::handshake::server::Response|
+                      -> Result<
+                    tungstenite::handshake::server::Response,
+                    tungstenite::handshake::server::ErrorResponse,
+                > {
+                    server_windows.lock().unwrap().push(
+                        request
+                            .headers()
+                            .get("x-codex-window-id")
+                            .map(|value| value.to_str().unwrap().to_string())
+                            .unwrap_or_default(),
+                    );
+                    Ok(response)
+                }
+            };
+            let mut ws = tokio_tungstenite::accept_hdr_async_with_config(
+                socket,
+                recorder,
+                Some(WebSocketConfig::default()),
+            )
+            .await
+            .unwrap();
+            while let Some(message) = ws.next().await {
+                match message.unwrap() {
+                    Message::Text(_) => {
+                        for event in [
+                            r#"{"type":"response.created","response":{"id":"resp_1"}}"#,
+                            r#"{"type":"response.output_text.delta","delta":"hi"}"#,
+                            r#"{"type":"response.completed","response":{}}"#,
+                        ] {
+                            ws.send(Message::Text(event.to_string().into()))
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    Message::Ping(data) => ws.send(Message::Pong(data)).await.unwrap(),
+                    Message::Pong(_) => {}
+                    Message::Close(_) => break,
+                    other => panic!("unexpected frame: {other:?}"),
+                }
+            }
+        });
+
+        let mut config = Config::default();
+        config.providers.get_mut("codex").unwrap().base_url = format!("http://{addr}");
+        config.providers.get_mut("codex").unwrap().websocket = true;
+        let state = AppState::new(config, reqwest::Client::new()).unwrap();
+        let accounts = vec![
+            pool_account("acc-a", "SHUNT_POOL_PROBE_A"),
+            pool_account("acc-b", "SHUNT_POOL_PROBE_B"),
+        ];
+        let turn = pool_turn(accounts, false);
+        let (status, _response) = forward_chatgpt_oauth(
+            state.clone(),
+            pool_route(),
+            PoolForward {
+                pool_key: Some("sess-1".to_string()),
+                session_id: Some("sess-1".to_string()),
+                compact: crate::request::CompactionMark::armed(true),
+                ..turn
+            },
+        )
+        .await
+        .expect("marked turn succeeds on the failover account");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            *windows.lock().unwrap().last().unwrap(),
+            "sess-1:1",
+            "the failover handshake carries the once-bumped window"
+        );
+        assert_eq!(
+            window_for("sess-1"),
+            1,
+            "one compaction mark bumps exactly once, across all attempts"
+        );
+        clear_pool_for_tests();
+        server.abort();
+    }
+
+    /// A marked turn whose first-ranked account fails admission must still
+    /// bump: the mark rides the first attempt that actually reaches the
+    /// websocket, matching the committed single-route path's semantics. The
+    /// mock accepts once — the cooled account never connects, the serving
+    /// account's handshake carries the advanced window.
+    #[tokio::test]
+    async fn pool_path_bumps_when_the_first_account_fails_admission() {
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+        use tungstenite::handshake::server::Request;
+        use tungstenite::protocol::WebSocketConfig;
+        use tungstenite::Message;
+
+        use crate::adapters::responses::codex_ws::{
+            clear_pool_for_tests, window_for, POOL_TEST_LOCK,
+        };
+        use futures_util::{SinkExt, StreamExt};
+
+        let _env = ENV_LOCK.lock().await;
+        let _pool_guard = POOL_TEST_LOCK.lock().await;
+        let _token_b =
+            crate::auth::shared::EnvVarGuard::set("SHUNT_POOL_PROBE_B", probe_token("acc-b"));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let windows: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let server_windows = windows.clone();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let recorder = {
+                let server_windows = server_windows.clone();
+                #[allow(clippy::result_large_err)]
+                move |request: &Request,
+                      response: tungstenite::handshake::server::Response|
+                      -> Result<
+                    tungstenite::handshake::server::Response,
+                    tungstenite::handshake::server::ErrorResponse,
+                > {
+                    server_windows.lock().unwrap().push(
+                        request
+                            .headers()
+                            .get("x-codex-window-id")
+                            .map(|value| value.to_str().unwrap().to_string())
+                            .unwrap_or_default(),
+                    );
+                    Ok(response)
+                }
+            };
+            let mut ws = tokio_tungstenite::accept_hdr_async_with_config(
+                socket,
+                recorder,
+                Some(WebSocketConfig::default()),
+            )
+            .await
+            .unwrap();
+            while let Some(message) = ws.next().await {
+                match message.unwrap() {
+                    Message::Text(_) => {
+                        for event in [
+                            r#"{"type":"response.created","response":{"id":"resp_1"}}"#,
+                            r#"{"type":"response.output_text.delta","delta":"hi"}"#,
+                            r#"{"type":"response.completed","response":{}}"#,
+                        ] {
+                            ws.send(Message::Text(event.to_string().into()))
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    Message::Ping(data) => ws.send(Message::Pong(data)).await.unwrap(),
+                    Message::Pong(_) => {}
+                    Message::Close(_) => break,
+                    other => panic!("unexpected frame: {other:?}"),
+                }
+            }
+        });
+
+        let mut config = Config::default();
+        config.providers.get_mut("codex").unwrap().base_url = format!("http://{addr}");
+        config.providers.get_mut("codex").unwrap().websocket = true;
+        let state = AppState::new(config, reqwest::Client::new()).unwrap();
+        let accounts = vec![
+            // A never-resolving credential fails admission deterministically:
+            // the token env name is guaranteed unset, so `resolve_or_cooldown`
+            // returns None and the loop rotates before any connect. Listed
+            // first, and NO cooldown: a cooldown would demote it in the
+            // selection order instead of failing its admission.
+            pool_account("acc-a", "SHUNT_POOL_PROBE_NEVER_SET_9F3A"),
+            pool_account("acc-b", "SHUNT_POOL_PROBE_B"),
+        ];
+        let turn = pool_turn(accounts, false);
+        let (status, _response) = forward_chatgpt_oauth(
+            state.clone(),
+            pool_route(),
+            PoolForward {
+                pool_key: Some("sess-1".to_string()),
+                session_id: Some("sess-1".to_string()),
+                compact: crate::request::CompactionMark::armed(true),
+                ..turn
+            },
+        )
+        .await
+        .expect("marked turn succeeds on the serving account");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            _response.headers().get("x-shunt-account").unwrap(),
+            "acc-b",
+            "account A failed admission, so B is the account that served"
+        );
+        assert_eq!(
+            *windows.lock().unwrap().last().unwrap(),
+            "sess-1:1",
+            "the serving account's handshake carries the advanced window"
+        );
+        assert_eq!(
+            window_for("sess-1"),
+            1,
+            "the mark bumps on the first attempt that actually runs"
+        );
+        clear_pool_for_tests();
+        server.abort();
+    }
+
+    /// A compaction bump rotates the conversation's sockets under EVERY
+    /// account, not only the one serving the marked turn: a socket left
+    /// pooled on the pre-compaction window under another account is reused
+    /// the moment the sticky account changes (dbbb7a5's per-model cooldown is
+    /// one trigger). The mock serves two clean WS turns: turn 1 pools the
+    /// conversation under acc-b, turn 2 (marked, served by acc-a) must evict
+    /// acc-b's socket along with its own.
+    #[tokio::test]
+    async fn pool_path_bump_evicts_the_conversations_sockets_under_every_account() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+        use tungstenite::protocol::WebSocketConfig;
+        use tungstenite::Message;
+
+        use crate::adapters::responses::codex_ws::{
+            clear_pool_for_tests, pool_contains_for_tests, window_for, POOL_TEST_LOCK,
+        };
+        use futures_util::{SinkExt, StreamExt};
+
+        let _env = ENV_LOCK.lock().await;
+        let _pool_guard = POOL_TEST_LOCK.lock().await;
+        let _token_b =
+            crate::auth::shared::EnvVarGuard::set("SHUNT_POOL_PROBE_B", probe_token("acc-b"));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let server_accepts = accepts.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (socket, _) = listener.accept().await.unwrap();
+                server_accepts.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut ws = tokio_tungstenite::accept_async_with_config(
+                        socket,
+                        Some(WebSocketConfig::default()),
+                    )
+                    .await
+                    .unwrap();
+                    while let Some(message) = ws.next().await {
+                        match message.unwrap() {
+                            Message::Text(_) => {
+                                for event in [
+                                    r#"{"type":"response.created","response":{"id":"resp_1"}}"#,
+                                    r#"{"type":"response.output_text.delta","delta":"hi"}"#,
+                                    r#"{"type":"response.completed","response":{}}"#,
+                                ] {
+                                    ws.send(Message::Text(event.to_string().into()))
+                                        .await
+                                        .unwrap();
+                                }
+                            }
+                            Message::Ping(data) => ws.send(Message::Pong(data)).await.unwrap(),
+                            Message::Pong(_) => {}
+                            Message::Close(_) => break,
+                            other => panic!("unexpected frame: {other:?}"),
+                        }
+                    }
+                });
+            }
+        });
+
+        let mut config = Config::default();
+        config.providers.get_mut("codex").unwrap().base_url = format!("http://{addr}");
+        config.providers.get_mut("codex").unwrap().websocket = true;
+        let state = AppState::new(config, reqwest::Client::new()).unwrap();
+
+        // Turn 1: only acc-b is resolvable, so it serves and pools the
+        // conversation's socket under acc-b.
+        let (status, response) = forward_chatgpt_oauth(
+            state.clone(),
+            pool_route(),
+            PoolForward {
+                pool_key: Some("sess-1".to_string()),
+                session_id: Some("sess-1".to_string()),
+                ..pool_turn(vec![pool_account("acc-b", "SHUNT_POOL_PROBE_B")], false)
+            },
+        )
+        .await
+        .expect("turn 1 serves on acc-b");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-shunt-account").unwrap(),
+            "acc-b",
+            "turn 1 is served by acc-b, the only resolvable account"
+        );
+        assert!(
+            pool_contains_for_tests("acc-b\u{1f}sess-1"),
+            "turn 1 pools the socket under acc-b"
+        );
+
+        // Turn 2: compaction-marked, served by acc-a (now resolvable, ranked
+        // first). The bump must evict acc-b's pre-compaction socket along
+        // with acc-a's own.
+        let _token_a =
+            crate::auth::shared::EnvVarGuard::set("SHUNT_POOL_PROBE_A", probe_token("acc-a"));
+        let (status, _) = forward_chatgpt_oauth(
+            state.clone(),
+            pool_route(),
+            PoolForward {
+                pool_key: Some("sess-1".to_string()),
+                session_id: Some("sess-1".to_string()),
+                compact: crate::request::CompactionMark::armed(true),
+                ..pool_turn(
+                    vec![
+                        pool_account("acc-a", "SHUNT_POOL_PROBE_A"),
+                        pool_account("acc-b", "SHUNT_POOL_PROBE_B"),
+                    ],
+                    false,
+                )
+            },
+        )
+        .await
+        .expect("marked turn serves on acc-a");
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !pool_contains_for_tests("acc-b\u{1f}sess-1"),
+            "the bump evicts the conversation's socket under the OTHER account"
+        );
+        assert_eq!(window_for("sess-1"), 1, "one compaction mark bumps once");
+        assert!(
+            pool_contains_for_tests("acc-a\u{1f}sess-1"),
+            "the post-bump socket pools under the serving account"
+        );
+
+        clear_pool_for_tests();
+        server.abort();
+    }
+
     fn pool_state(base_url: String) -> AppState {
         let mut config = Config::default();
         config.providers.get_mut("codex").unwrap().base_url = base_url;
@@ -1837,6 +2443,8 @@ mod tests {
         PoolForward {
             pool_key: None,
             session_id: None,
+            compact: crate::request::CompactionMark::default(),
+            delegation: None,
             upstream_body: std::sync::Arc::new(json!({"input": []})),
             accounts_config: accounts,
             turn: TurnOptions {
@@ -2725,6 +3333,9 @@ mod tests {
             route: route.clone(),
             auth: AuthMode::ChatgptOauth,
             session_id: None,
+            window_key: None,
+            compact: crate::request::CompactionMark::default(),
+            delegation: None,
             upstream_body: std::sync::Arc::new(json!({"input": []})),
             accounts_config: std::sync::Arc::new(accounts),
             order,
@@ -2875,6 +3486,9 @@ mod tests {
             policy: crate::retry::RetryPolicy::DISABLED,
             credential: None,
             session_id: None,
+            window_key: None,
+            compact: crate::request::CompactionMark::default(),
+            delegation: None,
             upstream_body: std::sync::Arc::new(json!({"input": []})),
             auth: AuthMode::ChatgptOauth,
             codex_quota_account: None,
@@ -2915,6 +3529,9 @@ mod tests {
             policy: crate::retry::RetryPolicy::DISABLED,
             credential: None,
             session_id: None,
+            window_key: None,
+            compact: crate::request::CompactionMark::default(),
+            delegation: None,
             upstream_body: std::sync::Arc::new(json!({"input": []})),
             auth: AuthMode::ChatgptOauth,
             codex_quota_account: None,
@@ -2968,6 +3585,9 @@ mod tests {
             policy: crate::retry::RetryPolicy::DISABLED,
             credential: None,
             session_id: None,
+            window_key: None,
+            compact: crate::request::CompactionMark::default(),
+            delegation: None,
             upstream_body: std::sync::Arc::new(json!({"input": []})),
             auth: AuthMode::ApiKey,
             codex_quota_account: None,
@@ -3029,6 +3649,9 @@ mod tests {
             policy: crate::retry::RetryPolicy::DISABLED,
             credential: None,
             session_id: None,
+            window_key: None,
+            compact: crate::request::CompactionMark::default(),
+            delegation: None,
             upstream_body: std::sync::Arc::new(json!({"input": []})),
             auth: AuthMode::ChatgptOauth,
             codex_quota_account: None,

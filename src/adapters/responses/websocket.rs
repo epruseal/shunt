@@ -24,6 +24,22 @@ use super::error::build_upstream_error;
 use super::request::{responses_url, routing_hint, CODEX_CLIENT_VERSION, CODEX_USER_AGENT};
 use super::ws_stream::{json_events_response, stream_events_response};
 
+/// The identity inputs for a turn's handshake headers: the connection pool
+/// key (the turn's thread scope — the child's on a delegated turn — and
+/// account-prefixed on the pool path), the window-counter key (the same scope
+/// unprefixed by the account, so an account rotation cannot reset the
+/// conversation's window), the effective session id, the request's one-shot
+/// compaction mark (consumed by this turn's window computation if no earlier
+/// dispatch of the same turn reached an upstream), and the delegated-turn
+/// subagent identity (child thread id + markers) when the turn is a child's.
+pub(super) struct WsIdentity<'a> {
+    pub(super) pool_key: Option<&'a str>,
+    pub(super) window_key: Option<&'a str>,
+    pub(super) session_id: Option<&'a str>,
+    pub(super) compact: crate::request::CompactionMark,
+    pub(super) delegation: Option<&'a super::request::CodexDelegation>,
+}
+
 /// Drive a turn over the Codex Responses WebSocket v2 transport (issue #32).
 /// Reuses the session's pooled connection and, when the current input is an
 /// append-only extension of the previous turn, sends only the delta with
@@ -33,8 +49,7 @@ use super::ws_stream::{json_events_response, stream_events_response};
 pub(super) async fn forward_websocket(
     state: &AppState,
     route: &Route,
-    pool_key: Option<&str>,
-    session_id: Option<&str>,
+    identity: WsIdentity<'_>,
     forward: ForwardOptions,
     credential: Credential,
 ) -> Result<(StatusCode, axum::response::Response), AdapterError> {
@@ -45,10 +60,34 @@ pub(super) async fn forward_websocket(
         codex_quota_account,
         estimate_input,
         started_at: _,
+        // The websocket attempt's mark and window key arrive through
+        // `identity` below; `forward`'s copies exist for the HTTP fallback,
+        // which this function never drives itself.
+        window_key: _,
+        compact: _,
     } = forward;
+    let WsIdentity {
+        pool_key,
+        window_key,
+        session_id,
+        compact,
+        delegation,
+    } = identity;
     let pool_key = pool_key.filter(|key| !key.is_empty());
     let http_url = responses_url(&state.config, &route.provider);
     let ws_url = codex_ws::to_websocket_url(&http_url).map_err(ws_transport_error)?;
+    // The handshake's `x-codex-window-id` carries the conversation's compaction
+    // window: the request's one-shot mark is consumed here — the first window
+    // computation of the turn, which is the first dispatch that reaches an
+    // upstream — bumping the counter and rotating the socket; every later
+    // dispatch of the same turn (route failover, a gated REDO, the HTTP
+    // fallback below) takes an already-consumed mark and reads the advanced
+    // window. The counter keys on `window_key` — the turn's thread scope (the
+    // child's on a delegated turn), unprefixed by the account name so an
+    // account rotation cannot reset it — and the bump sweeps the
+    // conversation's sockets under every account, not just this attempt's
+    // (see `window_for_turn`).
+    let window = codex_ws::window_for_turn(window_key, compact.take());
     let ctx = WsTurnContext {
         ws_url,
         pool_key,
@@ -61,8 +100,19 @@ pub(super) async fn forward_websocket(
         signature: codex_continuation::signature(&upstream_body),
         upstream_body,
         routing_hint: routing_hint(route),
+        window,
+        delegation,
     };
-    tracing::debug!(provider = %route.provider, ws_url = %ctx.ws_url, pool_key = pool_key.unwrap_or(""), "opening codex websocket");
+    // The internal key composes with a control-byte separator; render it with
+    // `:` so the log line stays readable.
+    tracing::debug!(
+        provider = %route.provider,
+        ws_url = %ctx.ws_url,
+        pool_key = pool_key
+            .unwrap_or("")
+            .replace(codex_ws::KEY_COMPONENT_SEPARATOR, ":"),
+        "opening codex websocket"
+    );
 
     // Overlap the CPU-bound tiktoken encode with the websocket connect (same
     // rationale as forward_http); its result is only consumed once the event
@@ -120,10 +170,10 @@ pub(super) async fn forward_websocket(
 struct WsTurnContext<'a> {
     ws_url: String,
     pool_key: Option<&'a str>,
-    /// The inbound `x-claude-code-session-id` header, the conversation id that
-    /// becomes the `session-id`/`thread-id` handshake headers (the backend
-    /// derives prompt-cache affinity from it) and the body's
-    /// `prompt_cache_key`.
+    /// The effective conversation id (the inbound `x-claude-code-session-id`
+    /// header or a parsed metadata session), which becomes the handshake
+    /// session-identity headers (the backend derives prompt-cache affinity
+    /// from `session-id`) and the body's `prompt_cache_key`.
     session_id: Option<&'a str>,
     provider: &'a str,
     /// Shared, not borrowed: the `codex.rate_limits` tap outlives this context
@@ -142,6 +192,15 @@ struct WsTurnContext<'a> {
     /// builds it at connection time — and it is a routing *hint*, not a routing
     /// decision, so a stale one costs nothing.
     routing_hint: Option<HeaderValue>,
+    /// The compaction-window index the handshake's `x-codex-window-id` carries
+    /// (`{session}:{window}`). Computed once per turn in [`forward_websocket`]:
+    /// a compaction-marked turn bumps the pooled counter, every other turn
+    /// reads the current window, and an unpoolable session stays 0.
+    window: u64,
+    /// The delegated-turn subagent identity for the handshake headers, when
+    /// this turn is a child's (`{session}::{agent}` thread id + the two
+    /// markers); `None` sends the plain session headers.
+    delegation: Option<&'a super::request::CodexDelegation>,
 }
 
 /// The first event, peeked off the stream before the websocket response is
@@ -335,6 +394,8 @@ async fn start_ws_turn(
         ctx.credential.clone(),
         ctx.routing_hint.as_ref(),
         ctx.session_id,
+        ctx.window,
+        ctx.delegation,
     )?;
     let turn = codex_ws::begin(&ctx.ws_url, headers, ctx.pool_key, ctx.provider)
         .await
@@ -432,6 +493,8 @@ fn websocket_headers(
     credential: Credential,
     routing_hint: Option<&HeaderValue>,
     session_id: Option<&str>,
+    window: u64,
+    delegation: Option<&super::request::CodexDelegation>,
 ) -> Result<HeaderMap, AdapterError> {
     let mut headers = HeaderMap::new();
     // Set only on the ChatGPT OAuth arm; inserted after the match (see there).
@@ -463,9 +526,30 @@ fn websocket_headers(
             // Same session identity the HTTP transport sends: the backend
             // derives prompt-cache affinity from `session-id`, and its value
             // must equal the body's `prompt_cache_key` (see `request.rs`).
+            // The window id advances on compaction-marked turns (see
+            // `forward_websocket`); the HTTP transport stays `:0`.
+            // A delegated turn swaps `thread-id` for the child's derived id
+            // and adds the two subagent markers, and every thread-derived id
+            // — `x-client-request-id` and the window id's identity part —
+            // carries the child's, exactly as codex builds them from its
+            // thread metadata.
             if let Some(session_id) = session_id.filter(|id| !id.is_empty()) {
+                let thread_id =
+                    delegation.map_or(session_id, |delegation| delegation.thread_id.as_str());
                 set("session-id", session_id.to_string())?;
-                set("thread-id", session_id.to_string())?;
+                match delegation {
+                    Some(delegation) => {
+                        set("thread-id", delegation.thread_id.clone())?;
+                        set(
+                            "x-codex-parent-thread-id",
+                            delegation.parent_thread_id.clone(),
+                        )?;
+                        set("x-openai-subagent", delegation.subagent.clone())?;
+                    }
+                    None => set("thread-id", session_id.to_string())?,
+                }
+                set("x-client-request-id", thread_id.to_string())?;
+                set("x-codex-window-id", format!("{thread_id}:{window}"))?;
             }
             // Deliberately not through `set`: every other header must fail the
             // turn on a malformed value, but the routing hint is built from the
@@ -778,7 +862,7 @@ mod tests {
             },
         ];
         for credential in cases {
-            let headers = websocket_headers(credential, Some(&hint()), Some("sess-1"))
+            let headers = websocket_headers(credential, Some(&hint()), Some("sess-1"), 0, None)
                 .expect("valid credential builds headers");
             assert_eq!(headers.get("openai-beta").unwrap(), WEBSOCKET_BETA_PROTOCOL);
             assert!(headers
@@ -791,6 +875,8 @@ mod tests {
             assert!(headers.get("originator").is_none());
             assert!(headers.get("session-id").is_none());
             assert!(headers.get("thread-id").is_none());
+            assert!(headers.get("x-client-request-id").is_none());
+            assert!(headers.get("x-codex-window-id").is_none());
             // Upstream suppresses the routing hint for api-key/bearer providers.
             assert!(headers.get("x-codex-routing-hint").is_none());
         }
@@ -811,6 +897,8 @@ mod tests {
                 "model=gpt-5.6-sol;tier=priority",
             )),
             Some("session-123"),
+            0,
+            None,
         )
         .expect("valid credential builds headers");
         assert_eq!(
@@ -819,6 +907,8 @@ mod tests {
         );
         assert_eq!(headers.get("session-id").unwrap(), "session-123");
         assert_eq!(headers.get("thread-id").unwrap(), "session-123");
+        assert_eq!(headers.get("x-client-request-id").unwrap(), "session-123");
+        assert_eq!(headers.get("x-codex-window-id").unwrap(), "session-123:0");
     }
 
     #[test]
@@ -864,6 +954,8 @@ mod tests {
                 },
                 routing_hint(&route).as_ref(),
                 None,
+                0,
+                None,
             )
             .expect("an unusable model must not fail the handshake build");
             assert!(
@@ -873,6 +965,64 @@ mod tests {
             // Only the hint is dropped; the rest of the identity still goes out.
             assert_eq!(headers.get("originator").unwrap(), "codex_cli_rs");
         }
+    }
+
+    #[test]
+    fn websocket_handshake_carries_the_advanced_window_id() {
+        use super::{websocket_headers, Credential};
+
+        let headers = websocket_headers(
+            Credential::ChatGptOAuth {
+                access_token: "access-token".to_string(),
+                account_id: "account-id".to_string(),
+            },
+            None,
+            Some("session-123"),
+            1,
+            None,
+        )
+        .expect("valid credential builds headers");
+        assert_eq!(headers.get("x-codex-window-id").unwrap(), "session-123:1");
+    }
+
+    #[test]
+    fn websocket_handshake_carries_the_delegated_subagent_markers() {
+        use super::{websocket_headers, Credential};
+        use crate::adapters::responses::request::CodexDelegation;
+
+        let headers = websocket_headers(
+            Credential::ChatGptOAuth {
+                access_token: "access-token".to_string(),
+                account_id: "account-id".to_string(),
+            },
+            None,
+            Some("session-123"),
+            0,
+            Some(&CodexDelegation {
+                thread_id: "session-123::agent-7".to_string(),
+                parent_thread_id: "session-123".to_string(),
+                subagent: "Explore".to_string(),
+                agent_id: "agent-7".to_string(),
+            }),
+        )
+        .expect("valid credential builds headers");
+        assert_eq!(headers.get("session-id").unwrap(), "session-123");
+        assert_eq!(headers.get("thread-id").unwrap(), "session-123::agent-7");
+        assert_eq!(
+            headers.get("x-codex-parent-thread-id").unwrap(),
+            "session-123"
+        );
+        assert_eq!(headers.get("x-openai-subagent").unwrap(), "Explore");
+        // Every thread-derived id — request id and window id included —
+        // carries the child identity; only `session-id` stays the parent's.
+        assert_eq!(
+            headers.get("x-client-request-id").unwrap(),
+            "session-123::agent-7"
+        );
+        assert_eq!(
+            headers.get("x-codex-window-id").unwrap(),
+            "session-123::agent-7:0"
+        );
     }
 
     #[test]
@@ -886,10 +1036,14 @@ mod tests {
             },
             Some(&hint()),
             Some(""),
+            0,
+            None,
         )
         .expect("valid credential builds headers");
         assert!(headers.get("session-id").is_none());
         assert!(headers.get("thread-id").is_none());
+        assert!(headers.get("x-client-request-id").is_none());
+        assert!(headers.get("x-codex-window-id").is_none());
         assert_eq!(headers.get("originator").unwrap(), "codex_cli_rs");
     }
 
@@ -900,7 +1054,8 @@ mod tests {
 
         // Passthrough is a misconfiguration on this transport: no credential is
         // attached, leaving the upstream to reject it.
-        let headers = websocket_headers(Credential::Passthrough, Some(&hint()), None).unwrap();
+        let headers =
+            websocket_headers(Credential::Passthrough, Some(&hint()), None, 0, None).unwrap();
         assert_eq!(headers.get("openai-beta").unwrap(), WEBSOCKET_BETA_PROTOCOL);
         assert!(headers.get("authorization").is_none());
         assert!(headers.get("x-codex-routing-hint").is_none());
@@ -922,6 +1077,8 @@ mod tests {
             },
             Some(&hint()),
             None,
+            0,
+            None,
         )
         .unwrap();
         assert_eq!(headers.get("openai-beta").unwrap(), WEBSOCKET_BETA_PROTOCOL);
@@ -942,6 +1099,8 @@ mod tests {
                 account_id: "bad\nid".to_string(),
             },
             Some(&hint()),
+            None,
+            0,
             None,
         )
         .expect_err("a malformed header value is rejected");

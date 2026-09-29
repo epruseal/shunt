@@ -42,12 +42,16 @@ pub(super) async fn http_send(
     route: &Route,
     credential: Credential,
     session_id: Option<&str>,
+    delegation: Option<&super::request::CodexDelegation>,
+    window: u64,
     body: PreparedBody,
 ) -> Result<reqwest::Response, crate::upstream_timeout::SendError<reqwest::Error>> {
     crate::upstream_timeout::wait(
         state.config.server.timeouts.upstream_ttfb_ms,
-        body.attach(request_builder(state, route, credential, session_id))
-            .send(),
+        body.attach(request_builder(
+            state, route, credential, session_id, delegation, window,
+        ))
+        .send(),
     )
     .await
 }
@@ -71,6 +75,7 @@ pub(super) async fn forward_http(
     forward: ForwardOptions,
     credential: CredentialSource,
     session_id: Option<&str>,
+    delegation: Option<&super::request::CodexDelegation>,
 ) -> Result<(StatusCode, axum::response::Response), AdapterError> {
     let ForwardOptions {
         upstream_body,
@@ -79,6 +84,8 @@ pub(super) async fn forward_http(
         codex_quota_account,
         estimate_input,
         started_at,
+        window_key,
+        compact,
     } = forward;
     let policy = provider_retry_policy(state, route);
     if turn.client_wants_stream {
@@ -104,6 +111,9 @@ pub(super) async fn forward_http(
                 policy,
                 credential: None,
                 session_id: session_id.map(str::to_string),
+                window_key,
+                compact,
+                delegation: delegation.cloned(),
                 upstream_body: upstream_body.clone(),
                 auth,
                 codex_quota_account: None,
@@ -141,11 +151,25 @@ pub(super) async fn forward_http(
     let estimate_handle = estimate_input.map(|request| {
         tokio::task::spawn_blocking(move || crate::count_tokens::count_input_tokens_value(&request))
     });
+    // The mark is consumed by the first send that reaches an upstream on
+    // either transport: a websocket attempt earlier in this dispatch already
+    // took it, so this reads the window it left.
+    let window = super::codex_ws::window_for_turn(window_key.as_deref(), compact.take());
     let upstream = crate::retry::send_with_retry_with_safety(
         policy,
         &route.provider,
         crate::retry::RetrySafety::NonIdempotentPost,
-        || http_send(state, route, credential.clone(), session_id, body.clone()),
+        || {
+            http_send(
+                state,
+                route,
+                credential.clone(),
+                session_id,
+                delegation,
+                window,
+                body.clone(),
+            )
+        },
     )
     .await
     .map_err(|error| {
@@ -708,14 +732,17 @@ mod tests {
             codex_quota_account: None,
             estimate_input: None,
             started_at: None,
+            window_key: None,
+            compact: crate::request::CompactionMark::default(),
         };
         let credential = CredentialSource::Resolved(Credential::ApiKey {
             value: "probe".to_string(),
             header: crate::config::ApiKeyHeader::Bearer,
         });
-        let (status, response) = forward_http(&state, &codex_route(), forward, credential, None)
-            .await
-            .expect("forward_http builds the response without upstream headers");
+        let (status, response) =
+            forward_http(&state, &codex_route(), forward, credential, None, None)
+                .await
+                .expect("forward_http builds the response without upstream headers");
         assert_eq!(status, StatusCode::OK);
         use futures_util::StreamExt;
         let mut body = response.into_body().into_data_stream();
@@ -774,12 +801,14 @@ mod tests {
             codex_quota_account: None,
             estimate_input: None,
             started_at: Some(std::time::Instant::now() - std::time::Duration::from_millis(300)),
+            window_key: None,
+            compact: crate::request::CompactionMark::default(),
         };
         let credential = CredentialSource::Resolved(Credential::ApiKey {
             value: "probe".to_string(),
             header: crate::config::ApiKeyHeader::Bearer,
         });
-        let (status, response) = forward_http(&state, &route, forward, credential, None)
+        let (status, response) = forward_http(&state, &route, forward, credential, None, None)
             .await
             .expect("forward_http builds the committed response");
         assert_eq!(status, StatusCode::OK);
