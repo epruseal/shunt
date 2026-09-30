@@ -5,7 +5,7 @@ use axum::http::{HeaderMap, HeaderValue};
 
 use crate::{auth::Credential, routing::Route, server::AppState};
 
-/// Codex CLI client identity, mirrored from openai/codex rust-v0.156.0.
+/// These headers mirror the client identity from openai/codex rust-v0.159.2.
 ///
 /// The ChatGPT backend routes newer model slugs (e.g. gpt-6-sol and gpt-6-luna,
 /// which have `minimal_client_version: 0.155.0`) by client identity and
@@ -20,8 +20,8 @@ use crate::{auth::Credential, routing::Route, server::AppState};
 /// `pub(crate)`: also reused by `crate::auth::codex::usage` (the wham/usage
 /// poller) so its CLI identity headers cannot drift from the Responses
 /// adapter's own.
-pub(crate) const CODEX_USER_AGENT: &str = "codex_cli_rs/0.156.0";
-pub(crate) const CODEX_CLIENT_VERSION: &str = "0.156.0";
+pub(crate) const CODEX_USER_AGENT: &str = "codex_cli_rs/0.159.2";
+pub(crate) const CODEX_CLIENT_VERSION: &str = "0.159.2";
 
 /// Grok CLI identity, mirrored from the official Grok CLI (via
 /// raine/claude-code-proxy `src/providers/grok/client.rs`). The subscription
@@ -949,6 +949,28 @@ mod tests {
             access_token: "access-token".to_string(),
             account_id: "account-id".to_string(),
         }
+    }
+
+    #[test]
+    fn gpt_6_1_sol_uses_the_current_codex_client_identity() {
+        let state = AppState::new(Config::default(), reqwest::Client::new()).unwrap();
+        let request = build_test_request(
+            &state,
+            &client_model_route("gpt-6.1-sol"),
+            codex_oauth(),
+            None,
+        );
+
+        assert_eq!(request.headers().get("originator").unwrap(), "codex_cli_rs");
+        assert_eq!(
+            request.headers().get("user-agent").unwrap(),
+            "codex_cli_rs/0.159.2"
+        );
+        assert_eq!(request.headers().get("version").unwrap(), "0.159.2");
+        assert_eq!(
+            request.headers().get("x-codex-routing-hint").unwrap(),
+            "model=gpt-6.1-sol"
+        );
     }
 
     #[test]
