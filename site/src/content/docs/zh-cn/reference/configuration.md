@@ -575,8 +575,10 @@ base_threshold = 0.5
 CLI 的 stdout 计,含行终止符;Cursor 按保留的文本与工具调用字段计。空闲间隔在 WebSocket
 事件之间(包括等待第一个事件)以及带内容的 Antigravity 输出行之间计时,单独的工具步骤不会
 重置它。对 OpenAI Responses 目标,间隔从请求发出的那一刻开始计时,所以等待响应头,或等待 WebSocket
-握手(复用连接池中的连接时为存活检查)和第一个事件的时间,以及读取回复前 shunt 在本地计算 token 的时间(最多 1 秒),都计入间隔。
-重新发送的请求会重新开始计时。在这些调用中因缓存为空而触发的 Antigravity 模型目录拉取,也按同样的上限读取;被拒绝
+握手(复用连接池中的连接时为存活检查)和第一个事件的时间,都计入间隔。shunt 在本地计算 token 的
+时间(最多 1 秒)与读取回复同时进行,因此超出间隔才到达的回复仍会被截断。错误响应的正文也在同一
+间隔内读取,但 `chatgpt_oauth` 账户池的账户全部失败后转发的错误正文,目前仍只受 5 秒的错误读取上限
+约束。重新发送的请求会重新开始计时。在这些调用中因缓存为空而触发的 Antigravity 模型目录拉取,也按同样的上限读取;被拒绝
 的目录会回退到没有目录时 shunt 推测的模型 id,下一次客户端回合会重新拉取。
 
 #### `type = "llm_classifier"`
@@ -893,7 +895,7 @@ Responses 执行模型都是如此,所以 Claude Code 的 `/model` 显示和 `--
 | :-- | :-- | :-- |
 | 被扣住的回合越过某个 `gated_*` 上限,或在终止标记之前结束 | 在发送任何响应头之前丢弃,由强目标实时提供这一轮(`escalation_fallback`) | 在发送任何响应头之前丢弃,请求以网关自有、Anthropic 错误形态的 `502` 失败(`gated_error`)。这既不是 REDO,也不是一次故障转移尝试 —— 上游已经以 `2xx` 作答 |
 | 被扣住调用的上游以超出上下文窗口为由拒绝该回合:`error.message`(若消息中没有这些短语,则为整个原始正文,无论是否为 JSON)包含 `prompt is too long`、`maximum number of tokens`、`context window` 或 `context length` 的 `400` | 由强目标实时提供这一轮(`escalation_fallback`) | 原样转发(`gated_error`),以便客户端压缩上下文 |
-| 被扣住调用的上游返回其他错误状态 | 与实时回合一样原样转发给客户端,并附带上游的 `retry-after`(`gated_error`)。但流式回合中 `chatgpt_oauth` 账户池的账户全部耗尽时,目前还不附带 `retry-after` | 原样转发(`gated_error`) |
+| 被扣住调用的上游返回其他错误状态 | 与实时回合一样原样转发给客户端,并附带上游的 `retry-after`(`gated_error`)。`chatgpt_oauth` 账户池的账户全部耗尽时也是如此 | 原样转发(`gated_error`) |
 | 在完整回合之后裁判或审阅失败 —— 超时、响应过大或无法解析、上游错误,或 `max_judge_calls` 用完 | 提供弱目标回合(`classifier_fail_open`) | `fail_open = true` 时提供执行模型回合(`advisor_fail_open`);`fail_open = false` 时请求以网关自有的 `502` 失败(`gated_error`),`max_judge_calls` 拒绝审阅时也是如此 —— 失败的审阅仍按其结果计数(例如 `upstream_error`、`timeout`),被 `max_judge_calls` 拒绝的则计为 `budget_exhausted` |
 
 **代价。** 这些代价是你按条目选择承担的:

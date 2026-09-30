@@ -25,10 +25,13 @@ use super::body::{prepare_body, PreparedBody};
 use super::codex_ws::KEY_COMPONENT_SEPARATOR;
 use super::context::{CredentialSource, ForwardOptions, PoolForward, RelayOptions, TurnOptions};
 use super::early_stream::{
-    bounded_input_estimate, estimated_machine_factory, http_events_stream, parsed_events,
-    pool_streaming_response, HttpSendContext, PoolEvent, PoolItem,
+    estimated_machine_factory, http_events_stream, parsed_events, pool_streaming_response,
+    HttpSendContext, InputEstimate, PoolEvent, PoolItem,
 };
-use super::error::{adapter_error_envelope, mapped_upstream_error, own_error, transport_error};
+use super::error::{
+    adapter_error_envelope, mapped_upstream_error, mapped_upstream_error_within, own_error,
+    transport_error,
+};
 use super::http::{http_send, json_response, stream_response};
 use super::websocket::forward_websocket;
 use crate::proxy::chain_stream::LazyEnvelope;
@@ -510,10 +513,11 @@ pub(super) fn pool_events_stream(
                                 // advance status is advance-worthy and
                                 // remembered, transport exhaustion advances
                                 // without remembering.
-                                let (status, advance, remember, envelope) =
+                                let (status, advance, remember, envelope, retry_after) =
                                     match last_response.take() {
                                         Some(upstream) => {
                                             let status = upstream.status();
+                                            let retry_after = retry_after_of(&upstream);
                                             let envelope =
                                                 LazyEnvelope::Deferred(Box::pin(async move {
                                                     adapter_error_envelope(
@@ -529,6 +533,7 @@ pub(super) fn pool_events_stream(
                                                 crate::proxy::failover::is_advance_status(status),
                                                 true,
                                                 envelope,
+                                                retry_after,
                                             )
                                         }
                                         None => (
@@ -542,6 +547,7 @@ pub(super) fn pool_events_stream(
                                                 ))
                                                 .await,
                                             ),
+                                            None,
                                         ),
                                     };
                                 record(status);
@@ -551,6 +557,7 @@ pub(super) fn pool_events_stream(
                                         advance,
                                         remember,
                                         envelope,
+                                        retry_after,
                                     }),
                                     (
                                         Phase::Done,
@@ -622,6 +629,7 @@ pub(super) fn pool_events_stream(
                                             advance: false,
                                             remember: false,
                                             envelope: LazyEnvelope::Ready(envelope),
+                                            retry_after: None,
                                         }),
                                         (
                                             Phase::Done,
@@ -703,6 +711,7 @@ pub(super) fn pool_events_stream(
                                         // this path. Terminal, carrying its
                                         // real status for metrics.
                                         record(status);
+                                        let retry_after = retry_after_of(&upstream);
                                         let envelope = adapter_error_envelope(
                                             mapped_upstream_error(status, upstream, auth).await,
                                         )
@@ -713,6 +722,7 @@ pub(super) fn pool_events_stream(
                                                 advance: false,
                                                 remember: true,
                                                 envelope: LazyEnvelope::Ready(envelope),
+                                                retry_after,
                                             }),
                                             (
                                                 Phase::Done,
@@ -779,6 +789,7 @@ pub(super) fn pool_events_stream(
                                                     advance: false,
                                                     remember: false,
                                                     envelope: LazyEnvelope::Ready(envelope),
+                                                    retry_after: None,
                                                 }),
                                                 (
                                                     Phase::Done,
@@ -854,6 +865,7 @@ pub(super) fn pool_events_stream(
                                                     account: Some(account.name.clone()),
                                                 };
                                             } else {
+                                                let retry_after = retry_after_of(&retry);
                                                 let envelope = adapter_error_envelope(
                                                     mapped_upstream_error(
                                                         retry_status,
@@ -872,6 +884,7 @@ pub(super) fn pool_events_stream(
                                                         advance: false,
                                                         remember: true,
                                                         envelope: LazyEnvelope::Ready(envelope),
+                                                        retry_after,
                                                     }),
                                                     (
                                                         Phase::Done,
@@ -1150,8 +1163,10 @@ pub(super) async fn forward_chatgpt_oauth(
             .response_bounds
             .idle
             .map(|_| tokio::time::Instant::now());
+        // The same clock bounds this attempt's error-body read (#704).
+        let clock = turn.response_bounds.idle.zip(idle_since);
         let upstream = match crate::adapters::within_idle(
-            turn.response_bounds.idle.zip(idle_since),
+            clock,
             http_send(
                 &state,
                 &route,
@@ -1189,16 +1204,7 @@ pub(super) async fn forward_chatgpt_oauth(
         state
             .accounts
             .note_codex_quota(&route.provider, account, upstream.headers());
-        match classify_first(
-            &state,
-            &route,
-            account,
-            upstream,
-            turn.response_bounds.idle,
-            false,
-        )
-        .await?
-        {
+        match classify_first(&state, &route, account, upstream, clock, false).await? {
             FirstOutcome::Relay(upstream) => {
                 // A non-401/429/5xx response means the account itself is fine,
                 // whether or not this particular request succeeded (mirrors the
@@ -1209,7 +1215,7 @@ pub(super) async fn forward_chatgpt_oauth(
                     .accounts
                     .mark_healthy(&route.provider, account, status.is_success());
                 if status.is_success() {
-                    let input_tokens_estimate = take_estimate(&mut estimate_handle).await;
+                    let input_tokens_estimate = take_estimate(&mut estimate_handle);
                     let response = relay_success(
                         &state,
                         upstream,
@@ -1233,7 +1239,7 @@ pub(super) async fn forward_chatgpt_oauth(
                 // account's fault: relay it (re-shaped into the Anthropic error
                 // envelope by mapped_upstream_error, as everywhere on this path)
                 // rather than rotating to another account.
-                return Err(mapped_upstream_error(status, upstream, auth).await);
+                return Err(mapped_upstream_error_within(status, upstream, auth, clock).await);
             }
             FirstOutcome::Rotate(upstream) => {
                 last_response = Some(upstream);
@@ -1259,8 +1265,9 @@ pub(super) async fn forward_chatgpt_oauth(
                     .response_bounds
                     .idle
                     .map(|_| tokio::time::Instant::now());
+                let retry_clock = turn.response_bounds.idle.zip(retry_since);
                 let retry = match crate::adapters::within_idle(
-                    turn.response_bounds.idle.zip(retry_since),
+                    retry_clock,
                     http_send(
                         &state,
                         &route,
@@ -1300,21 +1307,12 @@ pub(super) async fn forward_chatgpt_oauth(
                 state
                     .accounts
                     .note_codex_quota(&route.provider, account, retry.headers());
-                match classify_retry(
-                    &state,
-                    &route,
-                    account,
-                    retry,
-                    turn.response_bounds.idle,
-                    false,
-                )
-                .await?
-                {
+                match classify_retry(&state, &route, account, retry, retry_clock, false).await? {
                     RetryOutcome::Relay(retry) => {
                         let retry_status = retry.status();
                         if retry_status.is_success() {
                             state.accounts.mark_healthy(&route.provider, account, true);
-                            let input_tokens_estimate = take_estimate(&mut estimate_handle).await;
+                            let input_tokens_estimate = take_estimate(&mut estimate_handle);
                             let response = relay_success(
                                 &state,
                                 retry,
@@ -1333,7 +1331,13 @@ pub(super) async fn forward_chatgpt_oauth(
                             // hardcoded `200` — see the relay arm above.
                             return Ok((response.status(), response));
                         }
-                        return Err(mapped_upstream_error(retry_status, retry, auth).await);
+                        return Err(mapped_upstream_error_within(
+                            retry_status,
+                            retry,
+                            auth,
+                            retry_clock,
+                        )
+                        .await);
                     }
                     RetryOutcome::Rotate(retry) => {
                         last_response = Some(retry);
@@ -1355,19 +1359,31 @@ pub(super) async fn forward_chatgpt_oauth(
     }
 }
 
+/// The `retry-after` an exhausting upstream response carries, read before the
+/// response moves into [`mapped_upstream_error`] — the same header that
+/// function copies onto the ordered loop's refusal (#702).
+fn retry_after_of(upstream: &reqwest::Response) -> Option<HeaderValue> {
+    upstream
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .cloned()
+}
+
 /// Relay a successful upstream Responses answer to the client, choosing SSE
 /// or a single JSON body per `client_wants_stream`. Thin wrapper shared by
 /// every success arm in [`forward_chatgpt_oauth`] so each only differs in
 /// which upstream response and account produced it (mirrors how the
 /// single-account [`forward_http`] picks between [`stream_response`] and
 /// [`json_response`]). `idle_since` is when the answering request was sent,
-/// and only the non-streaming read, the one a gated call takes, uses it.
+/// and only the non-streaming read, the one a gated call takes, uses it. The
+/// streaming relay seeds `message_start` with the estimate, so it waits for it
+/// first; the non-streaming read waits for it beside the collection (#703).
 async fn relay_success(
     state: &AppState,
     upstream: reqwest::Response,
     client_wants_stream: bool,
     relay: RelayOptions,
-    input_tokens_estimate: u64,
+    input_tokens_estimate: InputEstimate,
     bounds: crate::adapters::ResponseBounds,
     idle_since: Option<tokio::time::Instant>,
 ) -> Result<axum::response::Response, AdapterError> {
@@ -1376,7 +1392,7 @@ async fn relay_success(
         Ok(stream_response(
             upstream,
             relay,
-            input_tokens_estimate,
+            input_tokens_estimate.resolve().await,
             keepalive,
         ))
     } else {
@@ -1384,23 +1400,21 @@ async fn relay_success(
     }
 }
 
-/// Await the lazily-spawned HTTP-path tiktoken estimate handle exactly once,
-/// mirroring `forward_http`'s inline `match estimate_handle { .. }`. Factored
-/// out because the pool loop has two success arms (first attempt and
-/// refresh retry) that must consume the same handle without awaiting it
-/// twice — `JoinHandle` is not `Clone`, so `.take()` leaves a torn-down `None`
-/// behind for whichever arm does not run. A non-streaming turn seeds no
+/// Take the lazily-spawned HTTP-path tiktoken estimate handle exactly once,
+/// as the [`InputEstimate`] [`relay_success`] waits for, mirroring
+/// `forward_http`'s handoff to `json_response`. Factored out because the pool
+/// loop has two success arms (first attempt and refresh retry) that must
+/// consume the same handle without awaiting it twice — `JoinHandle` is not
+/// `Clone`, so `.take()` leaves a torn-down `None` behind for whichever arm
+/// does not run. A non-streaming turn seeds no
 /// `message_start`, so `forward`'s gate spawns a handle for one only when it
 /// carries `stop_sequences` — there the estimate is what keeps a stopped turn's
 /// final JSON from reporting `input_tokens: 0` (issue #605). Without either, the
-/// handle is `None` and this naturally yields `0` below.
-async fn take_estimate(estimate_handle: &mut Option<tokio::task::JoinHandle<u64>>) -> u64 {
-    match estimate_handle.take() {
-        // Bounded like `forward_http`: the committed `message_start` must not
-        // wait on the estimator (see `bounded_input_estimate`).
-        Some(handle) => bounded_input_estimate(handle, std::time::Duration::from_secs(1)).await,
-        None => 0,
-    }
+/// handle is `None` and this naturally yields `0`. The wait is bounded like
+/// `forward_http`'s: the committed `message_start` must not wait on the
+/// estimator (see `bounded_input_estimate`).
+fn take_estimate(estimate_handle: &mut Option<tokio::task::JoinHandle<u64>>) -> InputEstimate {
+    estimate_handle.take().into()
 }
 
 /// Inject `x-shunt-account` naming which pool account produced the response,
@@ -1627,7 +1641,10 @@ const MODEL_NOT_SUPPORTED: &str = "model_not_supported";
 /// refusal. The read is bounded like the Responses adapter's error envelope
 /// read ([`crate::error::ERROR_ENVELOPE_BUDGET`] and
 /// [`crate::error::ERROR_ENVELOPE_BYTES`]), plus the gated idle gap when the
-/// caller has one (`ResponseBounds::idle`, as `json_response` honours it). The
+/// caller has one (`ResponseBounds::idle`, as `json_response` honours it):
+/// `clock` is that gap and the attempt's send, so the first wait is the rest
+/// of the gap the header wait began rather than a fresh one, and each chunk
+/// refreshes it (#704). The
 /// bytes are returned only when the whole body arrived within those bounds: a
 /// body that declares or passes the cap, trips the budget, or breaks is not a
 /// refusal, and is passed on unjudged. Only an idle cut is an error: it is the
@@ -1643,7 +1660,7 @@ const MODEL_NOT_SUPPORTED: &str = "model_not_supported";
 /// idle gap, on a body that has already spent both.
 async fn buffer_error_body(
     upstream: reqwest::Response,
-    idle: Option<Duration>,
+    clock: Option<(Duration, tokio::time::Instant)>,
     verbatim: bool,
 ) -> Result<(reqwest::Response, Option<bytes::Bytes>), AdapterError> {
     let declared_oversized = upstream
@@ -1659,13 +1676,14 @@ async fn buffer_error_body(
     let budget = tokio::time::Instant::now() + crate::error::ERROR_ENVELOPE_BUDGET;
     let mut read = Vec::new();
     let mut total = 0usize;
+    let mut idle_deadline = clock.map(|(idle, since)| since + idle);
     let complete = !declared_oversized
         && loop {
-            let idle_deadline = idle.map(|idle| tokio::time::Instant::now() + idle);
             let wait = idle_deadline.map_or(budget, |deadline| deadline.min(budget));
             match tokio::time::timeout_at(wait, rest.next()).await {
                 Ok(None) => break true,
                 Ok(Some(Ok(chunk))) => {
+                    idle_deadline = clock.map(|(idle, _)| tokio::time::Instant::now() + idle);
                     total = total.saturating_add(chunk.len());
                     read.push(Ok(chunk));
                     if total > crate::error::ERROR_ENVELOPE_BYTES {
@@ -1676,8 +1694,8 @@ async fn buffer_error_body(
                     read.push(Err(error));
                     break false;
                 }
-                Err(_) => match (idle, idle_deadline) {
-                    (Some(idle), Some(deadline)) if deadline < budget => {
+                Err(_) => match (clock, idle_deadline) {
+                    (Some((idle, _)), Some(deadline)) if deadline < budget => {
                         return Err(crate::adapters::idle_error(
                             crate::adapters::UpstreamBodyIdle { idle },
                         ));
@@ -1726,13 +1744,13 @@ async fn rotate_on_model_refusal(
     route: &Route,
     account: &AccountConfig,
     upstream: reqwest::Response,
-    idle: Option<Duration>,
+    clock: Option<(Duration, tokio::time::Instant)>,
     verbatim: bool,
 ) -> Result<(reqwest::Response, bool), AdapterError> {
     if upstream.status() != StatusCode::BAD_REQUEST {
         return Ok((upstream, false));
     }
-    let (upstream, body) = buffer_error_body(upstream, idle, verbatim).await?;
+    let (upstream, body) = buffer_error_body(upstream, clock, verbatim).await?;
     if !body.is_some_and(|body| accounts::is_codex_model_unsupported(upstream.status(), &body)) {
         return Ok((upstream, false));
     }
@@ -1772,22 +1790,22 @@ pub(super) enum FirstOutcome {
 /// A `Relay` account is left for the caller to mark healthy so it can render the
 /// response its own way (a translating path splits success vs a non-failover 4xx;
 /// the passthrough relays verbatim). A 400 model refusal rotates instead
-/// ([`rotate_on_model_refusal`]); `idle` bounds that body read and its trip is
-/// the only `Err`, and `verbatim` (the passthrough) keeps an unjudged 400's body
+/// ([`rotate_on_model_refusal`]); `clock` (the gated idle gap and the send it
+/// runs from) bounds that body read and its trip is the only `Err`, and `verbatim` (the passthrough) keeps an unjudged 400's body
 /// intact rather than falling back ([`buffer_error_body`]).
 pub(super) async fn classify_first(
     state: &AppState,
     route: &Route,
     account: &AccountConfig,
     upstream: reqwest::Response,
-    idle: Option<Duration>,
+    clock: Option<(Duration, tokio::time::Instant)>,
     verbatim: bool,
 ) -> Result<FirstOutcome, AdapterError> {
     let status = upstream.status();
     match accounts::classify_codex(status, upstream.headers()) {
         FailoverAction::Relay => {
             let (upstream, rotate) =
-                rotate_on_model_refusal(state, route, account, upstream, idle, verbatim).await?;
+                rotate_on_model_refusal(state, route, account, upstream, clock, verbatim).await?;
             Ok(if rotate {
                 FirstOutcome::Rotate(upstream)
             } else {
@@ -1837,7 +1855,7 @@ pub(super) async fn classify_retry(
     route: &Route,
     account: &AccountConfig,
     retry: reqwest::Response,
-    idle: Option<Duration>,
+    clock: Option<(Duration, tokio::time::Instant)>,
     verbatim: bool,
 ) -> Result<RetryOutcome, AdapterError> {
     let retry_status = retry.status();
@@ -1865,7 +1883,7 @@ pub(super) async fn classify_retry(
     match accounts::classify_codex(retry_status, retry.headers()) {
         FailoverAction::Relay => {
             let (retry, rotate) =
-                rotate_on_model_refusal(state, route, account, retry, idle, verbatim).await?;
+                rotate_on_model_refusal(state, route, account, retry, clock, verbatim).await?;
             Ok(if rotate {
                 RetryOutcome::Rotate(retry)
             } else {
@@ -2878,6 +2896,54 @@ mod tests {
         assert_eq!(relayed.status(), StatusCode::BAD_REQUEST);
         let bytes = relayed.bytes().await.expect("body is readable");
         assert_eq!(bytes, body.as_bytes(), "every upstream byte is relayed");
+    }
+
+    /// The pooled path's case of #704: a gated attempt's `400` whose headers
+    /// arrive 250 ms after the send and whose body then stalls is cut at the
+    /// idle gap measured from the send, 300 ms, so a refusal body that would
+    /// have landed later cannot rotate the pool past the call's bound.
+    ///
+    /// Non-vacuity: start the first deadline at the read (`Instant::now() +
+    /// idle`, the pre-#704 read) and the cut lands at 550 ms, so the elapsed
+    /// assertion goes red.
+    #[tokio::test(start_paused = true)]
+    async fn a_gated_refusal_body_stalled_after_its_headers_is_cut_at_the_gap_from_the_send() {
+        let idle = Duration::from_millis(300);
+        let sent_at = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let upstream = super::super::error::tests::timed_bad_request(None);
+        let error = buffer_error_body(upstream, Some((idle, sent_at)), false)
+            .await
+            .expect_err("a body silent past the gap from the send is cut");
+        assert_eq!(
+            error
+                .response
+                .extensions()
+                .get::<crate::adapters::UpstreamBodyIdle>(),
+            Some(&crate::adapters::UpstreamBodyIdle { idle }),
+            "got: {}",
+            error.message
+        );
+        assert_eq!(sent_at.elapsed(), idle, "cut at the gap from the send");
+    }
+
+    /// The twin: the same `400` whose body completes 280 ms after the send is
+    /// read whole and judged, as it always was.
+    #[tokio::test(start_paused = true)]
+    async fn a_gated_refusal_body_inside_the_gap_from_the_send_is_judged() {
+        let idle = Duration::from_millis(300);
+        let sent_at = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let body: &'static [u8] = br#"{"detail":"The model is not supported"}"#;
+        let upstream = super::super::error::tests::timed_bad_request(Some((
+            sent_at + Duration::from_millis(280),
+            body,
+        )));
+        let (relayed, judged) = buffer_error_body(upstream, Some((idle, sent_at)), false)
+            .await
+            .expect("a body inside the gap is read");
+        assert_eq!(relayed.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(judged.as_deref(), Some(body), "the whole body is judged");
     }
 
     /// Positive twin: on the translating path an unjudged 400 falls back to the

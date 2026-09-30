@@ -613,9 +613,11 @@ WebSocket은 이벤트마다 타입과 페이로드의 compact JSON, Antigravity
 CLI의 stdout, Cursor는 보관하는 텍스트와 도구 호출 필드를 셉니다. 유휴 간격은 WebSocket
 이벤트 사이(첫 이벤트 전 대기 포함)와, 내용을 담은 Antigravity 출력 줄 사이에서 잽니다.
 도구 단계만으로는 타이머가 되돌려지지 않습니다. OpenAI Responses 대상에서는 요청을 보낸
-순간부터 간격을 재므로, 응답 헤더나 WebSocket 핸드셰이크(풀링된 연결이면 생존 확인)와 첫 이벤트를 기다리는 시간과 응답을 읽기 전
-shunt가 로컬에서 토큰을 세는 시간(최대 1초)도 간격에 들어갑니다. 요청을 다시 보내면 간격도
-다시 잽니다. 이런 호출 도중 Antigravity 모델 카탈로그
+순간부터 간격을 재므로, 응답 헤더나 WebSocket 핸드셰이크(풀링된 연결이면 생존 확인)와 첫 이벤트를
+기다리는 시간도 간격에 들어갑니다. shunt가 로컬에서 토큰을 세는 시간(최대 1초)은 응답을 읽는
+동안 함께 흐르므로, 간격이 지난 뒤 도착한 응답은 그대로 잘립니다. 오류 응답의 본문도 같은 간격
+안에서 읽습니다. 단, `chatgpt_oauth` 계정 풀의 계정이 모두 실패한 뒤 전달하는 오류 본문에는
+아직 5초의 오류 읽기 한도만 적용됩니다. 요청을 다시 보내면 간격도 다시 잽니다. 이런 호출 도중 Antigravity 모델 카탈로그
 캐시가 비어 있어 가져오는 요청도 같은 한도로 읽습니다. 한도에 걸린 카탈로그는 카탈로그
 없이 shunt가 추정했을 모델 id로 대체되고, 다음 클라이언트 턴이 카탈로그를 다시 가져옵니다.
 
@@ -960,7 +962,7 @@ Anthropic 실행 모델이든 OpenAI Responses 실행 모델이든 같습니다.
 | :-- | :-- | :-- |
 | 보류된 턴이 `gated_*` 한도를 넘거나 종료 표시 전에 끝남 | 헤더를 보내기 전에 버리고, 강한 타깃이 턴을 실시간으로 제공합니다(`escalation_fallback`) | 헤더를 보내기 전에 버리고, 요청은 Anthropic 오류 형태의 게이트웨이 소유 `502`로 실패합니다(`gated_error`). REDO도 페일오버 시도도 아닙니다 — 업스트림은 이미 `2xx`로 답했습니다 |
 | 보류된 호출의 업스트림이 컨텍스트 윈도에 비해 너무 길다며 턴을 거부함: `error.message`에 — 메시지에 해당 문구가 없으면 JSON이든 아니든 원본 본문 전체에 — `prompt is too long`, `maximum number of tokens`, `context window`, `context length` 중 하나가 들어 있는 `400` | 강한 타깃이 턴을 실시간으로 제공합니다(`escalation_fallback`) | 클라이언트가 컨텍스트를 압축할 수 있도록 그대로 전달합니다(`gated_error`) |
-| 보류된 호출의 업스트림이 그 밖의 오류 상태로 답함 | 실시간 턴과 마찬가지로 업스트림의 `retry-after`와 함께 클라이언트에 그대로 전달합니다(`gated_error`). 단, 스트리밍 턴에서 `chatgpt_oauth` 계정 풀의 계정이 모두 소진된 경우에는 아직 `retry-after`를 전달하지 않습니다 | 그대로 전달합니다(`gated_error`) |
+| 보류된 호출의 업스트림이 그 밖의 오류 상태로 답함 | 실시간 턴과 마찬가지로 업스트림의 `retry-after`와 함께 클라이언트에 그대로 전달합니다(`gated_error`). `chatgpt_oauth` 계정 풀의 계정이 모두 소진된 경우도 마찬가지입니다 | 그대로 전달합니다(`gated_error`) |
 | 완성된 턴 뒤에 판정이나 리뷰가 실패함 — 타임아웃, 너무 크거나 파싱할 수 없는 응답, 업스트림 오류, `max_judge_calls` 소진 | 약한 턴을 제공합니다(`classifier_fail_open`) | `fail_open = true`면 실행 모델 턴을 제공하고(`advisor_fail_open`), `fail_open = false`면 요청이 게이트웨이 소유 `502`로 실패합니다(`gated_error`). `max_judge_calls`가 리뷰를 거부한 경우도 마찬가지입니다. 실패한 리뷰는 여전히 그 결과(예: `upstream_error`, `timeout`)로 집계되고, `max_judge_calls`가 거부했다면 `budget_exhausted`로 집계됩니다 |
 
 **비용.** 다음은 항목별로 선택해 치르는 비용입니다.

@@ -1475,9 +1475,10 @@ also carries the `retry-after` of the attempt whose failure it is — the value
 that upstream sent, from the same remembered failure the status comes from,
 which is the value the ordered loop relays with that failure (issue #655,
 `a_refused_streaming_weak_chain_relays_the_upstream_retry_after`). An
-`auth = "chatgpt_oauth"` account pool that ran out of accounts is the
-exception: its exhaustion does not keep the header yet, so that refusal relays
-none (issue #702). The live committed stream cannot carry the header at all:
+`auth = "chatgpt_oauth"` account pool that ran out of accounts relays it the
+same way: the pool reads the header off the upstream response its exhaustion
+keeps (issue #702,
+`a_refused_streaming_weak_chain_relays_a_pool_exhausted_retry_after`). The live committed stream cannot carry the header at all:
 it has already answered `200` and reports the refusal as one `error` frame, so
 on that path the header is still absent. A route that
 fails after it has started streaming is still a cut.
@@ -1509,7 +1510,7 @@ gated turn:
 | Key | Default | Bounds |
 | :-- | :-- | :-- |
 | `gated_max_bytes` | `8388608` | Retained SSE frame bytes, or the retained JSON body. An adapter that builds the reply before the capture sees it counts what it receives, as §5 describes for `judge_max_response_bytes` |
-| `gated_idle_ms` | `60000` | The gap between body chunks. On an SSE body — a streaming call, or a Responses upstream's reply, which is SSE even when read whole for a non-streaming call — only a completed content frame counts as progress (§5), so SSE `ping` frames do not reset it and an endless keep-alive stream cannot hold a gated turn open. The adapters that accumulate a non-streaming reply apply it between the pieces they accumulate, the first wait included: the Responses WebSocket between events (and before the first one, where a cut is not an HTTP fallback), Antigravity between CLI lines whose translation carries a content frame, so a tool step alone does not reset it. Cursor's agent stream already ends a quiet turn on its own first-byte and idle timeouts. On a non-streaming Responses call the clock starts when the request is sent, so the HTTP header wait is the first gap, and on the WebSocket the handshake (or a pooled connection's probe) and the wait for the first event are. The bounded input-token estimate between the headers (or the peeked first WebSocket event) and the collector sits inside the gap rather than before it; a retried send, a pooled account's attempt, or a retry after a credential refresh starts its own clock (#690) |
+| `gated_idle_ms` | `60000` | The gap between body chunks. On an SSE body — a streaming call, or a Responses upstream's reply, which is SSE even when read whole for a non-streaming call — only a completed content frame counts as progress (§5), so SSE `ping` frames do not reset it and an endless keep-alive stream cannot hold a gated turn open. The adapters that accumulate a non-streaming reply apply it between the pieces they accumulate, the first wait included: the Responses WebSocket between events (and before the first one, where a cut is not an HTTP fallback), Antigravity between CLI lines whose translation carries a content frame, so a tool step alone does not reset it. Cursor's agent stream already ends a quiet turn on its own first-byte and idle timeouts. On a non-streaming Responses call the clock starts when the request is sent, so the HTTP header wait is the first gap, and on the WebSocket the handshake (or a pooled connection's probe) and the wait for the first event are. The bounded input-token estimate runs beside the collector rather than before it, so a frame counts as progress only if it arrives inside the gap (#703). An error body's read continues the same gap, on the single-account path and in the pooled refusal check, so a non-2xx whose body stalls is cut at the gap from the send (#704); the body a `chatgpt_oauth` pool relays after every account failed is still read under the 5 s error-envelope budget alone (#707). A retried send, a pooled account's attempt, or a retry after a credential refresh starts its own clock (#690) |
 | `gated_max_duration_ms` | `600000` | Wall clock across headers and body |
 
 Crossing a bound cancels the upstream call and refunds nothing: the upstream
@@ -1572,7 +1573,7 @@ served.
 | The gated turn crosses a `gated_*` bound | Discarded before any header is committed; the strong target serves the turn live (`escalation_fallback`) | Discarded before any header is committed; the request fails with a gateway-owned `502` in the Anthropic error shape (`gated_error`) |
 | The gated turn ends before its terminal marker | As above | As above. Not a REDO and not a failover attempt: the upstream answered `2xx` and the client never saw it |
 | The gated call's upstream refuses the turn as too long for its context window (a `400`, see below) | The strong target serves the turn live (`escalation_fallback`) | Relayed unchanged (`gated_error`), so a harness can compact |
-| The gated call's upstream answers any other non-2xx | Relayed to the client unchanged, as a live turn would be, `retry-after` included — except from a `chatgpt_oauth` account pool that ran out of accounts on a streaming turn, which relays none yet (issue #702) (`gated_error`) | Relayed unchanged (`gated_error`) |
+| The gated call's upstream answers any other non-2xx | Relayed to the client unchanged, as a live turn would be, `retry-after` included, from a `chatgpt_oauth` account pool that ran out of accounts too (`gated_error`) | Relayed unchanged (`gated_error`) |
 | The judge or review fails after a complete turn — timeout, oversized, unparseable, upstream error, or `max_judge_calls` spent | The algorithm's `fail_open` outcome: the weak turn is replayed (`classifier_fail_open`) | With `fail_open = true` (the default), the executor turn is replayed (`advisor_fail_open`). With `fail_open = false`, the request fails with a gateway-owned `502` (`gated_error`), including when `max_judge_calls` refused the review; the failed review is still recorded under its outcome — e.g. `upstream_error` or `timeout`, or `budget_exhausted` when `max_judge_calls` refused it |
 
 **A context-window refusal (issue #654).** libsy's own client types a `400`
