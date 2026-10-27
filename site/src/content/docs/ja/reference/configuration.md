@@ -60,6 +60,13 @@ tokens_env = "SHUNT_CLIENT_TOKENS"   # JWT issuer を設定したら任意
 issuer = "https://accounts.google.com"
 audience = ["<shunt 専用の client id>"]
 email_domains = ["example.com"]
+
+# ワークロード ID: GitHub Actions の OIDC トークンには email がありません
+[[server.auth.jwt]]
+issuer = "https://token.actions.githubusercontent.com"
+audience = ["https://shunt.example.com"]
+require = { repository_owner_id = "1234567", repository_id = ["7654321"] }
+identity_claim = "repository"
 ```
 
 | キー | デフォルト | 意味 |
@@ -68,17 +75,20 @@ email_domains = ["example.com"]
 | `audience` | 必須 | 受け入れる `aud` 値。文字列または配列 |
 | `email_domains` | `[]` | 大文字小文字を区別しないドメイン。最後の `@` の後ろの部分と**完全一致**で、サフィックス一致ではない |
 | `allowed_emails` | `[]` | 大文字小文字を区別しない完全なメールアドレス |
+| `require` | `{}` | クレーム名 → 文字列または文字列配列のテーブル。列挙した各クレームはトップレベルの JSON **文字列**で、いずれかの値と完全一致（大文字小文字を区別）する必要がある。クレーム間は AND。`email` を持たないワークロード issuer 向け |
+| `subject_prefix` | `[]` | 文字列または配列。設定すると `sub` がいずれかで始まる必要がある（大文字小文字を区別）。区切り文字で終えること — 例: `repo:pleaseai/`（`repo:pleaseai` は `pleaseai-evil` にも一致する）。GitHub の `sub` 形式はリポジトリの作成時期と管理者の設定によって変わるため、ID クレームに対する `require` を優先すること |
+| `identity_claim` | `email` | 文字列値（空でなく 256 バイト以下）が呼び出し元 identity になるクレーム。エントリに `email_domains`/`allowed_emails` がない場合は必須。`sub` ではなく `repository` のように長さが限られたクレームを選ぶ。identity には issuer の接頭辞が付かないため、静的クライアント名や他のエントリの identity と値が同じだと、使用量と spend で同じ呼び出し元として扱われる。`actor` のような単純なユーザー名クレームは避けること |
 | `algorithms` | `["RS256"]` | 受け入れる署名アルゴリズム。非対称のみ |
 | `authorized_parties` | `audience` | `azp` クレームが存在する場合に受け入れる値 |
 | `clock_skew_seconds` | `0` | `exp` と `nbf` に適用する許容誤差 |
 | `max_token_age_seconds` | `3600` | `exp - iat` がこれを超えたら拒否 |
 | `jwks_url` | discovery | discovery ドキュメントを提供しない issuer 向けの明示的な JWKS エンドポイント |
 
-各エントリには `issuer`、`audience`、そして `email_domains` か `allowed_emails` の値が最低 1 つ必要です。`audience` だけでは認可ルールになりません — issuer によっては呼び出し側が自分で audience を選べるからです。`algorithms` に対称アルゴリズムや未知の値がある場合、また `issuer` が `[server.gateway]` の `public_url` と同じ場合も、起動は fail closed します。両方の検証器が同じ bearer スロットを読むため、issuer が重なるとトークンの所有権が評価順に左右されます。
+各エントリには `issuer`、`audience`、そして認可ルールが最低 1 つ必要です: `email_domains`/`allowed_emails` の値、`aud`・`iss` 以外のクレームを指定した `require` テーブル（この 2 つは shunt がすでに行う検査の繰り返しにすぎません）、または `subject_prefix`。`audience` だけでは認可ルールになりません — issuer によっては呼び出し側が自分で audience を選べるからです（任意の GitHub リポジトリが任意の `aud` でトークンを発行できます）。メールルールのないエントリは `identity_claim` も設定する必要があります。設定されたすべてのグループ（メールルール、`require`、`subject_prefix`）を通過する必要があります。`email_verified = true` は、エントリにメールルールがある場合、identity クレームが `email` の場合、または `require` が `email` を指定している場合に強制され、それ以外のエントリは `email` を読みません。`algorithms` に対称アルゴリズムや未知の値がある場合、また `issuer` が `[server.gateway]` の `public_url` と同じ場合も、起動は fail closed します。両方の検証器が同じ bearer スロットを読むため、issuer が重なるとトークンの所有権が評価順に左右されます。
 
 エントリが 1 つでもあれば `tokens_env` は空でも構いません — 認証をすべて IdP に任せるデプロイには設定すべき静的トークンがありません。トークンリストもエントリもない場合、`[server.auth]` は従来どおり起動に失敗します。
 
-JWT は **`Authorization: Bearer` でのみ**受け付けます — 設定された `header` でも `x-api-key` でもありません。Claude Code がすでに `ANTHROPIC_AUTH_TOKEN` を送っているスロットです。ゲートされたルートでは、まず静的トークン、そのルートが受け付ける場合は gateway JWT、次に `iss` で JWT エントリの順に確認します。検証はアルゴリズムを config で固定し（トークンヘッダーの `alg` が選ぶことはありません）、`kid` を必須とし、`exp`/`nbf`、`aud`、`azp`、`exp - iat`、`email_verified = true`、メール許可リストを確認します。検証済みのメールがログと使用量の帰属における呼び出し元 identity になり、256 バイトを超えるアドレスは切り詰めずに拒否します。ゲートされるルートは `[server.auth]` がすでに保護しているルートです: 認証情報を注入する `/v1/messages` と `/v1/messages/count_tokens`、`GET /v1/models`、`GET /usage`、`GET /api/oauth/usage`（loopback 以外のみ）、そしてインバウンド Codex エンドポイント（HTTP、WebSocket、analytics）。
+JWT は **`Authorization: Bearer` でのみ**受け付けます — 設定された `header` でも `x-api-key` でもありません。Claude Code がすでに `ANTHROPIC_AUTH_TOKEN` を送っているスロットです。ゲートされたルートでは、まず静的トークン、そのルートが受け付ける場合は gateway JWT、次に `iss` で JWT エントリの順に確認します。検証はアルゴリズムを config で固定し（トークンヘッダーの `alg` が選ぶことはありません）、`kid` を必須とし、`exp`/`nbf`、`aud`、`azp`、`exp - iat`、設定された `require`/`subject_prefix` オペレーター、メール許可リスト、およびエントリが `email` を読む場合は `email_verified = true` を確認します。検証済みの identity クレーム（デフォルトはメール）がログと使用量の帰属における呼び出し元 identity になり、256 バイトを超える値は切り詰めずに拒否します。ゲートされるルートは `[server.auth]` がすでに保護しているルートです: 認証情報を注入する `/v1/messages` と `/v1/messages/count_tokens`、`GET /v1/models`、`GET /usage`、`GET /api/oauth/usage`（loopback 以外のみ）、そしてインバウンド Codex エンドポイント（HTTP、WebSocket、analytics）。
 
 key set は issuer ごとに初回使用時に遅延取得されるため、IdP に到達できなくても起動を妨げません。キャッシュした key set を信頼するのは最大 5 分で、その後は次のリクエストが再取得を試みます（60 秒の再取得下限が適用されます）。再取得に成功すると key set を丸ごと置き換えるため、issuer が取り下げた鍵は約 5 分以内に検証に使われなくなります。再取得に失敗した場合は、IdP の障害が全面停止に広がらないよう期限切れの key set を使い続け、discovery 自体が失敗したときは最後に発見した `jwks_uri` を代わりに試します。config reload は、エントリの `issuer` と `jwks_url` がどちらも変わらない場合に限りキャッシュ済みの鍵を保持します。未知の `kid` は key set あたり 60 秒のウィンドウで最大 1 回しか再取得を起こしません。どのエントリでも検証できなかったトークンは `401`、検証できたエントリがなく、トークンの issuer に一致するエントリのうちキャッシュ済みの key set がなく取得にも失敗したものがある場合は **`503`** です — IdP の障害が不正な認証情報として報告されることはありません。
 
@@ -184,9 +194,9 @@ rate は upstream ごとに、最も具体的なものから順に一致しま�
 | :-- | :-- | :-- |
 | `fail_closed_on_error` | `false` | プリンシパルのメーターを信頼できないとき（復元に失敗したカウンターレコード。そのウィンドウが終わるまで）: `false` はリクエストを転送して警告を記録、`true` は上限のあるプリンシパルを `429` `spend limit unavailable` で拒否（上限のないプリンシパルは転送） |
 
-上限適用は `POST /v1/messages` に対して行われます（`count_tokens` は対象外）。プリンシパルは静的な `[server.auth]` トークン名、検証済み JWT のメール、または gateway ログインのメールで、`user` 上限の `user_id` とそのまま照合されます。認証情報を注入するが ID を持たないリクエストは `shunt:anonymous` を共有し、passthrough または `type = "noop"` ルートのみのチェーンは適用も計測もされません。UTC の期間（日、月曜開始の週、月）ごとの上限は、そのプリンシパルの `user` 行、なければ `organization` 行（共有プールではなくユーザーごとのデフォルト）、それもなければ無制限です。`amount: null` の `user` 行は明示的な無制限です。チェックは予約を伴わない事前チェックなので、処理中のリクエストは上限を超えることがあります。上限に達したプリンシパルには `retry-after` と `x-should-retry: false` 付きの `429 billing_error`（`spend limit reached (<period>; resets YYYY-MM-DD 00:00 UTC)`）が返り、上限のあるプリンシパルの計測対象レスポンスでは（passthrough または `noop` ルートのみのチェーンはアップストリームのヘッダーをそのまま保持）、すべてのステータスでアップストリームの `anthropic-ratelimit-*` ヘッダーが除去され、そのプリンシパル自身の `anthropic-ratelimit-unified-*` ヘッダーは `2xx` と 2 種類の支出上限による拒否、つまり上限超過の `429` と、`anthropic-ratelimit-unified-overage-disabled-reason: fetch_error` が付く fail-closed の `429 spend limit unavailable` にのみ付きます（その他のエラーや fail-open での転送には付きません）。`/audit`、監査・アイデンティティの保持スイープ、group scope は未実装です。詳細な動作は [Gateway spend limits](https://github.com/pleaseai/shunt/blob/main/docs/gateway-spend-limits.md)（英語）を参照してください。
+上限適用は `POST /v1/messages` に対して行われます（`count_tokens` は対象外）。プリンシパルは静的な `[server.auth]` トークン名、検証済み JWT の identity（`identity_claim`、既定はメール）、または gateway ログインのメールで、`user` 上限の `user_id` とそのまま照合されます。認証情報を注入するが ID を持たないリクエストは `shunt:anonymous` を共有し、passthrough または `type = "noop"` ルートのみのチェーンは適用も計測もされません。UTC の期間（日、月曜開始の週、月）ごとの上限は、そのプリンシパルの `user` 行、なければ `organization` 行（共有プールではなくユーザーごとのデフォルト）、それもなければ無制限です。`amount: null` の `user` 行は明示的な無制限です。チェックは予約を伴わない事前チェックなので、処理中のリクエストは上限を超えることがあります。上限に達したプリンシパルには `retry-after` と `x-should-retry: false` 付きの `429 billing_error`（`spend limit reached (<period>; resets YYYY-MM-DD 00:00 UTC)`）が返り、上限のあるプリンシパルの計測対象レスポンスでは（passthrough または `noop` ルートのみのチェーンはアップストリームのヘッダーをそのまま保持）、すべてのステータスでアップストリームの `anthropic-ratelimit-*` ヘッダーが除去され、そのプリンシパル自身の `anthropic-ratelimit-unified-*` ヘッダーは `2xx` と 2 種類の支出上限による拒否、つまり上限超過の `429` と、`anthropic-ratelimit-unified-overage-disabled-reason: fetch_error` が付く fail-closed の `429 spend limit unavailable` にのみ付きます（その他のエラーや fail-open での転送には付きません）。`/audit`、監査・アイデンティティの保持スイープ、group scope は未実装です。詳細な動作は [Gateway spend limits](https://github.com/pleaseai/shunt/blob/main/docs/gateway-spend-limits.md)（英語）を参照してください。
 
-受信 Codex エンドポイント（`[server.codex_endpoint]`）も同じ上限とカウンターでチェックおよび計測されるため、1 つの上限が両方のサーフェスにまたがるプリンシパルの支出を制限します。すべてのターンは、HTTP でも Responses WebSocket でも、アップストリームを呼ぶ前にチェックされます。プリンシパルは静的トークン名、検証済み JWT のメール、または `[server.auth]` がない場合の `shunt:anonymous` です。上限を超えたターンには `429` が返り、`error.type` と `error.code` は `usage_limit_reached`、さらに `resets_at`（エポック秒、到達した上限のうち最後にリセットされるもの）、`retry-after`、`x-should-retry: false` が付き、`blocked_message` が純粋な ASCII であれば `x-codex-promo-message` でも伝えられます。`fail_closed_on_error` は、上限を持つプリンシパルを同じ type で、`resets_at` と `retry-after` なしで拒否します。完了したターンは Responses の `usage` から課金されます。キャッシュされた入力トークンは `cache_read` レート、残りの入力は `input` レートで、推論トークンは出力に含まれます。使用量が報告されずに終わったターンは、推定入力の下限に配信済みの出力を加えて課金されます。クライアントから見える動作は[受信 Codex エンドポイント](/ja/guides/inbound-codex-endpoint/#支出上限)を参照してください。
+受信 Codex エンドポイント（`[server.codex_endpoint]`）も同じ上限とカウンターでチェックおよび計測されるため、1 つの上限が両方のサーフェスにまたがるプリンシパルの支出を制限します。すべてのターンは、HTTP でも Responses WebSocket でも、アップストリームを呼ぶ前にチェックされます。プリンシパルは静的トークン名、検証済み JWT の identity（`identity_claim`、既定はメール）、または `[server.auth]` がない場合の `shunt:anonymous` です。上限を超えたターンには `429` が返り、`error.type` と `error.code` は `usage_limit_reached`、さらに `resets_at`（エポック秒、到達した上限のうち最後にリセットされるもの）、`retry-after`、`x-should-retry: false` が付き、`blocked_message` が純粋な ASCII であれば `x-codex-promo-message` でも伝えられます。`fail_closed_on_error` は、上限を持つプリンシパルを同じ type で、`resets_at` と `retry-after` なしで拒否します。完了したターンは Responses の `usage` から課金されます。キャッシュされた入力トークンは `cache_read` レート、残りの入力は `input` レートで、推論トークンは出力に含まれます。使用量が報告されずに終わったターンは、推定入力の下限に配信済みの出力を加えて課金されます。クライアントから見える動作は[受信 Codex エンドポイント](/ja/guides/inbound-codex-endpoint/#支出上限)を参照してください。
 
 ## `[server.gateway]`（オプション）
 
