@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.59.1](https://github.com/pleaseai/shunt/compare/v0.59.0...v0.59.1) (2026-10-25)
+
+
+### Bug Fixes
+
+* **anthropic:** decode compressed upstream responses before relaying ([#832](https://github.com/pleaseai/shunt/issues/832)) ([83e312f](https://github.com/pleaseai/shunt/commit/83e312f2b1b58bf35c60f246688d6398e8c94743))
+* **anthropic:** keep every anthropic-beta line when adding the OAuth beta ([#834](https://github.com/pleaseai/shunt/issues/834)) ([b36a8f0](https://github.com/pleaseai/shunt/commit/b36a8f0b6ecd224439c20d767cad0bc592087c00))
+* **auth:** bound the Claude token refresh with a request timeout ([#833](https://github.com/pleaseai/shunt/issues/833)) ([a658fef](https://github.com/pleaseai/shunt/commit/a658fef8621337dfd51174421f1c7f5c438f1f70))
+
 ## [0.59.0](https://github.com/pleaseai/shunt/compare/v0.58.0...v0.59.0) (2026-10-23)
 
 
