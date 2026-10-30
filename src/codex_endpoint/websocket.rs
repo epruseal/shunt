@@ -100,6 +100,10 @@ pub async fn get(
         .inbound_auth
         .as_ref()
         .map(|auth| auth.header().clone());
+    let jwt_header = state
+        .inbound_auth
+        .as_ref()
+        .and_then(|auth| auth.jwt_header().cloned());
     let admin_header = state.admin_auth.as_ref().map(|auth| auth.header().clone());
 
     ws.on_upgrade(move |socket| async move {
@@ -111,6 +115,7 @@ pub async fn get(
             session_id,
             headers,
             auth_header,
+            jwt_header,
             admin_header,
         )
         .await;
@@ -123,6 +128,7 @@ async fn handle_socket(
     session_id: Option<String>,
     handshake_headers: HeaderMap,
     auth_header: Option<HeaderName>,
+    jwt_header: Option<HeaderName>,
     admin_header: Option<HeaderName>,
 ) {
     let (mut ws_tx, mut ws_rx) = socket.split();
@@ -249,6 +255,7 @@ async fn handle_socket(
 
                         let session_id_clone = session_id.clone();
                         let auth_header_clone = auth_header.clone();
+                        let jwt_header_clone = jwt_header.clone();
                         let admin_header_clone = admin_header.clone();
                         let out_tx_clone = out_tx.clone();
                         let gen_clone = current_generation.clone();
@@ -266,6 +273,7 @@ async fn handle_socket(
                                 session_id: session_id_clone,
                                 headers: turn_headers,
                                 auth_header: auth_header_clone,
+                                jwt_header: jwt_header_clone,
                                 admin_header: admin_header_clone,
                                 body: body_bytes,
                                 estimate_body,
@@ -330,33 +338,10 @@ fn same_origin_or_non_browser(headers: &HeaderMap) -> bool {
     else {
         return false;
     };
-    let Ok(origin) = url::Url::parse(origin) else {
-        return false;
-    };
-    let Some(origin_host) = origin.host_str() else {
-        return false;
-    };
-    let origin_port = origin.port_or_known_default();
-    // Split a trailing `:port` only when it parses; a port-less IPv6 literal
-    // (`[::1]`) keeps its whole text as the host name.
-    let (host_without_port, host_port) = host
-        .rsplit_once(':')
-        .and_then(|(name, port)| Some((name, Some(port.parse::<u16>().ok()?))))
-        .unwrap_or((host, None));
-    // `Url::host_str` keeps an IPv6 literal's brackets and so does the Host
-    // header; compare both unbracketed so either spelling matches.
-    let unbracket = |host: &str| {
-        host.trim_start_matches('[')
-            .trim_end_matches(']')
-            .to_owned()
-    };
-    unbracket(origin_host).eq_ignore_ascii_case(&unbracket(host_without_port))
-        && origin_port
-            == host_port.or_else(|| match origin.scheme() {
-                "http" => Some(80),
-                "https" => Some(443),
-                _ => None,
-            })
+    // Host and port only, as documented for the unauthenticated endpoint, so
+    // `http` and `https` on one host are not told apart here (the cookie slot
+    // does compare them).
+    crate::auth::jwt_slots::origin_matches_host(origin, host, None)
 }
 
 #[cfg(test)]
