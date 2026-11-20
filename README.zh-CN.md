@@ -17,7 +17,7 @@
 
 名字即机制:电气/铁路中的 *shunt(分流)* 将流量中被选中的部分导向一条并行路径。在这里,被映射模型的推理被分流到另一个提供方,而 Claude Code 的工具和技能保持完好。
 
-内置了 OpenAI、ChatGPT/Codex、xAI、Grok、Cursor、Kimi Code、智谱、MiniMax 国内版、OpenCode Zen、Gemini、Antigravity 以及 Anthropic 透传,其中不少可以直接复用你已经在付费的订阅。任何兼容 Anthropic-Messages 的后端只需一个配置表即可接入,无需改动代码。参见[提供方](#提供方)。
+内置了 OpenAI、ChatGPT/Codex、xAI、Grok、Cursor、Kimi Code、智谱、MiniMax 国内版、OpenCode Zen、Cheaper Inference、Gemini、Antigravity 以及 Anthropic 透传,其中不少可以直接复用你已经在付费的订阅。任何兼容 Anthropic-Messages 的后端只需一个配置表即可接入,无需改动代码。参见[提供方](#提供方)。
 
 > [!NOTE]
 > `shunt` 是仍在活跃开发中的 1.0 之前(pre-1.0)软件。按照 [SemVer](https://semver.org/lang/zh-CN/#spec) 惯例,`0.x` 版本可能包含对配置键、CLI 和行为的破坏性变更(breaking change) —— 升级前请查看[发布说明](https://github.com/pleaseai/shunt/releases)。
@@ -136,7 +136,24 @@ codex-fallback = "gpt-5.6-sol"
 | `antigravity` | `antigravity` | Antigravity OAuth | `daily-cloudcode-pa.googleapis.com` —— 通过 HTTP 访问的 Google Antigravity 后端,使用 `~/.shunt/antigravity-auth.json`(`shunt login antigravity`;或用 `shunt login antigravity --name` 在 `~/.shunt/accounts/antigravity` 下使用具名账号,通过 `accounts = [...]` 选择) |
 | `antigravity-cli` | `antigravity_cli` | 无(本地 CLI) | **已弃用。** 本地 `agy` 二进制 —— 通过子进程访问同一后端,已被上面的 `antigravity` 取代 |
 
-有序的 `[[upstreams]]` 条目还接受 `kimi`、`kimi-code`、`zhipu`、`minimax-cn`、`opencode` 预设,它们会补齐对应后端的 `kind`、`base_url` 和默认认证。
+有序的 `[[upstreams]]` 条目还接受 `kimi`、`kimi-code`、`zhipu`、`minimax-cn`、`opencode`、`cheaperinference`、`chatgpt-plan` 预设,它们会补齐对应后端的 `kind`、`base_url` 和默认认证。
+
+**ChatGPT 套餐(Sign in with ChatGPT)。** `chatgpt-plan` 预设通过 `api.openai.com/v1/responses` 上 OpenAI 的 "Sign in with ChatGPT" 令牌共享预览使用 ChatGPT 套餐,与上面的 `codex` 提供方相互独立。用 `shunt login chatgpt-plan --name <account>` 登录(浏览器回调到 `127.0.0.1:1455`,远程主机上则粘贴回调 URL),添加一个 `provider = "chatgpt-plan"` 的有序 `[[upstreams]]` 条目(预设会补齐 `kind`、`base_url` 和 `auth = "chatgpt_plan_oauth"`),并按下面的方式映射模型。多个命名账户组成账户池,某个账户触达套餐用量上限时会轮换;`shunt logout chatgpt-plan --name <account>` 会撤销并清除一个账户。预览会拒绝一些请求参数,输出开始后触达用量上限时流会直接结束而不是轮换。详见 [ChatGPT 套餐指南](https://shunt.sh/zh-cn/guides/chatgpt-plan/)。
+
+```toml
+[[upstreams]]
+name = "anthropic"
+provider = "anthropic" # preset: Claude models pass through to Anthropic
+
+[[upstreams]]
+name = "chatgpt-plan"
+provider = "chatgpt-plan" # preset: kind, base_url, and auth = "chatgpt_plan_oauth"
+
+[[models]]
+id = "gpt-6.1-sol"
+[models.upstream_model]
+chatgpt-plan = "gpt-6.1-sol"
+```
 
 各提供方的设置、模型 id 和注意事项都在[提供方](https://shunt.sh/zh-cn/guides/providers/)下,包括 xAI 的 OAuth 层级限制（[xAI / Grok](https://shunt.sh/zh-cn/guides/xai/)）、Cursor 的 agent 模式前缀（[Cursor](https://shunt.sh/zh-cn/providers/cursor/)）以及 Antigravity 的两种传输方式和 `kind = "antigravity"` 迁移（[Antigravity](https://shunt.sh/zh-cn/providers/antigravity/)）。
 
@@ -157,6 +174,7 @@ codex-fallback = "gpt-5.6-sol"
 | MiniMax | `https://api.minimax.io/anthropic` | 见 [MiniMax 文档](https://platform.minimax.io/docs/token-plan/claude-code) |
 | MiniMax 国内版 | `https://api.minimax.cn/anthropic` | `MiniMax-M3` |
 | OpenCode Zen | `https://opencode.ai/zen` | `claude-fable-5-1`、`gpt-6-astra` — 精选跨厂商目录;读取 `x-api-key` |
+| Cheaper Inference | `https://api.cheaperinference.com` | `gpt-5.4`、`deepseek-v4-flash`、`glm-5.3` — 提供 Messages 端点的 OpenAI 兼容网关 |
 | OpenRouter | `https://openrouter.ai/api` | `anthropic/claude-opus-4.8` |
 | Vercel AI Gateway | `https://ai-gateway.vercel.sh` | `anthropic/claude-opus-4.8` |
 
@@ -192,8 +210,8 @@ OpenAI 的 Thibault Sottiaux 已公开欢迎通过其他编码 harness 运行 Co
 
 | 功能 | 启用方式 | 文档 |
 | :-- | :-- | :-- |
-| Anthropic 多账号池化 —— 粘性会话、配额感知轮换、预测性规避、按窗口设置的硬上限(`max_utilization*`,会剔除账号,并在池被上限耗尽时故障转移到下一个上游) | 拥有两个及以上账号的 `auth = "claude_oauth"`；`[server.pool]` 只是可选调优 | [指南](https://shunt.sh/zh-cn/guides/anthropic-multi-account/) |
-| Codex 多账号池化 —— `x-codex-*` 窗口跟踪、慢启动爬坡、重新探测、按窗口设置的硬上限(`max_utilization*`,会剔除账号,并在池被上限耗尽时故障转移到下一个上游) | 拥有两个及以上账号的 `auth = "chatgpt_oauth"`；`[server.pool]` 只是可选调优 | [指南](https://shunt.sh/zh-cn/guides/codex-multi-account/) |
+| Anthropic 多账号池化 —— 会话与账号绑定，仅在所绑定账号无法处理请求或已接近配额达 60 秒时才迁移(分配方式由 `[server.pool] assignment` 选择，默认 `spread`，也可设为 `soonest_weekly_reset`)、配额感知轮换、预测性规避、按窗口设置的硬上限(`max_utilization*`,会剔除账号,并在池被上限耗尽时故障转移到下一个上游) | 拥有两个及以上账号的 `auth = "claude_oauth"`；`[server.pool]` 只是可选调优 | [指南](https://shunt.sh/zh-cn/guides/anthropic-multi-account/) |
+| Codex 多账号池化 —— 同样的会话账号绑定、`x-codex-*` 窗口跟踪、慢启动爬坡、重新探测、按窗口设置的硬上限(`max_utilization*`,会剔除账号,并在池被上限耗尽时故障转移到下一个上游) | 拥有两个及以上账号的 `auth = "chatgpt_oauth"`；`[server.pool]` 只是可选调优 | [指南](https://shunt.sh/zh-cn/guides/codex-multi-account/) |
 | 学习型 prefill 路由 (`type = "prefill_router"`) | 编译期选择启用 —— `cargo build --release --features prefill-router`(**默认关闭**;发布二进制和 Homebrew formula 都以 `--features ui` 构建,因此不包含它),此外还需要一个带 `type = "prefill_router"` 的 `[models.router]` 表、磁盘上的路由检查点,以及装有 `torch` 和 `transformers` 的 Python 环境 | [参考](https://shunt.sh/zh-cn/reference/configuration/#type--prefill_router) |
 | 入站 Codex 端点 —— 把 **Codex CLI** 通过 HTTP/SSE 或 WebSocket 指向 shunt 并纳入同一个池,还可按模型选择性路由 | `[server.codex_endpoint]` | [指南](https://shunt.sh/zh-cn/guides/inbound-codex-endpoint/) |
 | LLM 裁判路由 (`type = "llm_classifier"`、`type = "composite"`) —— 由裁判模型按 `classify_trigger` 逐轮挑选目标,其回复永远不会提供给客户端 | 带 `type = "llm_classifier"`(`mode = "capability"` 或 `"custom"`)或 `type = "composite"` 的 `[models.router]` 表,或 classifier 形态的 `[models.subagents]` 覆盖层 | [参考](https://shunt.sh/zh-cn/reference/configuration/#type--llm_classifier) |

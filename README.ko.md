@@ -17,7 +17,7 @@
 
 이름 자체가 동작 방식을 나타냅니다. 전기/철도의 *shunt*는 흐름의 일부를 선택해 병렬 경로로 우회시킵니다. 여기서는 매핑된 모델의 추론이 다른 프로바이더로 우회되는 동안 Claude Code의 도구와 스킬은 그대로 유지됩니다.
 
-OpenAI, ChatGPT/Codex, xAI, Grok, Cursor, Kimi Code, Zhipu, MiniMax 중국, OpenCode Zen, Gemini, Antigravity, Anthropic 패스스루가 기본 내장되어 있고, 이 가운데 여럿은 이미 결제 중인 구독을 그대로 재사용합니다. Anthropic Messages 호환 백엔드라면 무엇이든 구성 테이블 하나로 붙일 수 있으며, 코드 변경은 필요 없습니다. [프로바이더](#프로바이더)를 참고하세요.
+OpenAI, ChatGPT/Codex, xAI, Grok, Cursor, Kimi Code, Zhipu, MiniMax 중국, OpenCode Zen, Cheaper Inference, Gemini, Antigravity, Anthropic 패스스루가 기본 내장되어 있고, 이 가운데 여럿은 이미 결제 중인 구독을 그대로 재사용합니다. Anthropic Messages 호환 백엔드라면 무엇이든 구성 테이블 하나로 붙일 수 있으며, 코드 변경은 필요 없습니다. [프로바이더](#프로바이더)를 참고하세요.
 
 > [!NOTE]
 > `shunt`는 활발히 개발 중인 1.0 미만(pre-1.0) 소프트웨어입니다. [SemVer](https://semver.org/lang/ko/#spec) 관례에 따라 `0.x` 릴리스에는 설정 키, CLI, 동작에 대한 호환성이 깨지는 변경(breaking change)이 포함될 수 있으니, 업그레이드 전에 [릴리스 노트](https://github.com/pleaseai/shunt/releases)를 확인하세요.
@@ -139,7 +139,24 @@ codex-fallback = "gpt-5.6-sol"
 | `antigravity` | `antigravity` | Antigravity OAuth | `daily-cloudcode-pa.googleapis.com` — HTTP로 통신하는 Google Antigravity 백엔드, `~/.shunt/antigravity-auth.json`(`shunt login antigravity`)을 사용(또는 `shunt login antigravity --name`으로 `~/.shunt/accounts/antigravity` 아래 이름 지정 계정을 만들어 `accounts = [...]`로 선택) |
 | `antigravity-cli` | `antigravity_cli` | 없음(로컬 CLI) | **Deprecated.** 로컬 `agy` 바이너리 — 서브프로세스로 동일한 백엔드를 사용하며, 위의 `antigravity`로 대체되었습니다 |
 
-순서가 있는 `[[upstreams]]` 항목은 여기에 더해 `kimi`, `kimi-code`, `zhipu`, `minimax-cn`, `opencode` 프리셋도 받으며, 각 백엔드의 `kind`, `base_url`, 기본 인증을 채워 넣습니다.
+순서가 있는 `[[upstreams]]` 항목은 여기에 더해 `kimi`, `kimi-code`, `zhipu`, `minimax-cn`, `opencode`, `cheaperinference`, `chatgpt-plan` 프리셋도 받으며, 각 백엔드의 `kind`, `base_url`, 기본 인증을 채워 넣습니다.
+
+**ChatGPT 플랜(Sign in with ChatGPT).** `chatgpt-plan` 프리셋은 `api.openai.com/v1/responses`에서 OpenAI의 "Sign in with ChatGPT" 토큰 공유 프리뷰를 통해 ChatGPT 플랜을 사용하며, 위의 `codex` 프로바이더와는 별개입니다. `shunt login chatgpt-plan --name <account>`로 로그인하고(`127.0.0.1:1455`로의 브라우저 콜백, 또는 원격 호스트에서는 콜백 URL 붙여넣기), `provider = "chatgpt-plan"`인 순서 있는 `[[upstreams]]` 항목을 추가하고(프리셋이 `kind`, `base_url`, `auth = "chatgpt_plan_oauth"`를 채웁니다) 아래처럼 모델을 연결합니다. 이름 있는 여러 계정은 풀을 이루어 한 계정이 플랜 사용량 한도에 닿으면 순환하며, `shunt logout chatgpt-plan --name <account>`는 계정 하나를 폐기하고 지웁니다. 프리뷰는 일부 요청 파라미터를 거부하고, 출력이 시작된 뒤 사용량 한도에 닿으면 순환하지 않고 스트림이 끝납니다. [ChatGPT 플랜 가이드](https://shunt.sh/ko/guides/chatgpt-plan/)를 참고하세요.
+
+```toml
+[[upstreams]]
+name = "anthropic"
+provider = "anthropic" # preset: Claude models pass through to Anthropic
+
+[[upstreams]]
+name = "chatgpt-plan"
+provider = "chatgpt-plan" # preset: kind, base_url, and auth = "chatgpt_plan_oauth"
+
+[[models]]
+id = "gpt-6.1-sol"
+[models.upstream_model]
+chatgpt-plan = "gpt-6.1-sol"
+```
 
 프로바이더별 설정과 모델 id, 주의 사항은 [프로바이더](https://shunt.sh/ko/guides/providers/)에 정리되어 있습니다. xAI의 OAuth 등급 제한([xAI / Grok](https://shunt.sh/ko/guides/xai/)), Cursor의 에이전트 모드 프리픽스([Cursor](https://shunt.sh/ko/providers/cursor/)), Antigravity의 두 가지 전송 방식과 `kind = "antigravity"` 마이그레이션([Antigravity](https://shunt.sh/ko/providers/antigravity/))도 그곳에 있습니다.
 
@@ -160,6 +177,7 @@ codex-fallback = "gpt-5.6-sol"
 | MiniMax | `https://api.minimax.io/anthropic` | [MiniMax 문서](https://platform.minimax.io/docs/token-plan/claude-code) 참고 |
 | MiniMax 중국 | `https://api.minimax.cn/anthropic` | `MiniMax-M3` |
 | OpenCode Zen | `https://opencode.ai/zen` | `claude-fable-5-1`, `gpt-6-astra` — 큐레이션된 크로스 벤더 카탈로그; `x-api-key` 읽음 |
+| Cheaper Inference | `https://api.cheaperinference.com` | `gpt-5.4`, `deepseek-v4-flash`, `glm-5.3` — Messages 엔드포인트를 제공하는 OpenAI 호환 게이트웨이 |
 | OpenRouter | `https://openrouter.ai/api` | `anthropic/claude-opus-4.8` |
 | Vercel AI Gateway | `https://ai-gateway.vercel.sh` | `anthropic/claude-opus-4.8` |
 
@@ -195,8 +213,8 @@ OpenAI의 Thibault Sottiaux는 다른 코딩 하네스를 통해 Codex를 실행
 
 | 기능 | 활성화 키 | 문서 |
 | :-- | :-- | :-- |
-| Anthropic 멀티 계정 풀링 — 스티키 세션, 쿼터 인식 로테이션, 예측 회피, 풀이 캡으로 모두 막히면 계정을 제외하고 다음 업스트림으로 페일오버하는 윈도우별 하드 캡(`max_utilization*`) | 계정 2개 이상인 `auth = "claude_oauth"`; `[server.pool]`은 선택적 튜닝 | [가이드](https://shunt.sh/ko/guides/anthropic-multi-account/) |
-| Codex 멀티 계정 풀링 — `x-codex-*` 윈도우 추적, 슬로우 스타트 램프, 재프로브, 풀이 캡으로 모두 막히면 계정을 제외하고 다음 업스트림으로 페일오버하는 윈도우별 하드 캡(`max_utilization*`) | 계정 2개 이상인 `auth = "chatgpt_oauth"`; `[server.pool]`은 선택적 튜닝 | [가이드](https://shunt.sh/ko/guides/codex-multi-account/) |
+| Anthropic 멀티 계정 풀링 — 세션을 계정에 할당하고 그 계정이 요청을 처리할 수 없거나 60초 동안 쿼터에 근접해 있을 때 옮기는 세션 바인딩(`[server.pool] assignment`로 배치 방식 선택, 기본값 `spread`, 대안 `soonest_weekly_reset`), 쿼터 인식 로테이션, 예측 회피, 풀이 캡으로 모두 막히면 계정을 제외하고 다음 업스트림으로 페일오버하는 윈도우별 하드 캡(`max_utilization*`) | 계정 2개 이상인 `auth = "claude_oauth"`; `[server.pool]`은 선택적 튜닝 | [가이드](https://shunt.sh/ko/guides/anthropic-multi-account/) |
+| Codex 멀티 계정 풀링 — 같은 세션-계정 바인딩, `x-codex-*` 윈도우 추적, 슬로우 스타트 램프, 재프로브, 풀이 캡으로 모두 막히면 계정을 제외하고 다음 업스트림으로 페일오버하는 윈도우별 하드 캡(`max_utilization*`) | 계정 2개 이상인 `auth = "chatgpt_oauth"`; `[server.pool]`은 선택적 튜닝 | [가이드](https://shunt.sh/ko/guides/codex-multi-account/) |
 | 학습형 프리필 라우팅 (`type = "prefill_router"`) | 컴파일 타임 옵트인 — `cargo build --release --features prefill-router` (**기본 꺼짐** — 릴리스 바이너리와 Homebrew 포뮬러는 `--features ui`로 빌드되므로 들어 있지 않습니다). 여기에 `type = "prefill_router"`를 지정한 `[models.router]` 테이블, 디스크에 놓인 라우터 체크포인트, `torch`와 `transformers`가 설치된 Python 환경이 필요합니다 | [레퍼런스](https://shunt.sh/ko/reference/configuration/#type--prefill_router) |
 | 인바운드 Codex 엔드포인트 — **Codex CLI**를 HTTP/SSE나 WebSocket으로 shunt에 연결해 같은 풀에 태우고, 모델별 라우팅도 선택할 수 있음 | `[server.codex_endpoint]` | [가이드](https://shunt.sh/ko/guides/inbound-codex-endpoint/) |
 | LLM 판정 라우팅 (`type = "llm_classifier"`, `type = "composite"`) — 판정 모델이 `classify_trigger`에 따라 턴마다 목적지를 고르며, 그 답은 클라이언트에게 제공되지 않습니다 | `type = "llm_classifier"`(`mode = "capability"` 또는 `"custom"`)나 `type = "composite"`를 지정한 `[models.router]` 테이블, 또는 classifier 형태의 `[models.subagents]` 오버레이 | [레퍼런스](https://shunt.sh/ko/reference/configuration/#type--llm_classifier) |

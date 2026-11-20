@@ -1,7 +1,7 @@
 import { useState, type ReactElement } from 'react';
 
 import { patchPoolAccount, patchPoolSortByReset } from '../api';
-import { pctResetCap, titleCase } from '../format';
+import { pctResetCap, planLabel } from '../format';
 import { useCanWrite, useSession } from '../session';
 import type { PoolAccount, PoolData } from '../types';
 import type { Loadable } from '../useDashboard';
@@ -23,6 +23,8 @@ function poolState(account: PoolAccount): string {
   // coming. Reporting the warning while hiding the active gate is the defect.
   // A hard cap lasts until its window resets, so it outranks the short cooldown.
   if (account.capped) return 'capped';
+  // So does a used-up window, which `near_quota` alone reports as a warning.
+  if (account.exhausted) return 'exhausted';
   if (account.cooldown_secs_remaining) return 'cooling';
   if (account.near_quota) return 'near quota';
   if (account.capped_fable) return 'capped (fable)';
@@ -92,7 +94,7 @@ export function PoolHealth({ pool, onMutated }: PoolHealthProps): ReactElement {
   const rows =
     pool.status === 'ready'
       ? pool.data.providers.flatMap((table) =>
-          (table.accounts ?? []).map((account) => ({ provider: table.provider, account })),
+          (table.accounts ?? []).map((account) => ({ provider: table.provider, auth: table.auth, account })),
         )
       : [];
   return (
@@ -146,13 +148,13 @@ export function PoolHealth({ pool, onMutated }: PoolHealthProps): ReactElement {
                 </td>
               </tr>
             ) : null}
-            {rows.map(({ provider, account }, rowIndex) => {
+            {rows.map(({ provider, auth, account }, rowIndex) => {
               const state = poolState(account);
               return (
                 <tr key={`${provider}:${account.account_ref ?? account.name}:${rowIndex}`}>
                   <td>{provider}</td>
                   <td>{account.name}</td>
-                  <td>{titleCase(account.plan) || '—'}</td>
+                  <td>{planLabel(auth, account.plan) || '—'}</td>
                   <td
                     className={account.needs_relogin ? 'status' : undefined}
                     data-state={account.needs_relogin ? 'needs-relogin' : undefined}

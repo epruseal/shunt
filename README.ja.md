@@ -17,7 +17,7 @@
 
 この名前が仕組みそのものを表しています。電気回路や鉄道の *shunt*（分岐器）が、選んだ一部の流れを並行した経路へ振り分けるのと同じように、ここではマッピングされたモデルの推論を別のプロバイダーへ振り分けつつ、Claude Code のツールやスキルはそのまま保たれます。
 
-OpenAI、ChatGPT/Codex、xAI、Grok、Cursor、Kimi Code、Zhipu、MiniMax 中国版、OpenCode Zen、Gemini、Antigravity、Anthropic パススルーが標準搭載されており、その多くはすでに契約済みのサブスクリプションをそのまま再利用します。Anthropic Messages 互換のバックエンドであれば設定テーブルを 1 つ書くだけで、コード変更なしに追加できます。[プロバイダー](#プロバイダー)を参照してください。
+OpenAI、ChatGPT/Codex、xAI、Grok、Cursor、Kimi Code、Zhipu、MiniMax 中国版、OpenCode Zen、Cheaper Inference、Gemini、Antigravity、Anthropic パススルーが標準搭載されており、その多くはすでに契約済みのサブスクリプションをそのまま再利用します。Anthropic Messages 互換のバックエンドであれば設定テーブルを 1 つ書くだけで、コード変更なしに追加できます。[プロバイダー](#プロバイダー)を参照してください。
 
 > [!NOTE]
 > `shunt` は活発に開発中の 1.0 未満（pre-1.0）ソフトウェアです。[SemVer](https://semver.org/lang/ja/#spec) の慣例に従い、`0.x` リリースには設定キー・CLI・動作に対する破壊的変更（breaking change）が含まれる場合があります。アップグレード前に[リリースノート](https://github.com/pleaseai/shunt/releases)を確認してください。
@@ -138,7 +138,24 @@ codex-fallback = "gpt-5.6-sol"
 | `antigravity` | `antigravity` | Antigravity OAuth | `daily-cloudcode-pa.googleapis.com` — HTTP 経由の Google Antigravity バックエンド、`~/.shunt/antigravity-auth.json`（`shunt login antigravity`）を使用（または `shunt login antigravity --name` で `~/.shunt/accounts/antigravity` 以下に名前付きアカウントを作成し `accounts = [...]` で選択） |
 | `antigravity-cli` | `antigravity_cli` | なし（ローカル CLI） | **非推奨。** ローカルの `agy` バイナリ — サブプロセス経由で同じバックエンドを利用。上記の `antigravity` に置き換えられました |
 
-順序付きの `[[upstreams]]` エントリーはこれに加えて `kimi`、`kimi-code`、`zhipu`、`minimax-cn`、`opencode` のプリセットも受け付け、各バックエンドの `kind`、`base_url`、デフォルト認証を補完します。
+順序付きの `[[upstreams]]` エントリーはこれに加えて `kimi`、`kimi-code`、`zhipu`、`minimax-cn`、`opencode`、`cheaperinference`、`chatgpt-plan` のプリセットも受け付け、各バックエンドの `kind`、`base_url`、デフォルト認証を補完します。
+
+**ChatGPT プラン（Sign in with ChatGPT）。** `chatgpt-plan` プリセットは、`api.openai.com/v1/responses` 上の OpenAI「Sign in with ChatGPT」トークン共有プレビューを通じて ChatGPT プランを消費します。上の `codex` プロバイダーとは別物です。`shunt login chatgpt-plan --name <account>` でサインインし（`127.0.0.1:1455` へのブラウザーコールバック、リモートホストではコールバック URL の貼り付け）、`provider = "chatgpt-plan"` を指定した順序付きの `[[upstreams]]` エントリーを追加し（プリセットが `kind`、`base_url`、`auth = "chatgpt_plan_oauth"` を補完します）、以下のようにモデルを割り当てます。名前付きの複数アカウントはプールとなり、1 つがプランの使用量上限に達するとローテーションします。`shunt logout chatgpt-plan --name <account>` は 1 つのアカウントを失効させて消去します。プレビューは一部のリクエストパラメーターを拒否し、出力開始後に使用量上限に達した場合はローテーションせずストリームが終了します。詳しくは [ChatGPT プランのガイド](https://shunt.sh/ja/guides/chatgpt-plan/)を参照してください。
+
+```toml
+[[upstreams]]
+name = "anthropic"
+provider = "anthropic" # preset: Claude models pass through to Anthropic
+
+[[upstreams]]
+name = "chatgpt-plan"
+provider = "chatgpt-plan" # preset: kind, base_url, and auth = "chatgpt_plan_oauth"
+
+[[models]]
+id = "gpt-6.1-sol"
+[models.upstream_model]
+chatgpt-plan = "gpt-6.1-sol"
+```
 
 プロバイダーごとのセットアップ、モデル id、注意点は[プロバイダー](https://shunt.sh/ja/guides/providers/)にまとまっています。xAI の OAuth ティア制限（[xAI / Grok](https://shunt.sh/ja/guides/xai/)）、Cursor のエージェントモードのプレフィックス（[Cursor](https://shunt.sh/ja/providers/cursor/)）、Antigravity の 2 つのトランスポートと `kind = "antigravity"` の移行（[Antigravity](https://shunt.sh/ja/providers/antigravity/)）もそこにあります。
 
@@ -159,6 +176,7 @@ codex-fallback = "gpt-5.6-sol"
 | MiniMax | `https://api.minimax.io/anthropic` | [MiniMax docs](https://platform.minimax.io/docs/token-plan/claude-code) を参照 |
 | MiniMax 中国版 | `https://api.minimax.cn/anthropic` | `MiniMax-M3` |
 | OpenCode Zen | `https://opencode.ai/zen` | `claude-fable-5-1`、`gpt-6-astra` — キュレーションされたクロスベンダーカタログ。`x-api-key` を読む |
+| Cheaper Inference | `https://api.cheaperinference.com` | `gpt-5.4`、`deepseek-v4-flash`、`glm-5.3` — Messages エンドポイントを備えた OpenAI 互換ゲートウェイ |
 | OpenRouter | `https://openrouter.ai/api` | `anthropic/claude-opus-4.8` |
 | Vercel AI Gateway | `https://ai-gateway.vercel.sh` | `anthropic/claude-opus-4.8` |
 
@@ -194,8 +212,8 @@ OpenAI の Thibault Sottiaux は、他のコーディングハーネスを通じ
 
 | 機能 | 有効化 | ドキュメント |
 | :-- | :-- | :-- |
-| Anthropic マルチアカウントプーリング — スティッキーセッション、クォータを考慮したローテーション、予測的回避、プールがキャップで尽きたときにアカウントを除外して次のアップストリームへフェイルオーバーするウィンドウ別ハードキャップ（`max_utilization*`） | アカウント 2 つ以上の `auth = "claude_oauth"`（`[server.pool]` は任意のチューニング） | [ガイド](https://shunt.sh/ja/guides/anthropic-multi-account/) |
-| Codex マルチアカウントプーリング — `x-codex-*` ウィンドウの追跡、スロースタートのランプ、再プローブ、プールがキャップで尽きたときにアカウントを除外して次のアップストリームへフェイルオーバーするウィンドウ別ハードキャップ（`max_utilization*`） | アカウント 2 つ以上の `auth = "chatgpt_oauth"`（`[server.pool]` は任意のチューニング） | [ガイド](https://shunt.sh/ja/guides/codex-multi-account/) |
+| Anthropic マルチアカウントプーリング — セッションをアカウントに割り当て、そのアカウントが応答できないとき、または 60 秒間クォータに近い状態が続いたときに移すセッションバインディング（配置方式は `[server.pool] assignment` で選択。既定は `spread`、ほかに `soonest_weekly_reset`）、クォータを考慮したローテーション、予測的回避、プールがキャップで尽きたときにアカウントを除外して次のアップストリームへフェイルオーバーするウィンドウ別ハードキャップ（`max_utilization*`） | アカウント 2 つ以上の `auth = "claude_oauth"`（`[server.pool]` は任意のチューニング） | [ガイド](https://shunt.sh/ja/guides/anthropic-multi-account/) |
+| Codex マルチアカウントプーリング — 同じセッションバインディング、`x-codex-*` ウィンドウの追跡、スロースタートのランプ、再プローブ、プールがキャップで尽きたときにアカウントを除外して次のアップストリームへフェイルオーバーするウィンドウ別ハードキャップ（`max_utilization*`） | アカウント 2 つ以上の `auth = "chatgpt_oauth"`（`[server.pool]` は任意のチューニング） | [ガイド](https://shunt.sh/ja/guides/codex-multi-account/) |
 | 学習済みプリフィルルーティング (`type = "prefill_router"`) | コンパイル時のオプトイン — `cargo build --release --features prefill-router`（**既定で無効**。リリースバイナリと Homebrew formula は `--features ui` でビルドされるため含まれません）。加えて `type = "prefill_router"` を指定した `[models.router]` テーブル、ディスク上のルーターチェックポイント、`torch` と `transformers` が入った Python 環境が必要です | [リファレンス](https://shunt.sh/ja/reference/configuration/#type--prefill_router) |
 | 受信 Codex エンドポイント — **Codex CLI** 自体を HTTP/SSE または WebSocket で shunt に向けて同じプールに載せ、モデル単位のルーティングも選択可能 | `[server.codex_endpoint]` | [ガイド](https://shunt.sh/ja/guides/inbound-codex-endpoint/) |
 | LLM ジャッジによるルーティング (`type = "llm_classifier"`、`type = "composite"`) — ジャッジモデルが `classify_trigger` に従ってターンごとに宛先を選びます。その応答がクライアントに渡ることはありません | `type = "llm_classifier"`（`mode = "capability"` または `"custom"`）か `type = "composite"` を指定した `[models.router]` テーブル、あるいは classifier 形式の `[models.subagents]` オーバーレイ | [リファレンス](https://shunt.sh/ja/reference/configuration/#type--llm_classifier) |

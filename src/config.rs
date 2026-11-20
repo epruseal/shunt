@@ -296,6 +296,22 @@ pub struct PoolConfig {
     /// never probed (see `reprobe_interval`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reprobe_seconds: Option<u64>,
+    /// How a new session is assigned to a pool account: `spread` (default) or
+    /// `soonest_weekly_reset`. Values are case-sensitive.
+    #[serde(default)]
+    pub assignment: PoolAssignment,
+}
+
+/// Session-to-account assignment strategy for `[server.pool] assignment`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PoolAssignment {
+    /// Spread new sessions across accounts (the default).
+    #[default]
+    Spread,
+    /// Take the lowest `priority` account first, then the account whose
+    /// governing weekly window resets soonest (an unknown reset sorts last).
+    SoonestWeeklyReset,
 }
 
 pub(crate) fn default_hard_threshold() -> f64 {
@@ -320,6 +336,7 @@ impl Default for PoolConfig {
             state_path: None,
             ramp_initial_concurrency: None,
             reprobe_seconds: None,
+            assignment: PoolAssignment::default(),
         }
     }
 }
@@ -2364,6 +2381,11 @@ pub enum AuthMode {
     /// or per-account in `~/.shunt/accounts/xai/<name>.json`
     /// (`shunt login xai --name <account-name>`), which form an account pool.
     XaiOauth,
+    /// ChatGPT-plan subscription OAuth for the public OpenAI API surface,
+    /// acquired via `shunt login chatgpt-plan --name <account-name>` and stored
+    /// per-account in `~/.shunt/accounts/chatgpt-plan/<name>.json`, which form an
+    /// account pool. Only valid for `kind = "responses"` on `api.openai.com`.
+    ChatgptPlanOauth,
     /// Cursor OAuth acquired by `shunt login cursor`.
     CursorOauth,
     /// Kimi Code subscription OAuth, acquired via the device-code flow
@@ -2384,6 +2406,18 @@ pub enum AuthMode {
     AntigravityOauth,
     /// No authentication header sent (e.g. local subprocess CLI adapters).
     None,
+}
+
+impl AuthMode {
+    /// Whether a `responses` provider with this auth serves its turns through
+    /// the Responses account-pool loop (per-account credentials, rotation,
+    /// refresh-on-401) rather than one credential resolved up front.
+    pub fn uses_responses_pool(self) -> bool {
+        matches!(
+            self,
+            AuthMode::ChatgptOauth | AuthMode::XaiOauth | AuthMode::ChatgptPlanOauth
+        )
+    }
 }
 
 /// The dialect of the OpenAI Responses API an upstream speaks. Some backends
@@ -2431,7 +2465,7 @@ fn model_supports_tool_search(model: &str) -> bool {
     // exactly: the catalog lists no gpt-6 family, only these slugs.
     matches!(
         model,
-        "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna" | "gpt-6.1-sol"
+        "gpt-6-astra" | "gpt-6-sol" | "gpt-6-luna" | "gpt-6.1-sol" | "gpt-6.1-terra"
     )
 }
 
@@ -2854,6 +2888,14 @@ pub enum ConfigError {
     XaiOauthNotHttps { provider: String },
     #[error("providers.{provider} uses auth = \"xai_oauth\" but kind is not \"responses\"; the anthropic adapter would forward the client's own credential instead of the xAI token")]
     XaiOauthWrongKind { provider: String },
+    #[error("providers.{provider}.auth = \"chatgpt_plan_oauth\" requires kind = \"responses\" (providers.{provider}.kind); the anthropic adapter would forward the client's own credential instead of the plan token")]
+    ChatgptPlanOauthWrongKind { provider: String },
+    #[error("providers.{provider}.base_url must be https for auth = \"chatgpt_plan_oauth\" (or a loopback host); refusing to send a subscription token over plaintext")]
+    ChatgptPlanOauthNotHttps { provider: String },
+    #[error("providers.{provider}.base_url host {host} is not api.openai.com for auth = \"chatgpt_plan_oauth\"; refusing to send a subscription token off-origin")]
+    ChatgptPlanOauthNonOpenaiHost { provider: String, host: String },
+    #[error("providers.{provider}.auth must be \"chatgpt_plan_oauth\": a provider named \"chatgpt-plan\" is reserved for the ChatGPT-plan subscription")]
+    ChatgptPlanNameRequiresOauth { provider: String },
     #[error("providers.{provider} uses auth = \"cursor_oauth\" but kind is not \"cursor\"")]
     CursorOauthWrongKind { provider: String },
     #[error("providers.{provider} uses auth = \"cursor_oauth\" but base_url host {host} is not cursor.sh/cursor.com; refusing to send a subscription token off-origin")]
@@ -2891,7 +2933,7 @@ pub enum ConfigError {
     AntigravityLegacyTableMissingAuth,
     #[error("{0}")]
     AntigravityMigrationRequired(String),
-    #[error("providers.{provider}.accounts requires auth = \"claude_oauth\", \"chatgpt_oauth\", \"kimi_oauth\", \"xai_oauth\", or \"antigravity_oauth\"")]
+    #[error("providers.{provider}.accounts requires auth = \"claude_oauth\", \"chatgpt_oauth\", \"kimi_oauth\", \"xai_oauth\", \"chatgpt_plan_oauth\", or \"antigravity_oauth\"")]
     AccountsRequireOauthProvider { provider: String },
     #[error("providers.{provider}.classifier_model requires kind = \"anthropic\"; it remaps Claude Code's auto-mode classifier request within the provider, and only the anthropic adapter carries that request shape")]
     ClassifierModelWrongKind { provider: String },
@@ -2924,6 +2966,8 @@ pub enum ConfigError {
     InvalidAccountName { provider: String, name: String },
     #[error("providers.{provider}.accounts account \"{name}\" sets both credentials and token_env; set at most one credential source")]
     AccountMultipleCredentialSources { provider: String, name: String },
+    #[error("providers.{provider}.accounts account \"{name}\" sets credentials, but chatgpt-plan accounts are signed in with `shunt login chatgpt-plan --name {name}`, not `credentials`")]
+    ChatgptPlanAccountCredentials { provider: String, name: String },
     #[error("providers.{provider}.accounts account \"{name}\" sets token_env, but Antigravity accounts require a credential file containing a project id; use `credentials`, or omit the account entirely to use the default account store")]
     AntigravityAccountTokenEnv { provider: String, name: String },
     #[error("server.pool.{key} must be between 0.0 and 1.0, got {value}")]
@@ -2959,6 +3003,8 @@ pub enum ConfigError {
         provider: String,
         auth: &'static str,
     },
+    #[error("[server.codex_endpoint] route for model {model} targets provider {provider}, but the inbound Codex endpoint does not serve auth = \"chatgpt_plan_oauth\" providers")]
+    CodexRouteChatgptPlan { model: String, provider: String },
     #[error("[server.codex_endpoint] declares more than one route for model {model}")]
     DuplicateCodexRoute { model: String },
     #[error("[server.codex_endpoint] route field `{field}` is empty for model {model}")]
@@ -3332,6 +3378,7 @@ impl ProviderConfig {
             AuthMode::KimiOauth => Some(StoreFamily::Kimi),
             AuthMode::AntigravityOauth => Some(StoreFamily::Antigravity),
             AuthMode::XaiOauth => Some(StoreFamily::Xai),
+            AuthMode::ChatgptPlanOauth => Some(StoreFamily::ChatgptPlan),
             _ => None,
         }
     }
@@ -3353,7 +3400,7 @@ impl ProviderConfig {
         let account_scope = self.account_scope.clone();
         async move {
             use crate::accounts::StoreFamily;
-            use crate::auth::{antigravity, claude, codex, kimi, xai};
+            use crate::auth::{antigravity, chatgpt_plan, claude, codex, kimi, xai};
 
             let (family, label, dir, scan): (_, _, _, fn() -> std::io::Result<Vec<AccountConfig>>) =
                 match auth {
@@ -3386,6 +3433,12 @@ impl ProviderConfig {
                         "xAI",
                         xai::store::default_accounts_dir(),
                         xai::store::scan_accounts,
+                    ),
+                    AuthMode::ChatgptPlanOauth => (
+                        StoreFamily::ChatgptPlan,
+                        "ChatGPT plan",
+                        chatgpt_plan::store::default_accounts_dir(),
+                        chatgpt_plan::store::scan_accounts,
                     ),
                     _ => return Ok(Vec::new()),
                 };
@@ -4846,6 +4899,7 @@ impl Config {
                         | AuthMode::ChatgptOauth
                         | AuthMode::KimiOauth
                         | AuthMode::XaiOauth
+                        | AuthMode::ChatgptPlanOauth
                         | AuthMode::AntigravityOauth
                 )
             {
@@ -5014,6 +5068,12 @@ impl Config {
                 }
             }
             for account in &provider.accounts {
+                if provider.auth == AuthMode::ChatgptPlanOauth && account.credentials.is_some() {
+                    return Err(ConfigError::ChatgptPlanAccountCredentials {
+                        provider: name.clone(),
+                        name: account.name.clone(),
+                    });
+                }
                 if account.credentials.is_some() && account.token_env.is_some() {
                     return Err(ConfigError::AccountMultipleCredentialSources {
                         provider: name.clone(),
@@ -5054,6 +5114,39 @@ impl Config {
                                 value,
                             });
                         }
+                    }
+                }
+            }
+            if name == "chatgpt-plan" && provider.auth != AuthMode::ChatgptPlanOauth {
+                return Err(ConfigError::ChatgptPlanNameRequiresOauth {
+                    provider: name.clone(),
+                });
+            }
+            // A chatgpt_plan_oauth provider injects a ChatGPT-plan bearer into
+            // the public OpenAI API, so it must be a `responses` provider on
+            // exactly `api.openai.com` over https (loopback hosts are allowed
+            // for tests and local mocks), never a gateway that would receive it.
+            if provider.auth == AuthMode::ChatgptPlanOauth {
+                if provider.kind != ProviderKind::Responses {
+                    return Err(ConfigError::ChatgptPlanOauthWrongKind {
+                        provider: name.clone(),
+                    });
+                }
+                let host = url.host_str().unwrap_or_default();
+                if !host_is_loopback(host) {
+                    if url.scheme() != "https" {
+                        return Err(ConfigError::ChatgptPlanOauthNotHttps {
+                            provider: name.clone(),
+                        });
+                    }
+                    if host != "api.openai.com" || url.port_or_known_default() != Some(443) {
+                        return Err(ConfigError::ChatgptPlanOauthNonOpenaiHost {
+                            provider: name.clone(),
+                            host: match url.port() {
+                                Some(port) => format!("{host}:{port}"),
+                                None => host.to_string(),
+                            },
+                        });
                     }
                 }
             }
@@ -5160,6 +5253,12 @@ impl Config {
                             } else {
                                 "none"
                             },
+                        });
+                    }
+                    Some(provider) if provider.auth == AuthMode::ChatgptPlanOauth => {
+                        return Err(ConfigError::CodexRouteChatgptPlan {
+                            model: route.model.clone(),
+                            provider: route.provider.clone(),
                         });
                     }
                     Some(_) => {}
@@ -6014,6 +6113,11 @@ impl Config {
         let Some(config) = self.provider(provider) else {
             return false;
         };
+        // The plan-backed preview rejects `tool_search`, so even an explicit
+        // `tool_search = true` stays on the shim for this auth mode.
+        if config.auth == AuthMode::ChatgptPlanOauth {
+            return false;
+        }
         if !matches!(
             self.responses_flavor(provider),
             ResponsesFlavor::OpenAi | ResponsesFlavor::Chatgpt
@@ -6120,10 +6224,10 @@ mod tests {
         CodexEndpointConfig, CodexRouteConfig, Config, ConfigError, ConfigFormat, GatewayConfig,
         GatewayOidcConfig, GatewayPolicyConfig, GatewayPolicyMatch, GatewaySessionConfig,
         GatewayTelemetryConfig, GatewayTelemetryDestination, InboundAuthConfig, InboundJwtConfig,
-        ModelConfig, OauthUsageConfig, OidcProviderConfig, PoolConfig, PricingConfig,
-        PricingOverride, ProviderConfig, ProviderKind, ResponsesFlavor, RetryConfig, RouteConfig,
-        RoutePrefixConfig, Secret, SpendConfig, StatusConfig, StatusSource, UsageEndpointConfig,
-        CONFIG_ENV_LOCK, MAX_SHUTDOWN_TIMEOUT_SECONDS,
+        ModelConfig, OauthUsageConfig, OidcProviderConfig, PoolAssignment, PoolConfig,
+        PricingConfig, PricingOverride, ProviderConfig, ProviderKind, ResponsesFlavor, RetryConfig,
+        RouteConfig, RoutePrefixConfig, Secret, SpendConfig, StatusConfig, StatusSource,
+        UsageEndpointConfig, CONFIG_ENV_LOCK, MAX_SHUTDOWN_TIMEOUT_SECONDS,
     };
 
     fn model_config(id: &str, upstream_model: Option<BTreeMap<String, String>>) -> ModelConfig {
@@ -7378,6 +7482,30 @@ confidence_threshold = 0.6
     }
 
     #[test]
+    fn pool_assignment_parses_and_rejects_other_values() {
+        let parse = |t: &str| {
+            figment::Figment::from(figment::providers::Toml::string(t))
+                .extract::<PoolConfig>()
+                .map_err(|e| e.to_string())
+        };
+        assert_eq!(parse("").unwrap().assignment, PoolAssignment::Spread);
+        assert_eq!(
+            parse("assignment = \"spread\"").unwrap().assignment,
+            PoolAssignment::Spread
+        );
+        assert_eq!(
+            parse("assignment = \"soonest_weekly_reset\"")
+                .unwrap()
+                .assignment,
+            PoolAssignment::SoonestWeeklyReset
+        );
+        for bad in ["Spread", "bogus", "SOONEST_WEEKLY_RESET"] {
+            let err = parse(&format!("assignment = \"{bad}\"")).unwrap_err();
+            assert!(err.contains("assignment"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
     fn max_utilization_keys_parse_and_round_trip() {
         let pool: PoolConfig = figment::Figment::from(figment::providers::Toml::string(
             "default_max_utilization = 0.9\ndefault_max_utilization_5h = 0.8\n\
@@ -7709,6 +7837,174 @@ confidence_threshold = 0.6
         let config = config.validate().unwrap();
         let codex = config.provider("codex").unwrap();
         assert_eq!(codex.accounts.len(), 1);
+    }
+
+    fn chatgpt_plan_config(mutate: impl FnOnce(&mut ProviderConfig)) -> Config {
+        let mut config = Config::default();
+        let mut provider = ProviderConfig::responses(
+            "https://api.openai.com/v1",
+            AuthMode::ChatgptPlanOauth,
+            None,
+        );
+        mutate(&mut provider);
+        config
+            .providers
+            .insert("chatgpt-plan".to_string(), provider);
+        config
+    }
+
+    #[test]
+    fn chatgpt_plan_oauth_accepts_the_openai_api_host() {
+        chatgpt_plan_config(|_| {}).validate().unwrap();
+        // Loopback is allowed for local mocks, over plain http.
+        chatgpt_plan_config(|p| p.base_url = "http://127.0.0.1:9000/v1".to_string())
+            .validate()
+            .unwrap();
+    }
+
+    #[test]
+    fn codex_endpoint_rejects_a_route_to_a_chatgpt_plan_provider() {
+        let mut config = chatgpt_plan_config(|_| {});
+        config.server.codex_endpoint = Some(codex_endpoint_with(vec![codex_route(
+            "gpt-5.5",
+            "chatgpt-plan",
+            None,
+        )]));
+        let error = config.validate().unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ConfigError::CodexRouteChatgptPlan { model, provider }
+                    if model == "gpt-5.5" && provider == "chatgpt-plan"
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains("chatgpt-plan"));
+        assert!(error.to_string().contains("chatgpt_plan_oauth"));
+    }
+
+    #[test]
+    fn chatgpt_plan_oauth_rejects_wrong_kind() {
+        let config = chatgpt_plan_config(|p| p.kind = ProviderKind::Anthropic);
+        let error = config.validate().unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::ChatgptPlanOauthWrongKind { .. }
+        ));
+        assert!(error.to_string().contains("providers.chatgpt-plan.kind"));
+    }
+
+    #[test]
+    fn chatgpt_plan_oauth_rejects_plaintext_remote_url() {
+        let config = chatgpt_plan_config(|p| p.base_url = "http://api.openai.com/v1".to_string());
+        let error = config.validate().unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::ChatgptPlanOauthNotHttps { .. }
+        ));
+        assert!(error
+            .to_string()
+            .contains("providers.chatgpt-plan.base_url"));
+    }
+
+    #[test]
+    fn chatgpt_plan_oauth_rejects_non_openai_host() {
+        for url in [
+            "https://evil.example.com/v1",
+            "https://api.openai.com.evil.com/v1",
+            "https://chatgpt.com/backend-api",
+            "https://eu.api.openai.com/v1",
+        ] {
+            let config = chatgpt_plan_config(|p| p.base_url = url.to_string());
+            let error = config.validate().unwrap_err();
+            assert!(
+                matches!(error, ConfigError::ChatgptPlanOauthNonOpenaiHost { .. }),
+                "{url}: {error}"
+            );
+            assert!(error
+                .to_string()
+                .contains("providers.chatgpt-plan.base_url"));
+        }
+    }
+
+    #[test]
+    fn chatgpt_plan_oauth_rejects_a_non_default_port_on_the_openai_host() {
+        let config =
+            chatgpt_plan_config(|p| p.base_url = "https://api.openai.com:8443/v1".to_string());
+        let error = config.validate().unwrap_err();
+        assert!(
+            matches!(error, ConfigError::ChatgptPlanOauthNonOpenaiHost { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("api.openai.com:8443"), "{error}");
+        let config =
+            chatgpt_plan_config(|p| p.base_url = "https://api.openai.com:443/v1".to_string());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn provider_named_chatgpt_plan_requires_the_plan_auth() {
+        let mut config = Config::default();
+        config.providers.insert(
+            "chatgpt-plan".to_string(),
+            ProviderConfig::responses(
+                "https://api.openai.com/v1",
+                AuthMode::ApiKey,
+                Some("OPENAI_API_KEY"),
+            ),
+        );
+        let error = config.validate().unwrap_err();
+        assert!(matches!(
+            error,
+            ConfigError::ChatgptPlanNameRequiresOauth { .. }
+        ));
+        assert!(error.to_string().contains("providers.chatgpt-plan.auth"));
+    }
+
+    #[test]
+    fn chatgpt_plan_oauth_rejects_account_credentials() {
+        let config = chatgpt_plan_config(|p| {
+            let mut work = account("work");
+            work.credentials = Some("~/.shunt/work.json".into());
+            p.accounts.push(work);
+        });
+        let error = config.validate().unwrap_err();
+        assert!(
+            matches!(error, ConfigError::ChatgptPlanAccountCredentials { .. }),
+            "{error}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("providers.chatgpt-plan.accounts"));
+        assert!(message.contains("shunt login chatgpt-plan --name work"));
+    }
+
+    #[test]
+    fn chatgpt_plan_oauth_accepts_inline_accounts_and_has_a_store_family() {
+        let config = chatgpt_plan_config(|p| p.accounts.push(account("work")))
+            .validate()
+            .unwrap();
+        assert_eq!(
+            config.provider("chatgpt-plan").unwrap().store_family(),
+            Some(crate::accounts::StoreFamily::ChatgptPlan)
+        );
+    }
+
+    #[test]
+    fn chatgpt_plan_oauth_never_uses_native_tool_search() {
+        for explicit in [None, Some(true)] {
+            let config = chatgpt_plan_config(|p| p.tool_search = explicit);
+            assert!(!config.native_tool_search("chatgpt-plan", "gpt-5.5"));
+        }
+        // The stock OpenAI provider on the same host still resolves native.
+        let config = Config::default();
+        assert!(config.native_tool_search("openai", "gpt-5.5"));
+    }
+
+    #[test]
+    fn chatgpt_plan_does_not_alter_default_config() {
+        let config = Config::default();
+        assert!(config.provider("chatgpt-plan").is_none());
+        assert!(!config.upstream_order.iter().any(|n| n == "chatgpt-plan"));
     }
 
     #[test]
@@ -12596,6 +12892,9 @@ target = "judge-alias"
         // Codex catalog slug `gpt-6.1-sol` (rust-v0.159.3, same flag).
         assert!(config.native_tool_search("codex", "gpt-6.1-sol"));
         assert!(config.native_tool_search("openai", "gpt-6.1-sol"));
+        // Codex catalog slug `gpt-6.1-terra` (openai/codex#57293, same flag).
+        assert!(config.native_tool_search("codex", "gpt-6.1-terra"));
+        assert!(config.native_tool_search("openai", "gpt-6.1-terra"));
         for model in [
             "openai/gpt-6-astra",
             "gpt-6-astra-preview",
@@ -12605,6 +12904,8 @@ target = "judge-alias"
             "gpt-6-luna[1m]",
             "gpt-6.1-sol-preview",
             "gpt-6.1-sol[1m]",
+            "gpt-6.1-terra-preview",
+            "gpt-6.1-terra[1m]",
         ] {
             assert!(!config.native_tool_search("codex", model), "{model}");
         }
@@ -12842,6 +13143,7 @@ target = "judge-alias"
             provider: "anthropic".into(),
         };
         assert!(error.to_string().contains("xai_oauth"));
+        assert!(error.to_string().contains("chatgpt_plan_oauth"));
     }
 
     /// zstd request compression is on by default, but only on the ChatGPT/Codex
